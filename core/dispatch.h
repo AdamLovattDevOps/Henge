@@ -1,0 +1,16 @@
+#ifndef HENGEVM_DISPATCH_H
+#define HENGEVM_DISPATCH_H
+
+#include "cpu.h"
+#include "machine.h"
+
+/* Runs translated code until the CPU halts, the test stop PC is reached, or
+   something the dispatcher cannot handle happens. Returns the HV_EXIT_* reason. */
+int hv_run(HvCpu *cpu);
+
+/* Drops every translated block (the JIT region is reused from the start). */
+void hv_flush_blocks(HvMachine *m);
+
+void hv_enter(HvCpu *cpu, void *block);
+
+#endif
