@@ -56,6 +56,12 @@ void hv_gicv3_set_irq(HvGic *g, int intid, int level) {
     hv_gicv3_update(g);
 }
 
+void hv_gicv3_pend(HvGic *g, int intid) {
+    if (intid < 32 || intid >= HV_GIC_NUM_IRQS) return;
+    g->latch[intid] = 1;
+    hv_gicv3_update(g);
+}
+
 /* ---- the CPU interface ---- */
 
 static uint64_t acknowledge(HvGic *g, int grp) {

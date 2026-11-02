@@ -39,6 +39,8 @@ typedef struct HvGic {
 HvGic *hv_gicv3_create(HvMachine *m, uint64_t dist_pa, uint64_t redist_pa);
 /* Drive an input line: PPIs (16-31) and SPIs (32+). */
 void hv_gicv3_set_irq(HvGic *g, int intid, int level);
+/* Make an SPI pending, as an MSI write does. */
+void hv_gicv3_pend(HvGic *g, int intid);
 /* Recompute the CPU's IRQ and FIQ inputs. */
 void hv_gicv3_update(HvGic *g);
 

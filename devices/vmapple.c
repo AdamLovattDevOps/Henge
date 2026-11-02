@@ -42,6 +42,30 @@ static void rtc_select_write(void *opaque, uint64_t off, uint64_t v, unsigned si
                            (unsigned long long)VMAPPLE_RTC_SELECT, (unsigned long long)off, (unsigned long long)v, size);
 }
 
+/* The guest's device tree gives the GIC a third region (gic,vmapple1), and
+   the kernel's AppleVirtualPlatformPCIEMSIController asserts that the type
+   register at +0x8 has bit 31 ("valid") set. It splits the rest into two
+   13-bit fields and uses +0x40 as the doorbell: an MSI frame in the style of
+   GICv2m, so it follows that layout: base INTID in bits 28..16, count in bits
+   12..0, and a write of an INTID to +0x40 makes it pending. */
+static uint64_t gic_msi_read(void *opaque, uint64_t off, unsigned size) {
+    HvVmapple *b = opaque;
+    if (off == 0x8) return 1u << 31 | (uint32_t)VMAPPLE_MSI_BASE << 16 | VMAPPLE_MSI_COUNT;
+    if (b->m->log) fprintf(stderr, "hengevm: gic msi frame read +%llx (size %u)\n", (unsigned long long)off, size);
+    return 0;
+}
+
+static void gic_msi_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
+    HvVmapple *b = opaque;
+    if (off == 0x40) {
+        if (v >= VMAPPLE_MSI_BASE && v < VMAPPLE_MSI_BASE + VMAPPLE_MSI_COUNT) hv_gicv3_pend(b->gic, (int)v);
+        else if (b->m->log) fprintf(stderr, "hengevm: msi doorbell for INTID %llu outside the frame\n", (unsigned long long)v);
+        return;
+    }
+    if (b->m->log) fprintf(stderr, "hengevm: gic msi frame write +%llx = %llx (size %u)\n", (unsigned long long)off,
+                           (unsigned long long)v, size);
+}
+
 static uint64_t tick(HvMachine *m, HvCpu *cpu) {
     HvVmapple *b = m->tick_opaque;
     uint64_t deadline = hv_timer_update(b->gic, cpu);
@@ -65,6 +89,7 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
     hv_machine_add_ram(m, VMAPPLE_MEM, ram_size, b->ram, 0);
 
     b->gic = hv_gicv3_create(m, VMAPPLE_GIC_DIST, VMAPPLE_GIC_REDIST);
+    hv_machine_add_mmio(m, VMAPPLE_GIC_MSI, 0x10000, b, gic_msi_read, gic_msi_write, "gic-msi");
     b->uart = hv_pl011_create(m, b->gic, VMAPPLE_UART, 32 + VMAPPLE_IRQ_UART);
     b->rtc = hv_pl031_create(m, b->gic, VMAPPLE_RTC, 32 + VMAPPLE_IRQ_RTC);
     b->gpio = hv_pl061_create(m, b->gic, VMAPPLE_GPIO, 32 + VMAPPLE_IRQ_GPIO);

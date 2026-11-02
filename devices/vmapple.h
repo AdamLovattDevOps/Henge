@@ -19,6 +19,7 @@
 #define VMAPPLE_CONFIG     0x00400000ull
 #define VMAPPLE_GIC_DIST   0x10000000ull
 #define VMAPPLE_GIC_REDIST 0x10010000ull
+#define VMAPPLE_GIC_MSI    0x1fff0000ull /* third gic reg in the guest's device tree; not in QEMU */
 #define VMAPPLE_UART       0x20010000ull
 #define VMAPPLE_RTC        0x20050000ull
 #define VMAPPLE_GPIO       0x20060000ull
@@ -37,6 +38,8 @@
 #define VMAPPLE_IRQ_GPIO 5
 #define VMAPPLE_IRQ_AES 0x12
 #define VMAPPLE_IRQ_PCIE 0x20
+#define VMAPPLE_MSI_BASE 96   /* INTIDs handed out through the MSI frame */
+#define VMAPPLE_MSI_COUNT 64
 
 typedef struct HvVmapple {
     HvMachine *m;

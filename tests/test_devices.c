@@ -447,6 +447,11 @@ int main(void) {
     test_virtio_blk(&aux);
     test_virtio_net();
     test_aes();
+    /* MSI frame: valid type register, doorbell pends the INTID */
+    check("msi type valid", rd32(VMAPPLE_GIC_MSI + 8) >> 31, 1);
+    check("msi base", (rd32(VMAPPLE_GIC_MSI + 8) >> 16) & 0x1fff, VMAPPLE_MSI_BASE);
+    wr32(VMAPPLE_GIC_MSI + 0x40, VMAPPLE_MSI_BASE + 3);
+    check("msi doorbell pends the INTID", board.gic->latch[VMAPPLE_MSI_BASE + 3], 1);
     /* PL061: power button on pin 3, rising edge */
     wr32(VMAPPLE_GPIO + 0x40c, 1u << 3); /* IEV: rising edge */
     wr32(VMAPPLE_GPIO + 0x410, 1u << 3);
