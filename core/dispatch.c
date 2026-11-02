@@ -109,10 +109,41 @@ static int wait_for_interrupt(HvCpu *cpu) {
     return 0;
 }
 
+static int run(HvCpu *cpu, int one);
+
 int hv_run(HvCpu *cpu) {
+    return run(cpu, 0);
+}
+
+int hv_run_one(HvCpu *cpu) {
+    return run(cpu, 1);
+}
+
+/* Bring-up aid (log >= 4): report the first block entered with a host address
+   in a guest register, which means the translator leaked one. */
+static int host_pointer_check(HvCpu *cpu, uint64_t prev_pc) {
+    HvMachine *m = cpu->m;
+    for (int r = 0; r < 31; r++) {
+        uint64_t v = cpu->x[r];
+        const char *what = NULL;
+        for (int i = 0; i < m->nram && !what; i++)
+            if (v - (uint64_t)(uintptr_t)m->ram[i].host < m->ram[i].size && m->ram[i].pa != (uint64_t)(uintptr_t)m->ram[i].host)
+                what = "host copy of guest RAM";
+        if (v - (uint64_t)(uintptr_t)m->jit.base < m->jit.capacity * 4) what = "JIT region";
+        if (v - (uint64_t)(uintptr_t)cpu < sizeof *cpu) what = "HvCpu";
+        if (what) {
+            fprintf(stderr, "host pointer: x%d = %llx (%s) entering %llx, previous block %llx\n", r,
+                    (unsigned long long)v, what, (unsigned long long)cpu->pc, (unsigned long long)prev_pc);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int run(HvCpu *cpu, int one) {
     HvMachine *m = cpu->m;
     uint32_t since_tick = 0;
-    uint64_t last_fault = ~0ull;
+    uint64_t last_fault = ~0ull, prev_pc = 0;
     for (;;) {
         if (m->flush_pending) {
             m->flush_pending = 0;
@@ -141,6 +172,8 @@ int hv_run(HvCpu *cpu) {
             return HV_EXIT_UNSUPPORTED;
         }
         if (m->trace) fprintf(stderr, "block %llx el%u\n", (unsigned long long)cpu->pc, cpu->el);
+        if (m->log >= 4 && host_pointer_check(cpu, prev_pc)) return HV_EXIT_UNSUPPORTED;
+        prev_pc = cpu->pc;
         cpu->exit_reason = HV_EXIT_BRANCH;
         cpu->icount++;
         hv_enter(cpu, b->code);
@@ -157,5 +190,6 @@ int hv_run(HvCpu *cpu) {
         default:
             return (int)cpu->exit_reason;
         }
+        if (one) return HV_EXIT_BRANCH;
     }
 }

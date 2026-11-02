@@ -19,7 +19,9 @@
 #define VMAPPLE_GIC_REDIST 0x10010000ull
 #define VMAPPLE_UART       0x20010000ull
 #define VMAPPLE_RTC        0x20050000ull
+#define VMAPPLE_PVPANIC    0x20070000ull
 #define VMAPPLE_BDOOR      0x30000000ull
+#define VMAPPLE_RTC_SELECT 0x30240000ull /* not in QEMU's map; see vmapple.c */
 #define VMAPPLE_PCIE_ECAM  0x40000000ull
 #define VMAPPLE_PCIE_MMIO  0x50000000ull
 #define VMAPPLE_MEM        0x70000000ull
@@ -41,6 +43,7 @@ typedef struct HvVmapple {
     HvVirtioNet *net;
     uint8_t *cfg, *rom, *ram;
     uint64_t ram_size;
+    uint64_t panic_events;   /* last pvpanic event the guest reported */
 } HvVmapple;
 
 /* Builds the machine around m and cpu. Disks may be NULL (no device then).

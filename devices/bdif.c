@@ -1,5 +1,6 @@
 #include "bdif.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -54,6 +55,12 @@ static void command(HvBdif *b, HvDisk *disk, uint64_t req_pa) {
             void *dst = hv_phys_ptr(b->m, req[1].addr, req[1].len);
             if (dst && hv_disk_read(disk, (uint64_t)sector[2] * 512, dst, req[1].len) == 0) ret = 0;
         }
+    }
+    if (b->m->log >= 2) {
+        uint32_t sector[4] = {0};
+        hv_phys_read(b->m, req[0].addr, sector, sizeof sector);
+        fprintf(stderr, "bdif %s: sector %u len %u flags %x -> %s\n", disk == b->aux ? "aux" : "root", sector[2],
+                req[1].len, req[1].flags, ret ? "failed" : "ok");
     }
     hv_phys_write(b->m, req[2].addr, &ret, 1);
 }

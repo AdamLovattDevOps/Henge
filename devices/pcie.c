@@ -46,7 +46,7 @@ uint64_t hv_pci_bar_addr(HvPciDev *d, int bar) {
 }
 
 static void update_line(HvPcie *p, int line) {
-    hv_gic_set_irq(p->gic, p->intx_base + line, p->line_count[line] > 0);
+    hv_gicv3_set_irq(p->gic, p->intx_base + line, p->line_count[line] > 0);
 }
 
 void hv_pci_set_intx(HvPciDev *d, int level) {

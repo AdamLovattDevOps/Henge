@@ -9,11 +9,44 @@
 
 #define ROM_SIZE 0x00100000ull
 
+/* pvpanic (MMIO): reads give the events supported, as QEMU's default
+   (panicked, crash loaded); a write reports one. */
+static uint64_t pvpanic_read(void *opaque, uint64_t off, unsigned size) {
+    (void)opaque, (void)off, (void)size;
+    return 3;
+}
+
+static void pvpanic_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
+    (void)off, (void)size;
+    HvVmapple *b = opaque;
+    b->panic_events = v;
+    fprintf(stderr, "hengevm: guest reported a panic (pvpanic event %llx)\n", (unsigned long long)v);
+    if (v & 1) b->cpu->halted = 4;
+}
+
+/* Not in QEMU's vmapple, which targets macOS 12 guests. iBootStage2 (Sequoia)
+   reads 0x30240040 and uses its PL031 driver ("pl031-rtc") if the value is
+   0xf001, or an Apple virtual RTC ("avp-rtc") otherwise. HengeVM has a PL031,
+   so it answers 0xf001; everything else here is logged so unknown use shows up. */
+static uint64_t rtc_select_read(void *opaque, uint64_t off, unsigned size) {
+    HvVmapple *b = opaque;
+    if (off == 0x40) return 0xf001;
+    if (b->m->log) fprintf(stderr, "hengevm: read of unknown register 0x%llx+%llx (size %u)\n",
+                           (unsigned long long)VMAPPLE_RTC_SELECT, (unsigned long long)off, size);
+    return 0;
+}
+
+static void rtc_select_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
+    HvVmapple *b = opaque;
+    if (b->m->log) fprintf(stderr, "hengevm: write of unknown register 0x%llx+%llx = %llx (size %u)\n",
+                           (unsigned long long)VMAPPLE_RTC_SELECT, (unsigned long long)off, (unsigned long long)v, size);
+}
+
 static uint64_t tick(HvMachine *m, HvCpu *cpu) {
     HvVmapple *b = m->tick_opaque;
     uint64_t deadline = hv_timer_update(b->gic, cpu);
     hv_pl031_tick(b->rtc);
-    hv_gic_update(b->gic);
+    hv_gicv3_update(b->gic);
     return deadline;
 }
 
@@ -31,10 +64,12 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
     hv_machine_add_ram(m, VMAPPLE_FIRMWARE, ROM_SIZE, b->rom, 0);
     hv_machine_add_ram(m, VMAPPLE_MEM, ram_size, b->ram, 0);
 
-    b->gic = hv_gic_create(m, VMAPPLE_GIC_DIST, VMAPPLE_GIC_REDIST);
+    b->gic = hv_gicv3_create(m, VMAPPLE_GIC_DIST, VMAPPLE_GIC_REDIST);
     b->uart = hv_pl011_create(m, b->gic, VMAPPLE_UART, 32 + VMAPPLE_IRQ_UART);
     b->rtc = hv_pl031_create(m, b->gic, VMAPPLE_RTC, 32 + VMAPPLE_IRQ_RTC);
     b->bdif = hv_bdif_create(m, VMAPPLE_BDOOR, root, aux);
+    hv_machine_add_mmio(m, VMAPPLE_PVPANIC, 2, b, pvpanic_read, pvpanic_write, "pvpanic");
+    hv_machine_add_mmio(m, VMAPPLE_RTC_SELECT, 0x4000, b, rtc_select_read, rtc_select_write, "rtc-select");
     HvCfgParams p = *cfg;
     p.ram_size = ram_size;
     b->cfg = hv_cfg_create(m, VMAPPLE_CONFIG, &p);

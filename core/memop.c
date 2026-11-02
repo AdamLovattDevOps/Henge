@@ -1,5 +1,6 @@
 #include "memop.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "exception.h"
@@ -305,6 +306,9 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
             }
         }
         if (rc) {
+            if (cpu->m->log)
+                fprintf(stderr, "unmapped %s: pa %llx (va %llx) size %u pc %llx\n", write ? "write" : "read",
+                        (unsigned long long)pa, (unsigned long long)va, chunk, (unsigned long long)pc);
             hv_raise_abort(cpu, 0, va, HV_FSC_EXTERNAL, write, 0, pc);
             return 1;
         }
@@ -580,6 +584,7 @@ static int do_vector(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint64_
 }
 
 int hv_mem_emulate(HvCpu *cpu, uint32_t insn, uint64_t pc) {
+    cpu->m->access_pc = pc;
     HvMemOp op;
     if (hv_mem_decode(insn, &op) != 0) {
         hv_raise_undef(cpu, pc);

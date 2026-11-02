@@ -76,6 +76,9 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
     if (!d || len > 8) return -1;
     uint64_t v = d->read ? d->read(d->opaque, pa - d->pa, len) : 0;
     memcpy(buf, &v, len);
+    if (m->log >= 3)
+        fprintf(stderr, "mmio read  %s+%llx size %u = %llx pc %llx\n", d->name, (unsigned long long)(pa - d->pa), len,
+                (unsigned long long)v, (unsigned long long)m->access_pc);
     return 0;
 }
 
@@ -99,6 +102,9 @@ int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
     if (!d || len > 8) return -1;
     uint64_t v = 0;
     memcpy(&v, buf, len);
+    if (m->log >= 3)
+        fprintf(stderr, "mmio write %s+%llx size %u = %llx pc %llx\n", d->name, (unsigned long long)(pa - d->pa), len,
+                (unsigned long long)v, (unsigned long long)m->access_pc);
     if (d->write) d->write(d->opaque, pa - d->pa, v, len);
     return 0;
 }

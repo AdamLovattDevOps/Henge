@@ -241,6 +241,13 @@ PROGRAM pac
     xpaci x28
     autia1716
     pacga x4, x5, x6
+    mov x9, x30
+    bl 1f
+    mov x30, x9
+    b 2f
+1:  pacibsp
+    retab
+2:  mov x10, x30
 END pac
 
     .p2align 14

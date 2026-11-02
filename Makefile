@@ -13,7 +13,15 @@ ENGINE = $(CORE) $(HOST)
 TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
         $(B)/test_mmu $(B)/test_exc $(B)/test_devices
 
-all: $(TESTS)
+all: $(TESTS) $(B)/hengevm $(B)/hengevm-ref
+
+# Mac-only test tool: the same machine with the CPU on Hypervisor.framework, for comparing runs.
+$(B)/hengevm-ref: host/hvf_ref.c host/hvf_ref.entitlements $(ENGINE) $(DEV)
+	$(CC) $(CFLAGS) host/hvf_ref.c $(ENGINE) $(DEV) -framework Hypervisor -o $@
+	codesign -s - -f --entitlements host/hvf_ref.entitlements $@
+
+$(B)/hengevm: host/main.c $(ENGINE) $(DEV)
+	$(CC) $(CFLAGS) host/main.c $(ENGINE) $(DEV) -o $@
 
 $(B)/%.o: core/%.c core/*.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@

@@ -12,7 +12,7 @@ static uint32_t now(HvPl031 *r) {
 }
 
 static void update(HvPl031 *r) {
-    hv_gic_set_irq(r->gic, r->intid, (r->ris & r->imsc) != 0);
+    hv_gicv3_set_irq(r->gic, r->intid, (r->ris & r->imsc) != 0);
 }
 
 void hv_pl031_tick(HvPl031 *r) {

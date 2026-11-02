@@ -333,6 +333,7 @@ static void translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
 static void translate_branch_reg(Emit *e, uint32_t insn, uint64_t pc) {
     uint32_t opc = (insn >> 21) & 3;
     int rn = (insn >> 5) & 0x1f;
+    if (opc == 2 && ((insn >> 11) & 0x1f) == 1) rn = 30; /* RETAA, RETAB: the Rn field is all ones, the target is x30 */
     put(e, STP_X(0, 1, 28, 0));
     if (is_stolen(rn)) {
         put(e, LDR_X(0, 28, slot_of(rn)));
@@ -440,7 +441,8 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
         if (rt2_stolen) rt2 = (op.rt2 == op.rt) ? T : U;
     }
     if (rs_stolen) put(e, LDR_X(rs, 28, slot_of(op.rs)));
-    if (rt_stolen && rt != rs) put(e, LDR_X(rt, 28, slot_of(op.rt)));
+    /* Only RMW forms have an Rs; elsewhere bits 20..16 are immediate bits. */
+    if (rt_stolen && !(rmw && rs_stolen && rt == rs)) put(e, LDR_X(rt, 28, slot_of(op.rt)));
     if (rt2_stolen && rt2 != rt) put(e, LDR_X(rt2, 28, slot_of(op.rt2)));
 
     uint32_t out;
@@ -625,6 +627,7 @@ int hv_translate_block(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t 
     int ended = 0;
     while (i < max && !ended) {
         uint64_t pc = b->va + 4ull * i;
+        if (i > 0 && pc == m->stop_pc) break; /* so the dispatcher sees stop_pc at a block start */
         ended = translate_one(e, code[i], pc);
         i++;
         if (e->n + WORDS_PER_INSN_MAX * 2 > MAX_WORDS || e->npool + 8 > MAX_LITS || e->nool + 4 > MAX_OOL) break;

@@ -15,7 +15,7 @@
 static const uint8_t pl011_id[8] = {0x11, 0x10, 0x14, 0x00, 0x0d, 0xf0, 0x05, 0xb1};
 
 static void update(HvPl011 *u) {
-    hv_gic_set_irq(u->gic, u->intid, (u->ris & u->imsc) != 0);
+    hv_gicv3_set_irq(u->gic, u->intid, (u->ris & u->imsc) != 0);
 }
 
 static void default_output(void *opaque, uint8_t c) {

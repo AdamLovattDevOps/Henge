@@ -15,6 +15,7 @@ typedef struct HvCfgParams {
     uint32_t rnd;
     uint8_t mac_en0[6], mac_en1[6], mac_wifi0[6], mac_bt0[6];
     const char *serial, *model, *soc_name; /* NULL: QEMU's defaults */
+    uint64_t seed;  /* nonzero: `rnd` gives a reproducible sequence (for debugging) */
 } HvCfgParams;
 
 /* Returns the host copy of the region (64 KB). */

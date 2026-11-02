@@ -42,18 +42,18 @@ static int hppi(HvGic *g, int masked) {
     return best;
 }
 
-void hv_gic_update(HvGic *g) {
+void hv_gicv3_update(HvGic *g) {
     int i = hppi(g, 1);
     g->m->irq_line = i != SPURIOUS && g->group[i] == 1;
     g->m->fiq_line = i != SPURIOUS && g->group[i] == 0;
 }
 
-void hv_gic_set_irq(HvGic *g, int intid, int level) {
+void hv_gicv3_set_irq(HvGic *g, int intid, int level) {
     if (intid < 16 || intid >= HV_GIC_NUM_IRQS) return;
     level = level != 0;
     if (g->edge[intid] && level && !g->level[intid]) g->latch[intid] = 1;
     g->level[intid] = (uint8_t)level;
-    hv_gic_update(g);
+    hv_gicv3_update(g);
 }
 
 /* ---- the CPU interface ---- */
@@ -64,7 +64,7 @@ static uint64_t acknowledge(HvGic *g, int grp) {
     g->active[i] = 1;
     g->latch[i] = 0;
     if (g->depth < 32) g->stack[g->depth++] = (HvGicActive){(uint16_t)i, g->priority[i], (uint8_t)grp};
-    hv_gic_update(g);
+    hv_gicv3_update(g);
     return (uint64_t)i;
 }
 
@@ -72,7 +72,7 @@ static void end_of_interrupt(HvGic *g, int intid) {
     if (intid >= HV_GIC_NUM_IRQS) return;
     if (g->depth) g->depth--; /* priority drop: the most recent acknowledge */
     if (!(g->icc_ctlr & 2)) g->active[intid] = 0; /* EOImode 0 also deactivates */
-    hv_gic_update(g);
+    hv_gicv3_update(g);
 }
 
 static uint64_t icc_read(HvMachine *m, HvCpu *cpu, uint32_t reg) {
@@ -128,7 +128,7 @@ static void icc_write(HvMachine *m, HvCpu *cpu, uint32_t reg, uint64_t v) {
     }
     default: break;
     }
-    hv_gic_update(g);
+    hv_gicv3_update(g);
 }
 
 /* ---- MMIO: bitmap, byte and route registers shared by GICD and GICR ---- */
@@ -256,7 +256,7 @@ static void dist_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
     } else if (a >= 0x80 && a < 0x1000) {
         if (!bank0(a)) bank_write(g, a, word, mask, 0, HV_GIC_NUM_IRQS, 0);
     }
-    hv_gic_update(g);
+    hv_gicv3_update(g);
 }
 
 /* One redistributor: RD_base at 0, SGI_base at 0x10000. */
@@ -295,10 +295,10 @@ static void redist_write(void *opaque, uint64_t off, uint64_t v, unsigned size) 
     uint32_t a = (uint32_t)(off - 0x10000) & ~3u, mask = size_mask(off, size);
     uint32_t word = (uint32_t)(v << ((off & 3) * 8));
     if (a >= 0x80 && a < 0x1000 && bank0(a)) bank_write(g, a, word, mask, 0, 32, 1);
-    hv_gic_update(g);
+    hv_gicv3_update(g);
 }
 
-HvGic *hv_gic_create(HvMachine *m, uint64_t dist_pa, uint64_t redist_pa) {
+HvGic *hv_gicv3_create(HvMachine *m, uint64_t dist_pa, uint64_t redist_pa) {
     HvGic *g = calloc(1, sizeof *g);
     g->m = m;
     g->waker = 6; /* ProcessorSleep and ChildrenAsleep until the guest wakes it */

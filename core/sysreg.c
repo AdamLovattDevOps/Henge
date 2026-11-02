@@ -1,6 +1,7 @@
 #include "sysreg.h"
 
 #include <mach/mach_time.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "exception.h"
@@ -231,6 +232,9 @@ int hv_sysreg_mrs(HvCpu *cpu, uint32_t insn, uint64_t pc) {
     uint64_t v;
     if (is_pauth_key(reg)) v = 0;
     else if (read_reg(cpu, reg, &v) != 0) return undefined(cpu, pc);
+    if (cpu->m->log >= 3)
+        fprintf(stderr, "mrs S%u_%u_C%u_C%u_%u = %llx pc %llx el%u\n", reg >> 14, (reg >> 11) & 7, (reg >> 7) & 15,
+                (reg >> 3) & 15, reg & 7, (unsigned long long)v, (unsigned long long)pc, cpu->el);
     if (rt != 31) cpu->x[rt] = v;
     return 0;
 }
@@ -255,6 +259,10 @@ int hv_sysreg_msr(HvCpu *cpu, uint32_t insn, uint64_t pc) {
     }
     uint32_t reg = (insn >> 5) & 0xffff;
     int rt = insn & 0x1f;
+    if (cpu->m->log >= 3)
+        fprintf(stderr, "msr S%u_%u_C%u_C%u_%u = %llx pc %llx el%u\n", reg >> 14, (reg >> 11) & 7, (reg >> 7) & 15,
+                (reg >> 3) & 15, reg & 7, (unsigned long long)(rt == 31 ? 0 : cpu->x[rt]), (unsigned long long)pc,
+                cpu->el);
     if (cpu->el == 0 && !el0_allowed(cpu, reg, 1)) return undefined(cpu, pc);
     if (write_reg(cpu, reg, rt == 31 ? 0 : cpu->x[rt]) != 0) return undefined(cpu, pc);
     return 0;

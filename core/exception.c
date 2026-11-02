@@ -42,7 +42,7 @@ void hv_pstate_set(HvCpu *cpu, uint64_t spsr) {
 
 void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set_far, uint64_t ret) {
     uint64_t spsr = hv_pstate_get(cpu);
-    if (cpu->m->trace)
+    if (cpu->m->trace || cpu->m->log >= 2)
         fprintf(stderr, "exception type %d esr %08x far %llx from pc %llx el%u\n", type, esr, (unsigned long long)far,
                 (unsigned long long)ret, cpu->el);
     uint64_t offset = cpu->el == 0 ? 0x400 : cpu->spsel ? 0x200 : 0x000;
@@ -69,6 +69,12 @@ void hv_raise_sync(HvCpu *cpu, uint32_t ec, uint32_t iss, uint64_t far, uint64_t
 }
 
 void hv_raise_undef(HvCpu *cpu, uint64_t pc) {
+    if (cpu->m->log) {
+        uint32_t insn = 0;
+        uint64_t pa;
+        if (!hv_mmu_access(cpu, pc, HV_ACC_EXEC, cpu->el, &pa)) hv_phys_read(cpu->m, pa, &insn, 4);
+        fprintf(stderr, "undefined: pc %llx insn %08x el%u\n", (unsigned long long)pc, insn, cpu->el);
+    }
     hv_raise_sync(cpu, HV_EC_UNKNOWN, 0, 0, pc);
 }
 
@@ -110,9 +116,31 @@ static uint64_t psci(HvCpu *cpu, uint64_t fn) {
     }
 }
 
+/* Bring-up aid: x0-x3, and any string they point to (read with the current EL's mapping). */
+void hv_debug_args(HvCpu *cpu) {
+    for (int i = 0; i < 4; i++) fprintf(stderr, " x%d=%llx", i, (unsigned long long)cpu->x[i]);
+    fprintf(stderr, "\n");
+    for (int i = 0; i < 4; i++) {
+        char str[161];
+        int n = 0;
+        for (; n < 160; n++) {
+            uint64_t pa;
+            if (hv_mmu_access(cpu, cpu->x[i] + n, HV_ACC_READ, cpu->el, &pa) || hv_phys_read(cpu->m, pa, &str[n], 1) ||
+                str[n] < 9 || (unsigned char)str[n] > 126)
+                break;
+        }
+        str[n] = 0;
+        if (n >= 4) fprintf(stderr, "    x%d -> \"%s\"\n", i, str);
+    }
+}
+
 int hv_exception_insn(HvCpu *cpu, uint32_t insn, uint64_t pc) {
     uint32_t imm16 = (insn >> 5) & 0xffff;
     uint32_t opc = (insn >> 21) & 7, ll = insn & 3;
+    if (opc == 0 && ll == 1 && cpu->m->log >= 3) {
+        fprintf(stderr, "svc #%x at %llx el%u:", imm16, (unsigned long long)pc, cpu->el);
+        hv_debug_args(cpu);
+    }
     if (opc == 0 && ll == 1) { /* SVC: ELR is the next instruction */
         hv_take_exception(cpu, HV_EXC_SYNC, HV_EC_SVC64 << 26 | 1u << 25 | imm16, 0, 0, pc + 4);
         return 1;

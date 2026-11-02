@@ -35,6 +35,7 @@ int main(void) {
     hv_machine_add_ram(&m, (uint64_t)(uintptr_t)stack, 65536, stack, 0);
     uint64_t sp = (uint64_t)(uintptr_t)stack + 32768;
 
+    m.trace = getenv("HV_TRACE") != NULL;
     int failed = 0;
     size_t count = sizeof programs / sizeof programs[0];
     for (size_t i = 0; i < count; i++) {
@@ -62,6 +63,8 @@ int main(void) {
         int bad = run_jit(&m, &pac_prog, &init, &jit, NULL);
         HvCpu want = init;
         want.x[4] = 0;
+        want.x[9] = init.x[30];  /* RETAB came back here, so x30 was restored */
+        want.x[10] = init.x[30];
         if (!bad) bad = compare_cpus("pac", &want, &jit);
         printf("%-12s       : %s\n", "pac", bad ? "FAIL" : "ok");
         failed += bad != 0;

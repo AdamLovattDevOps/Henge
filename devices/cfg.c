@@ -5,6 +5,10 @@
 #include <string.h>
 
 #define CFG_SIZE 0x10000
+/* iBootStage2 writes up to 0x500000 (seen as a data abort at 0x4ffff8 with the
+   64 KB QEMU uses), so the guest treats the whole megabyte from the config base
+   as memory. The structure stays in the first 64 KB; the rest is plain RAM. */
+#define CFG_WINDOW 0x100000
 
 typedef struct VMAppleCfg {
     uint32_t version;         /* 0x000 */
@@ -44,14 +48,44 @@ _Static_assert(offsetof(VMAppleCfg, cpu_ids) == 0x100, "cfg layout");
 _Static_assert(offsetof(VMAppleCfg, serial) == 0x500, "cfg layout");
 _Static_assert(offsetof(VMAppleCfg, soc_name) == 0x584, "cfg layout");
 
+/* The region is a device rather than RAM because of `rnd` (0x38): the boot ROM
+   fills buffers with random bytes by reading it once per word, so it behaves
+   as a random-number register. QEMU keeps it as a fixed property (default 0),
+   which gives the ROM all-zero randomness. Everything else reads back as
+   written, like the RAM QEMU uses. */
+static uint64_t rng_state; /* 0: use the system's random source */
+
+static uint64_t cfg_read(void *opaque, uint64_t off, unsigned size) {
+    uint64_t v = 0;
+    if (off >= 0x38 && off < 0x3c) {
+        uint64_t r;
+        if (rng_state) {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            r = rng_state;
+        } else {
+            r = (uint64_t)arc4random() << 32 | arc4random();
+        }
+        return size >= 4 ? (uint32_t)r : r & ((1ull << (size * 8)) - 1);
+    }
+    memcpy(&v, (uint8_t *)opaque + off, size);
+    return v;
+}
+
+static void cfg_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
+    memcpy((uint8_t *)opaque + off, &v, size);
+}
+
 static void put_str(char *dst, const char *src) {
     strncpy(dst, src, 31);
     dst[31] = 0;
 }
 
 uint8_t *hv_cfg_create(HvMachine *m, uint64_t pa, const HvCfgParams *p) {
-    uint8_t *mem = aligned_alloc(16384, CFG_SIZE);
-    memset(mem, 0, CFG_SIZE);
+    rng_state = p->seed;
+    uint8_t *mem = aligned_alloc(16384, CFG_WINDOW);
+    memset(mem, 0, CFG_WINDOW);
     VMAppleCfg *c = (VMAppleCfg *)mem;
     c->version = 2;
     c->nr_cpus = p->nr_cpus ? p->nr_cpus : 1;
@@ -77,7 +111,7 @@ uint8_t *hv_cfg_create(HvMachine *m, uint64_t pa, const HvCfgParams *p) {
     put_str(c->model, p->model ? p->model : "VM0001");
     c->unk10 = 1;
     put_str(c->soc_name, p->soc_name ? p->soc_name : "Apple M1 (Virtual)");
-    /* The guest may write it (QEMU maps it as RAM). */
-    hv_machine_add_ram(m, pa, CFG_SIZE, mem, 0);
+    hv_machine_add_mmio(m, pa, CFG_SIZE, mem, cfg_read, cfg_write, "cfg");
+    hv_machine_add_ram(m, pa + CFG_SIZE, CFG_WINDOW - CFG_SIZE, mem + CFG_SIZE, 0);
     return mem;
 }

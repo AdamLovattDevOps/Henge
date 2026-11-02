@@ -5,7 +5,7 @@
 static uint64_t one(HvGic *g, int ppi, uint64_t ctl, uint64_t cval, uint64_t now, uint64_t offset) {
     int enabled = (ctl & 1) && !(ctl & 2);
     int fired = enabled && now - offset >= cval;
-    hv_gic_set_irq(g, ppi, fired);
+    hv_gicv3_set_irq(g, ppi, fired);
     /* Deadline in host counter units; nothing to wait for if off or already firing. */
     return enabled && !fired ? cval + offset : 0;
 }

@@ -36,10 +36,10 @@ typedef struct HvGic {
     int depth;
 } HvGic;
 
-HvGic *hv_gic_create(HvMachine *m, uint64_t dist_pa, uint64_t redist_pa);
+HvGic *hv_gicv3_create(HvMachine *m, uint64_t dist_pa, uint64_t redist_pa);
 /* Drive an input line: PPIs (16-31) and SPIs (32+). */
-void hv_gic_set_irq(HvGic *g, int intid, int level);
+void hv_gicv3_set_irq(HvGic *g, int intid, int level);
 /* Recompute the CPU's IRQ and FIQ inputs. */
-void hv_gic_update(HvGic *g);
+void hv_gicv3_update(HvGic *g);
 
 #endif

@@ -68,7 +68,7 @@ static void test_gic(void) {
     wr32(VMAPPLE_GIC_DIST + 0x104, 1u << 1);
     wr8(VMAPPLE_GIC_DIST + 0x400 + 33, 0x80);
     check("ISENABLER1 reads back", rd32(VMAPPLE_GIC_DIST + 0x104) & 2, 2);
-    hv_gic_set_irq(g, 33, 1);
+    hv_gicv3_set_irq(g, 33, 1);
     check("level SPI raises IRQ", m.irq_line, 1);
     check("ISPENDR1 shows it", (rd32(VMAPPLE_GIC_DIST + 0x204) >> 1) & 1, 1);
     check("IAR1 = 33", m.icc_read(&m, &cpu, ICC_IAR1), 33);
@@ -76,7 +76,7 @@ static void test_gic(void) {
     check("nothing else pending", m.icc_read(&m, &cpu, ICC_IAR1), 1023);
     m.icc_write(&m, &cpu, ICC_EOIR1, 33);
     check("still-high level re-pends after EOI", m.irq_line, 1);
-    hv_gic_set_irq(g, 33, 0);
+    hv_gicv3_set_irq(g, 33, 0);
     check("level low: no IRQ", m.irq_line, 0);
 
     /* PMR masks; a higher-priority interrupt preempts a running one. */
@@ -84,22 +84,22 @@ static void test_gic(void) {
     wr32(VMAPPLE_GIC_DIST + 0x104, 1u << 2);
     wr8(VMAPPLE_GIC_DIST + 0x400 + 34, 0x40);
     m.icc_write(&m, &cpu, ICC_PMR, 0x80);
-    hv_gic_set_irq(g, 33, 1);
+    hv_gicv3_set_irq(g, 33, 1);
     check("priority 0x80 masked by PMR 0x80", m.irq_line, 0);
     m.icc_write(&m, &cpu, ICC_PMR, 0xff);
     check("unmasked", m.icc_read(&m, &cpu, ICC_IAR1), 33);
-    hv_gic_set_irq(g, 34, 1);
+    hv_gicv3_set_irq(g, 34, 1);
     check("higher priority preempts", m.irq_line, 1);
     check("IAR1 = 34", m.icc_read(&m, &cpu, ICC_IAR1), 34);
     m.icc_write(&m, &cpu, ICC_EOIR1, 34);
-    hv_gic_set_irq(g, 34, 0);
+    hv_gicv3_set_irq(g, 34, 0);
     m.icc_write(&m, &cpu, ICC_EOIR1, 33);
-    hv_gic_set_irq(g, 33, 0);
+    hv_gicv3_set_irq(g, 33, 0);
 
     /* Edge SPI: one pulse, one interrupt. */
     wr32(VMAPPLE_GIC_DIST + 0xc08, 2u << 2);  /* ICFGR2: INTID 33 edge */
-    hv_gic_set_irq(g, 33, 1);
-    hv_gic_set_irq(g, 33, 0);
+    hv_gicv3_set_irq(g, 33, 1);
+    hv_gicv3_set_irq(g, 33, 0);
     check("edge latched", m.icc_read(&m, &cpu, ICC_IAR1), 33);
     m.icc_write(&m, &cpu, ICC_EOIR1, 33);
     check("edge consumed", m.irq_line, 0);
@@ -133,8 +133,14 @@ static void test_simple_devices(void) {
     uint64_t rs = 0;
     hv_phys_read(&m, VMAPPLE_CONFIG + 0x20, &rs, 8);
     check("cfg ram_size", rs, RAM_SIZE);
-    check("cfg soc_name", memcmp(ram(VMAPPLE_CONFIG + 0x584), "Apple M1 (Virtual)", 19), 0);
-    check("cfg mac_en0", ram(VMAPPLE_CONFIG + 0x40)[5], 0x56);
+    char soc[20];
+    for (int i = 0; i < 19; i++) soc[i] = (char)rd8(VMAPPLE_CONFIG + 0x584 + i);
+    check("cfg soc_name", memcmp(soc, "Apple M1 (Virtual)", 19), 0);
+    check("cfg mac_en0", rd8(VMAPPLE_CONFIG + 0x40 + 5), 0x56);
+    uint32_t r1 = rd32(VMAPPLE_CONFIG + 0x38), r2 = rd32(VMAPPLE_CONFIG + 0x38);
+    check("cfg rnd changes on every read", r1 != r2, 1);
+    wr32(VMAPPLE_CONFIG + 0x3ac, 0x290001);
+    check("cfg scratch is writable", rd32(VMAPPLE_CONFIG + 0x3ac), 0x290001);
 
     /* PL031 */
     uint32_t t = rd32(VMAPPLE_RTC);

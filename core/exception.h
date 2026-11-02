@@ -39,6 +39,9 @@ void hv_eret(HvCpu *cpu);
 /* SVC, HVC (PSCI), SMC, BRK, HLT at pc. Returns 1: the block always leaves. */
 int hv_exception_insn(HvCpu *cpu, uint32_t insn, uint64_t pc);
 
+/* Prints x0-x3 and the strings they point to (bring-up aid). */
+void hv_debug_args(HvCpu *cpu);
+
 /* Called by the dispatcher between blocks. Returns 1 if an interrupt was taken. */
 int hv_check_interrupts(HvCpu *cpu);
 

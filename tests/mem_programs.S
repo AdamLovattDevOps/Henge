@@ -256,6 +256,34 @@ PROGRAM loops
     b.ne 3b
 END loops
 
+// A function epilogue from the boot ROM: x28 restored from an SP-based pair.
+PROGRAM epilogue
+    sub sp, sp, #0x100
+    stp x28, x27, [sp, #0xa0]
+    stp x26, x25, [sp, #0xb0]
+    stp x29, x30, [sp, #0xf0]
+    mov x28, #0x1234
+    mov x27, #0x5678
+    mov x26, #1
+    mov x25, #2
+    ldp x29, x30, [sp, #0xf0]
+    ldp x26, x25, [sp, #0xb0]
+    ldp x28, x27, [sp, #0xa0]
+    add sp, sp, #0x100
+    mov x1, x28
+    // The ROM's outlined prologue: imm7 = 20 puts 10 in bits 20..16, the
+    // number of the scratch register standing in for x28.
+    mov x28, #0x4321
+    sub sp, sp, #0x100
+    stp x28, x27, [sp, #0xa0]
+    ldp x2, x3, [sp, #0xa0]
+    stp x27, x28, [sp, #0x50]
+    ldp x4, x5, [sp, #0x50]
+    str x28, [sp, #0x50]
+    ldr x6, [sp, #0x50]
+    add sp, sp, #0x100
+END epilogue
+
 // JIT only: x0 is a fake device. Every access must reach it, at its own size.
 PROGRAM mmio
     str w1, [x0]
