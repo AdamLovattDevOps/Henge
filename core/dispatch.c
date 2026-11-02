@@ -93,18 +93,20 @@ uint32_t hv_helper(HvCpu *cpu, const HvHelperInfo *info) {
     }
 }
 
-/* WFI: sleep until an interrupt is pending (masked or not) or the next timer event. */
+/* WFI: sleep until an interrupt is pending (masked or not) or the next timer
+   event, at most 10 ms. WFI may complete early, so the guest just runs again
+   if nothing happened. */
 static int wait_for_interrupt(HvCpu *cpu) {
     HvMachine *m = cpu->m;
-    for (;;) {
-        uint64_t deadline = m->tick ? m->tick(m, cpu) : 0;
-        if (m->irq_line || m->fiq_line) return 0;
-        if (!m->tick) return -1; /* nothing could ever wake us */
-        uint64_t now = mach_absolute_time();
-        uint64_t wait_ticks = deadline && deadline > now ? deadline - now : 24000; /* 1 ms at 24 MHz */
-        if (wait_ticks > 240000) wait_ticks = 240000;
-        usleep((useconds_t)(wait_ticks / 24)); /* the host counter runs at 24 MHz */
-    }
+    uint64_t deadline = m->tick ? m->tick(m, cpu) : 0;
+    if (m->irq_line || m->fiq_line) return 0;
+    if (!m->tick) return -1; /* nothing could ever wake us */
+    uint64_t now = mach_absolute_time();
+    uint64_t wait_ticks = deadline && deadline > now ? deadline - now : 240000; /* the counter runs at 24 MHz */
+    if (wait_ticks > 240000) wait_ticks = 240000;
+    usleep((useconds_t)(wait_ticks / 24));
+    m->tick(m, cpu);
+    return 0;
 }
 
 int hv_run(HvCpu *cpu) {

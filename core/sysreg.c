@@ -135,8 +135,8 @@ static int read_reg(HvCpu *cpu, uint32_t reg, uint64_t *v) {
     case R(3, 3, 14, 3, 1): *v = timer_ctl(cpu->cntv_ctl, cpu->cntv_cval, now - cpu->cntvoff); return 0;
     case R(3, 3, 14, 3, 2): *v = cpu->cntv_cval; return 0;
     }
-    /* GIC CPU interface (ICC_*_EL1): CRn 12, CRm 8..12. */
-    if ((reg >> 14) == 3 && ((reg >> 11) & 7) == 0 && ((reg >> 7) & 15) == 12 && ((reg >> 3) & 15) >= 8) {
+    /* GIC CPU interface (ICC_*_EL1): CRn 12, CRm 8..12, and ICC_PMR_EL1. */
+    if (reg == R(3, 0, 4, 6, 0) || ((reg >> 14) == 3 && ((reg >> 11) & 7) == 0 && ((reg >> 7) & 15) == 12 && ((reg >> 3) & 15) >= 8)) {
         *v = m->icc_read ? m->icc_read(m, cpu, reg) : 0;
         return 0;
     }
@@ -191,18 +191,25 @@ static int write_reg(HvCpu *cpu, uint32_t reg, uint64_t v) {
     case R(3, 0, 14, 1, 0): cpu->cntkctl_el1 = v; return 0;
     case R(2, 0, 0, 2, 2): cpu->mdscr_el1 = v; return 0;
     case R(3, 2, 0, 0, 0): cpu->csselr_el1 = v & 0xf; return 0;
-    case R(3, 3, 14, 2, 0): cpu->cntp_cval = counter() + (uint64_t)(int64_t)(int32_t)v; return 0;
-    case R(3, 3, 14, 2, 1): cpu->cntp_ctl = v & 3; return 0;
-    case R(3, 3, 14, 2, 2): cpu->cntp_cval = v; return 0;
-    case R(3, 3, 14, 3, 0): cpu->cntv_cval = counter() - cpu->cntvoff + (uint64_t)(int64_t)(int32_t)v; return 0;
-    case R(3, 3, 14, 3, 1): cpu->cntv_ctl = v & 3; return 0;
-    case R(3, 3, 14, 3, 2): cpu->cntv_cval = v; return 0;
+    case R(3, 3, 14, 2, 0): cpu->cntp_cval = counter() + (uint64_t)(int64_t)(int32_t)v; break;
+    case R(3, 3, 14, 2, 1): cpu->cntp_ctl = v & 3; break;
+    case R(3, 3, 14, 2, 2): cpu->cntp_cval = v; break;
+    case R(3, 3, 14, 3, 0): cpu->cntv_cval = counter() - cpu->cntvoff + (uint64_t)(int64_t)(int32_t)v; break;
+    case R(3, 3, 14, 3, 1): cpu->cntv_ctl = v & 3; break;
+    case R(3, 3, 14, 3, 2): cpu->cntv_cval = v; break;
+    default: goto other;
     }
+    /* Timer outputs follow their registers at once, as in hardware: a masked
+       timer must drop its line before the handler's EOI. */
+    if (m->tick) m->tick(m, cpu);
+    return 0;
+other:
     /* PAuth key registers (CRn 2, CRm 1..3): kept, never used, since signing is a no-op. */
     if ((reg >> 14) == 3 && ((reg >> 11) & 7) == 0 && ((reg >> 7) & 15) == 2 && ((reg >> 3) & 15) >= 1 &&
         ((reg >> 3) & 15) <= 3)
         return 0;
-    if ((reg >> 14) == 3 && ((reg >> 11) & 7) == 0 && ((reg >> 7) & 15) == 12 && ((reg >> 3) & 15) >= 8) {
+    if (reg == R(3, 0, 4, 6, 0) ||
+        ((reg >> 14) == 3 && ((reg >> 11) & 7) == 0 && ((reg >> 7) & 15) == 12 && ((reg >> 3) & 15) >= 8)) {
         if (m->icc_write) m->icc_write(m, cpu, reg, v);
         return 0;
     }

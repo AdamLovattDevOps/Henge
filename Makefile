@@ -5,13 +5,13 @@ B = build
 
 CORE = $(B)/classify.o $(B)/operands.o $(B)/translate.o $(B)/dispatch.o $(B)/mmu.o $(B)/memop.o \
        $(B)/exception.o $(B)/sysreg.o $(B)/machine.o
-HOST = $(B)/jit_region.o $(B)/enter.o
+HOST = $(B)/jit_region.o $(B)/enter.o $(B)/disk.o
 DEV = $(B)/gicv3.o $(B)/timer.o $(B)/pl011.o $(B)/pl031.o $(B)/cfg.o $(B)/bdif.o $(B)/pcie.o \
-      $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_net.o
+      $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_net.o $(B)/vmapple.o
 ENGINE = $(CORE) $(HOST)
 
 TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-        $(B)/test_mmu $(B)/test_exc
+        $(B)/test_mmu $(B)/test_exc $(B)/test_devices
 
 all: $(TESTS)
 
@@ -21,7 +21,7 @@ $(B)/%.o: host/%.c host/*.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(B)/%.o: host/%.S | $(B)
 	$(CC) -c $< -o $@
-$(B)/%.o: devices/%.c devices/*.h core/*.h | $(B)
+$(B)/%.o: devices/%.c devices/*.h core/*.h host/*.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(B)/test_classify: tests/test_classify.c tests/classify_cases.s $(B)/classify.o
