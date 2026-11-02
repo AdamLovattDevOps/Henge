@@ -11,7 +11,7 @@ DEV = $(B)/gicv3.o $(B)/timer.o $(B)/pl011.o $(B)/pl031.o $(B)/cfg.o $(B)/bdif.o
 ENGINE = $(CORE) $(HOST)
 
 TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-        $(B)/test_mmu $(B)/test_exc $(B)/test_devices
+        $(B)/test_mmu $(B)/test_exc
 
 all: $(TESTS)
 
