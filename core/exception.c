@@ -111,7 +111,25 @@ static uint64_t psci(HvCpu *cpu, uint64_t fn) {
         return (uint64_t)-2;                                 /* INVALID_PARAMETERS */
     case 0x84000004: case 0xc4000004:                        /* AFFINITY_INFO */
         return (cpu->x[1] & 0xffffff) == (cpu->mpidr & 0xffffff) ? 0 : 1;
+    /* vmapple's paravirtualized PAC (XNU osfmk/arm64/hv_hvc.h): the guest
+       cannot program PAC keys itself, so the hypervisor does. HengeVM never
+       signs pointers, so there is nothing to program; each call only has to
+       succeed (XNU spins on a nonzero x0). */
+    case 0xc1000000: /* VMAPPLE_PAC_SET_INITIAL_STATE */
+    case 0xc1000002: /* VMAPPLE_PAC_SET_A_KEYS */
+    case 0xc1000003: /* VMAPPLE_PAC_SET_B_KEYS */
+    case 0xc1000004: /* VMAPPLE_PAC_SET_EL0_DIVERSIFIER */
+    case 0xc1000005: /* VMAPPLE_PAC_SET_EL0_DIVERSIFIER_AT_EL1 */
+    case 0xc1000006: /* VMAPPLE_PAC_SET_G_KEY */
+    case 0xc10000f0: /* VMAPPLE_PAC_NOP */
+        return 0;
+    case 0xc1000001: /* VMAPPLE_PAC_GET_DEFAULT_KEYS: x2 = default ROP id, x3 = default JOP id */
+        cpu->x[2] = 0x524f50; /* the values only name keys, and no key is ever used */
+        cpu->x[3] = 0x4a4f50;
+        return 0;
     default:
+        if (cpu->m->log) fprintf(stderr, "hengevm: unknown hypervisor call %#llx (x1 %#llx) at el%u\n",
+                                 (unsigned long long)fn, (unsigned long long)cpu->x[1], cpu->el);
         return (uint64_t)-1;                                 /* NOT_SUPPORTED */
     }
 }
