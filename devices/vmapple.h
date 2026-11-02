@@ -25,6 +25,8 @@
 #define VMAPPLE_GPIO       0x20060000ull
 #define VMAPPLE_PVPANIC    0x20070000ull
 #define VMAPPLE_BDOOR      0x30000000ull
+#define VMAPPLE_GFX        0x30200000ull /* paravirtualized graphics: present but inert */
+#define VMAPPLE_IOSFC      0x30210000ull
 #define VMAPPLE_AES_1      0x30220000ull
 #define VMAPPLE_AES_2      0x30230000ull
 #define VMAPPLE_RTC_SELECT 0x30240000ull /* not in QEMU's map; see vmapple.c */

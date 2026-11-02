@@ -66,6 +66,23 @@ static void gic_msi_write(void *opaque, uint64_t off, uint64_t v, unsigned size)
                            (unsigned long long)v, size);
 }
 
+/* Paravirtualized graphics (gfx, iosurface-mapper). QEMU's apple-gfx passes
+   these to ParavirtualizedGraphics.framework, which iOS does not have, and the
+   protocol is not documented. Until there is a display path the device is
+   present but inert: reads give 0, writes are dropped, everything is logged. */
+static uint64_t pvg_read(void *opaque, uint64_t off, unsigned size) {
+    HvVmapple *b = opaque;
+    if (b->m->log) fprintf(stderr, "hengevm: pvg read +%llx (size %u) pc %llx\n", (unsigned long long)off, size,
+                           (unsigned long long)b->m->access_pc);
+    return 0;
+}
+
+static void pvg_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
+    HvVmapple *b = opaque;
+    if (b->m->log) fprintf(stderr, "hengevm: pvg write +%llx = %llx (size %u)\n", (unsigned long long)off,
+                           (unsigned long long)v, size);
+}
+
 static uint64_t tick(HvMachine *m, HvCpu *cpu) {
     HvVmapple *b = m->tick_opaque;
     uint64_t deadline = hv_timer_update(b->gic, cpu);
@@ -96,6 +113,8 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
     b->bdif = hv_bdif_create(m, VMAPPLE_BDOOR, root, aux);
     b->aes = hv_aes_create(m, b->gic, VMAPPLE_AES_1, VMAPPLE_AES_2, 32 + VMAPPLE_IRQ_AES);
     hv_machine_add_mmio(m, VMAPPLE_PVPANIC, 2, b, pvpanic_read, pvpanic_write, "pvpanic");
+    hv_machine_add_mmio(m, VMAPPLE_GFX, 0x10000, b, pvg_read, pvg_write, "gfx");
+    hv_machine_add_mmio(m, VMAPPLE_IOSFC, 0x10000, b, pvg_read, pvg_write, "iosurface");
     hv_machine_add_mmio(m, VMAPPLE_RTC_SELECT, 0x4000, b, rtc_select_read, rtc_select_write, "rtc-select");
     HvCfgParams p = *cfg;
     p.ram_size = ram_size;
