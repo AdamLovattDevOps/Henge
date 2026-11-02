@@ -12,6 +12,7 @@
 #include "translate.h"
 
 void hv_flush_blocks(HvMachine *m) {
+    m->stats.block_flushes++;
     memset(m->hash, 0, sizeof m->hash);
     m->nblocks = 0;
     hv_jit_reset(&m->jit);
@@ -19,6 +20,8 @@ void hv_flush_blocks(HvMachine *m) {
 
 static uint32_t block_flags(HvCpu *cpu) {
     uint32_t flags = cpu->el ? HV_BLOCK_EL1 : 0;
+    if (cpu->el && cpu->spsel) flags |= HV_BLOCK_SPX;
+    if (cpu->el && (cpu->pstate_extra & HV_PSTATE_PAN)) flags |= HV_BLOCK_PAN;
     uint32_t fpen = (cpu->cpacr_el1 >> 20) & 3;
     if (fpen == 0 || fpen == 2 || (fpen == 1 && cpu->el == 0)) flags |= HV_BLOCK_FPOFF;
     return flags;
@@ -32,14 +35,22 @@ static uint32_t hash_of(uint64_t va, uint64_t pa, uint32_t flags) {
 static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, const uint32_t *code, uint32_t avail) {
     HvMachine *m = cpu->m;
     uint32_t h = hash_of(va, pa, flags);
+    HvRam *ram = hv_ram_lookup(m, pa);
+    uint64_t pg = (pa - ram->pa) >> HV_TLB_PAGE_BITS;
+    uint32_t gen = ram->page_gen[pg];
     for (HvBlock *b = m->hash[h]; b; b = b->next)
-        if (b->va == va && b->pa == pa && b->flags == flags) return b;
+        if (b->va == va && b->pa == pa && b->flags == flags && b->gen == gen) return b;
 
     for (int attempt = 0; attempt < 2; attempt++) {
-        if (m->nblocks == HV_MAX_BLOCKS) hv_flush_blocks(m);
+        if (m->nblocks == HV_MAX_BLOCKS) {
+            m->stats.flush_full++;
+            hv_flush_blocks(m);
+        }
         HvBlock *b = &m->blocks[m->nblocks];
-        *b = (HvBlock){.va = va, .pa = pa, .flags = flags};
+        *b = (HvBlock){.va = va, .pa = pa, .flags = flags, .gen = gen};
+        m->stats.translations++;
         if (hv_translate_block(m, b, code, avail) != 0) {
+            m->stats.flush_full++;
             hv_flush_blocks(m); /* JIT region full: start over */
             h = hash_of(va, pa, flags);
             continue;
@@ -48,8 +59,6 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
         b->next = m->hash[h];
         m->hash[h] = b;
         /* Writes to this page must now take the slow path so we notice them. */
-        HvRam *ram = hv_ram_lookup(m, pa);
-        uint64_t pg = (pa - ram->pa) >> HV_TLB_PAGE_BITS;
         if (!ram->code_pages[pg]) {
             ram->code_pages[pg] = 1;
             hv_tlb_flush(cpu);
@@ -60,7 +69,12 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
 }
 
 /* Blocks call this through hv_helper_entry. Returns 1 to leave the block. */
+static uint32_t reg_hist[65536]; /* --stats: MRS/MSR/SYS by op0:op1:CRn:CRm:op2 */
+
 uint32_t hv_helper(HvCpu *cpu, const HvHelperInfo *info) {
+    if (info->op < 12) cpu->m->stats.helper[info->op]++;
+    if (cpu->m->stats_interval && (info->op == HV_OP_MRS || info->op == HV_OP_MSR || info->op == HV_OP_SYS))
+        reg_hist[(info->insn >> 5) & 0xffff] += info->op == HV_OP_MRS ? 1 : 0x10000;
     switch (info->op) {
     case HV_OP_MEM:
         cpu->m->stat_slow_mem++;
@@ -104,9 +118,49 @@ static int wait_for_interrupt(HvCpu *cpu) {
     uint64_t now = mach_absolute_time();
     uint64_t wait_ticks = deadline && deadline > now ? deadline - now : 240000; /* the counter runs at 24 MHz */
     if (wait_ticks > 240000) wait_ticks = 240000;
+    uint64_t t0 = mach_absolute_time();
     usleep((useconds_t)(wait_ticks / 24));
+    m->stats.wfi++;
+    m->stats.wfi_ticks += mach_absolute_time() - t0;
     m->tick(m, cpu);
     return 0;
+}
+
+static void print_stats(HvCpu *cpu, int force) {
+    static uint64_t last_t, start_t;
+    static HvStats last;
+    HvMachine *m = cpu->m;
+    uint64_t now = mach_absolute_time();
+    if (!start_t) start_t = last_t = now;
+    if (!force && now - last_t < (uint64_t)m->stats_interval * 24000000ull) return;
+    double dt = (double)(now - last_t) / 24e6;
+    HvStats *s = &m->stats;
+#define RATE(f) ((double)(s->f - last.f) / dt)
+    fprintf(stderr,
+            "stats %5.0fs: blocks %.2fM/s, translated %.0f/s, slow mem %.0fK/s, mrs %.0fK/s msr %.0fK/s sys %.0fK/s, "
+            "exc %.0f/s irq %.0f/s, tlb flush %.0f/s, fetch walks %.0fK/s, wfi %.0f/s (%.0f%% idle), flushes %.0f/s (smc %.0f ic %.0f full %.0f), el%u pc %llx\n",
+            (double)(now - start_t) / 24e6, RATE(blocks) / 1e6, RATE(translations), RATE(helper[HV_OP_MEM]) / 1e3,
+            RATE(helper[HV_OP_MRS]) / 1e3, RATE(helper[HV_OP_MSR]) / 1e3, RATE(helper[HV_OP_SYS]) / 1e3,
+            RATE(exceptions), RATE(interrupts), RATE(tlb_flushes), RATE(fetch_walks) / 1e3, RATE(wfi),
+            100.0 * (double)(s->wfi_ticks - last.wfi_ticks) / (double)(now - last_t), RATE(block_flushes), RATE(flush_smc),
+            RATE(flush_ic), RATE(flush_full), cpu->el,
+            (unsigned long long)cpu->pc);
+#undef RATE
+    /* The five busiest system registers or SYS operations (reads + writes) this interval. */
+    for (int k = 0; k < 5; k++) {
+        uint32_t best = 0, bi = 0;
+        for (uint32_t r = 0; r < 65536; r++) {
+            uint32_t n = (reg_hist[r] & 0xffff) + (reg_hist[r] >> 16);
+            if (n > best) best = n, bi = r;
+        }
+        if (!best) break;
+        fprintf(stderr, "   S%u_%u_C%u_C%u_%u: %u reads %u writes/sys\n", bi >> 14, (bi >> 11) & 7, (bi >> 7) & 15,
+                (bi >> 3) & 15, bi & 7, reg_hist[bi] & 0xffff, reg_hist[bi] >> 16);
+        reg_hist[bi] = 0;
+    }
+    memset(reg_hist, 0, sizeof reg_hist);
+    last = *s;
+    last_t = now;
 }
 
 static int run(HvCpu *cpu, int one);
@@ -176,6 +230,8 @@ static int run(HvCpu *cpu, int one) {
         prev_pc = cpu->pc;
         cpu->exit_reason = HV_EXIT_BRANCH;
         cpu->icount++;
+        m->stats.blocks++;
+        if (m->stats_interval && (m->stats.blocks & 0xffff) == 0) print_stats(cpu, 0);
         hv_enter(cpu, b->code);
 
         switch (cpu->exit_reason) {

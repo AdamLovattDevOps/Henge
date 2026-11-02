@@ -385,10 +385,7 @@ static int rmw_target(HvCpu *cpu, uint64_t va, uint32_t bytes, int el, uint64_t 
     if (*host) {
         /* Same rule as other writes: drop translations made from this page. */
         uint64_t pg = (pa - ram->pa) >> HV_TLB_PAGE_BITS;
-        if (ram->code_pages[pg]) {
-            memset(ram->code_pages, 0, (ram->size + (1u << HV_TLB_PAGE_BITS) - 1) >> HV_TLB_PAGE_BITS);
-            cpu->m->flush_pending = 1;
-        }
+        if (ram->code_pages[pg]) hv_invalidate_code(cpu->m, pa);
     }
     *mmio_pa = pa;
     return 0;

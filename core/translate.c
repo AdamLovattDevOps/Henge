@@ -408,10 +408,12 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
 
     /* TLB: index from the first byte, tag check against the last one, so an
        access that crosses into the next page misses. Uses no flags. */
-    int el_idx = op.unpriv ? 0 : (e->flags & HV_BLOCK_EL1) ? 1 : 0;
-    uint32_t tlb = HV_CPU_TLB + el_idx * HV_CPU_TLB_EL;
+    int el_idx = op.unpriv || !(e->flags & HV_BLOCK_EL1) ? 0 : (e->flags & HV_BLOCK_PAN) ? 2 : 1;
+    uint32_t tlb = HV_CPU_TLB;
     put(e, UBFM_X(T, A, HV_TLB_PAGE_BITS, HV_TLB_PAGE_BITS + HV_TLB_BITS - 1));
     put(e, ADD_LSL(T, 28, T, 5));
+    /* EL1's table lies beyond a load's immediate range: step over EL0's. */
+    if (el_idx) put(e, 0x91400000u | (uint32_t)((el_idx * HV_CPU_TLB_EL) >> 12) << 10 | T << 5 | T); /* add T, T, #table */
     put(e, LDR_X(U, T, tlb + (op.store ? 8 : 0)));
     put(e, SUB_X(U, A, U));
     if (op.align && op.bytes > 1) {
@@ -509,6 +511,119 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
     e->ool[slow].join = e->n;
 }
 
+/* System registers that are plain storage, or host registers that already
+   hold the guest's value: MRS/MSR to these need no helper and do not end the
+   block. Anything with side effects (DAIF, SPSel writes, the MMU, timers, GIC)
+   still goes through the helper. Returns 1 if handled. */
+#define SR(op0, op1, crn, crm, op2) ((op0) << 14 | (op1) << 11 | (crn) << 7 | (crm) << 3 | (op2))
+
+static void put_load_field(Emit *e, int rt, uint32_t off) {
+    if (rt == 31) return;
+    if (!is_stolen(rt)) {
+        put(e, LDR_X(rt, 28, off));
+        return;
+    }
+    uint8_t s = 9;
+    spill(e, &s, 1);
+    put(e, LDR_X(s, 28, off));
+    put(e, STR_X(s, 28, slot_of(rt)));
+    unspill(e, &s, 1);
+}
+
+static void put_store_field(Emit *e, int rt, uint32_t off) {
+    if (!is_stolen(rt)) {
+        put(e, STR_X(rt, 28, off)); /* 31 stores XZR */
+        return;
+    }
+    uint8_t s = 9;
+    spill(e, &s, 1);
+    put(e, LDR_X(s, 28, slot_of(rt)));
+    put(e, STR_X(s, 28, off));
+    unspill(e, &s, 1);
+}
+
+/* MRS/MSR of NZCV, FPCR, FPSR: the host registers are the guest's. */
+static void put_native_sysreg(Emit *e, uint32_t insn, int read) {
+    int rt = insn & 0x1f;
+    if (!is_stolen(rt)) {
+        put(e, insn);
+        return;
+    }
+    uint8_t s = 9;
+    spill(e, &s, 1);
+    if (read) {
+        put(e, (insn & ~0x1fu) | s);
+        put(e, STR_X(s, 28, slot_of(rt)));
+    } else {
+        put(e, LDR_X(s, 28, slot_of(rt)));
+        put(e, (insn & ~0x1fu) | s);
+    }
+    unspill(e, &s, 1);
+}
+
+static int translate_sysreg_inline(Emit *e, uint32_t insn) {
+    if (((insn >> 19) & 3) == 0) return 0; /* MSR (immediate) */
+    int read = (insn >> 21) & 1, rt = insn & 0x1f;
+    uint32_t reg = (insn >> 5) & 0xffff;
+    int el1 = (e->flags & HV_BLOCK_EL1) != 0, spx = (e->flags & HV_BLOCK_SPX) != 0;
+    int fp_ok = !(e->flags & HV_BLOCK_FPOFF);
+    switch (reg) {
+    case SR(3, 3, 4, 2, 0): /* NZCV */
+        put_native_sysreg(e, insn, read);
+        return 1;
+    case SR(3, 3, 4, 4, 0): /* FPCR */
+    case SR(3, 3, 4, 4, 1): /* FPSR */
+        if (!fp_ok) return 0; /* traps: leave it to the helper */
+        put_native_sysreg(e, insn, read);
+        return 1;
+    case SR(3, 3, 13, 0, 2): /* TPIDR_EL0 */
+        if (read) put_load_field(e, rt, HV_CPU_TPIDR_EL0);
+        else put_store_field(e, rt, HV_CPU_TPIDR_EL0);
+        return 1;
+    case SR(3, 3, 13, 0, 3): /* TPIDRRO_EL0: EL0 may only read it */
+        if (read) put_load_field(e, rt, HV_CPU_TPIDRRO_EL0);
+        else if (el1) put_store_field(e, rt, HV_CPU_TPIDRRO_EL0);
+        else return 0;
+        return 1;
+    case SR(3, 0, 13, 0, 4): /* TPIDR_EL1 */
+    case SR(3, 0, 4, 0, 1):  /* ELR_EL1 */
+    case SR(3, 0, 4, 0, 0): { /* SPSR_EL1 */
+        if (!el1) return 0;
+        uint32_t off = reg == SR(3, 0, 13, 0, 4) ? HV_CPU_TPIDR_EL1 : reg == SR(3, 0, 4, 0, 1) ? HV_CPU_ELR_EL1 : HV_CPU_SPSR_EL1;
+        if (read) put_load_field(e, rt, off);
+        else put_store_field(e, rt, off);
+        return 1;
+    }
+    case SR(3, 0, 1, 0, 0): /* SCTLR_EL1, ESR_EL1, FAR_EL1: reads (writes have side effects or are rare) */
+    case SR(3, 0, 5, 2, 0):
+    case SR(3, 0, 6, 0, 0): {
+        if (!read || !el1) return 0;
+        uint32_t off = reg == SR(3, 0, 1, 0, 0) ? HV_CPU_SCTLR_EL1 : reg == SR(3, 0, 5, 2, 0) ? HV_CPU_ESR_EL1 : HV_CPU_FAR_EL1;
+        put_load_field(e, rt, off);
+        return 1;
+    }
+    case SR(3, 0, 4, 1, 0): /* SP_EL0: only while it is banked (SPSel = 1) */
+        if (!el1 || !spx) return 0;
+        if (read) put_load_field(e, rt, HV_CPU_SP_EL0);
+        else put_store_field(e, rt, HV_CPU_SP_EL0);
+        return 1;
+    case SR(3, 3, 4, 2, 1): /* DAIF: reads only; writes can unmask interrupts */
+        if (!read || !el1) return 0;
+        put_load_field(e, rt, HV_CPU_DAIF);
+        return 1;
+    case SR(3, 0, 4, 2, 0): /* SPSel */
+        if (!read || !el1) return 0;
+        put_const_to(e, rt, (uint64_t)spx);
+        return 1;
+    case SR(3, 0, 4, 2, 2): /* CurrentEL */
+        if (!read || !el1) return 0;
+        put_const_to(e, rt, 4);
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static int is_fp_insn(uint32_t insn) {
     uint32_t op0 = (insn >> 25) & 0xf;
     if ((op0 & 0x7) == 0x7) return 1;                        /* SIMD and FP data processing */
@@ -546,6 +661,7 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
         translate_mem(e, insn, pc);
         return 0;
     case HV_INSN_SYSREG:
+        if (translate_sysreg_inline(e, insn)) return 0;
         if (((insn >> 21) & 1) && ((insn >> 19) & 3)) { /* MRS */
             put_helper(e, pc, insn, HV_OP_MRS);
             return 0;
@@ -554,8 +670,14 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
         put_exit(e, pc + 4);
         return 1;
     case HV_INSN_SYS: {
+        uint32_t crn = (insn >> 12) & 0xf, crm = (insn >> 8) & 0xf, op1 = (insn >> 16) & 7, op2 = (insn >> 5) & 7;
+        /* Data-cache maintenance by VA or set/way: memory here is coherent, so
+           there is nothing to do. DC ZVA writes memory and AT translates, so
+           those still go to the helper. */
+        int dc_zva = op1 == 3 && crm == 4 && op2 == 1;
+        int at = crm == 8 || crm == 9;
+        if (crn == 7 && crm != 1 && crm != 5 && !dc_zva && !at) return 0;
         put_helper(e, pc, insn, HV_OP_SYS);
-        uint32_t crn = (insn >> 12) & 0xf, crm = (insn >> 8) & 0xf;
         if (crn == 7 && crm != 1 && crm != 5) return 0; /* DC and AT continue; IC and TLBI leave */
         put_exit(e, pc + 4);
         return 1;

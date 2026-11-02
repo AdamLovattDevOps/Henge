@@ -25,8 +25,7 @@ void hv_sp_switch(HvCpu *cpu, uint32_t el, uint32_t spsel) {
 }
 
 static void set_extra(HvCpu *cpu, uint64_t extra) {
-    /* EL1's TLB entries were filled under the old PAN setting. */
-    if ((extra ^ cpu->pstate_extra) & HV_PSTATE_PAN) memset(cpu->tlb[1], 0xff, sizeof cpu->tlb[1]);
+    /* PAN selects a different TLB table (hv_tlb_table), so nothing to flush. */
     cpu->pstate_extra = extra;
 }
 
@@ -41,6 +40,8 @@ void hv_pstate_set(HvCpu *cpu, uint64_t spsr) {
 }
 
 void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set_far, uint64_t ret) {
+    if (type == HV_EXC_SYNC) cpu->m->stats.exceptions++;
+    else cpu->m->stats.interrupts++;
     uint64_t spsr = hv_pstate_get(cpu);
     if (cpu->m->trace || cpu->m->log >= 2)
         fprintf(stderr, "exception type %d esr %08x far %llx from pc %llx el%u\n", type, esr, (unsigned long long)far,

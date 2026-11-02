@@ -30,6 +30,7 @@ void hv_mmu_walk(HvCpu *cpu, uint64_t va, HvAccess acc, int el, HvWalk *out);
 
 void hv_tlb_flush(HvCpu *cpu);
 void hv_tlb_flush_va(HvCpu *cpu, uint64_t va);
+void hv_tlb_flush_user(HvCpu *cpu);
 
 /* Translates for a C access of `len` bytes that stays inside one 16 KB page,
    filling the TLB when the page is ordinary RAM. Returns 0 and sets *pa, or the

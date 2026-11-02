@@ -120,13 +120,26 @@ void hv_mmu_walk(HvCpu *cpu, uint64_t va, HvAccess acc, int el, HvWalk *out) {
 }
 
 void hv_tlb_flush(HvCpu *cpu) {
+    if (cpu->m) cpu->m->stats.tlb_flushes++;
     memset(cpu->tlb, 0xff, sizeof cpu->tlb);
+}
+
+/* TTBR0 changed or an ASID was dropped: only user-half (TTBR0) translations go;
+   the kernel's TTBR1 entries stay. */
+void hv_tlb_flush_user(HvCpu *cpu) {
+    if (cpu->m) cpu->m->stats.tlb_flushes++;
+    for (int t = 0; t < 3; t++)
+        for (uint32_t i = 0; i < HV_TLB_SIZE; i++) {
+            HvTlbEntry *e = &cpu->tlb[t][i];
+            uint64_t tag = e->read_tag != ~0ull ? e->read_tag : e->exec_tag != ~0ull ? e->exec_tag : e->write_tag;
+            if (tag != ~0ull && !((tag >> 55) & 1)) memset(e, 0xff, sizeof *e);
+        }
 }
 
 void hv_tlb_flush_va(HvCpu *cpu, uint64_t va) {
     /* Tagged addresses may sit in any slot's tag byte, so check by the low 56 bits. */
     uint32_t idx = (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1);
-    for (int el = 0; el < 2; el++) {
+    for (int el = 0; el < 3; el++) {
         HvTlbEntry *e = &cpu->tlb[el][idx];
         memset(e, 0xff, sizeof *e);
     }
@@ -140,7 +153,7 @@ static void tlb_fill(HvCpu *cpu, uint64_t va, int el, const HvWalk *w) {
     if (page_pa < ram->pa || page_pa + PAGE_MASK + 1 - ram->pa > ram->size) return;
     uint64_t pg = (page_pa - ram->pa) >> HV_TLB_PAGE_BITS;
     uint64_t page_va = va & ~PAGE_MASK;
-    HvTlbEntry *e = &cpu->tlb[el ? 1 : 0][(va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1)];
+    HvTlbEntry *e = &cpu->tlb[hv_tlb_table(cpu, el)][(va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1)];
     e->addend = (int64_t)((uint64_t)(uintptr_t)(ram->host + (page_pa - ram->pa)) - page_va);
     e->read_tag = w->r ? page_va : ~0ull;
     /* Writes to ROM or to pages we translated from take the slow path. */
@@ -166,7 +179,7 @@ const uint32_t *hv_mmu_fetch(HvCpu *cpu, uint64_t va, uint64_t *pa, uint32_t *av
         hv_raise_sync(cpu, HV_EC_PC_ALIGN, 0, va, va);
         return NULL;
     }
-    HvTlbEntry *t = &cpu->tlb[cpu->el ? 1 : 0][(va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1)];
+    HvTlbEntry *t = &cpu->tlb[hv_tlb_table(cpu, cpu->el)][(va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1)];
     if (t->exec_tag == (va & ~PAGE_MASK)) {
         uint8_t *host = (uint8_t *)(uintptr_t)(va + t->addend);
         for (int i = 0; i < cpu->m->nram; i++) {
@@ -179,6 +192,7 @@ const uint32_t *hv_mmu_fetch(HvCpu *cpu, uint64_t va, uint64_t *pa, uint32_t *av
         }
     }
     HvWalk w;
+    cpu->m->stats.fetch_walks++;
     hv_mmu_walk(cpu, va, HV_ACC_EXEC, cpu->el, &w);
     if (w.fsc) {
         hv_raise_abort(cpu, 1, va, w.fsc, 0, w.s1ptw, va);

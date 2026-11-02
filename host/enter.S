@@ -91,8 +91,13 @@
     b.eq 1f
     msr fpcr, x0
 1:
+    // FPSR writes serialize the pipeline on Apple cores: skip them when unchanged.
     ldr x0, [x28, #CPU_FPSR]
+    mrs x1, fpsr
+    cmp x0, x1
+    b.eq 2f
     msr fpsr, x0
+2:
     ldr x0, [x28, #CPU_NZCV]
     msr nzcv, x0
 .endm

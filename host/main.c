@@ -102,7 +102,7 @@ static void *cpu_thread(void *unused) {
 }
 
 static void usage(void) {
-    fprintf(stderr, "usage: hengevm --rom FILE --disk FILE --aux FILE --ecid N [--seed N] [--ram MB] [--log N] [--trace 1] [--screenshot PNG] [--watch VA] [--no-pvg] [--break PC [--break-hits N]] [--dump PA LEN FILE] [--aux-offset BYTES]\n");
+    fprintf(stderr, "usage: hengevm --rom FILE --disk FILE --aux FILE --ecid N [--seed N] [--ram MB] [--log N] [--trace 1] [--screenshot PNG] [--watch VA] [--stats SECONDS] [--no-pvg] [--break PC [--break-hits N]] [--dump PA LEN FILE] [--aux-offset BYTES]\n");
     exit(2);
 }
 
@@ -111,7 +111,8 @@ int main(int argc, char **argv) {
     uint64_t seed = 0, ecid = 0, ram_mb = 4096, aux_offset = 16384;
     int log = 1, trace = 0, use_pvg = 1;
     const char *screenshot = NULL;
-    uint64_t watch = 0;
+    uint64_t watch = 0, watch_pa = 0;
+    int stats = 0;
     uint64_t brk = ~0ull, brk_hits = 1, dump_pa = 0, dump_len = 0;
     const char *dump_path = NULL;
     for (int i = 1; i < argc; i++) {
@@ -130,7 +131,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--trace")) trace = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--screenshot")) screenshot = argv[++i];
         else if (!strcmp(argv[i], "--watch")) watch = strtoull(argv[++i], NULL, 0);
-        else if (!strcmp(argv[i], "--watch-pa")) m.watch_pa = strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--stats")) stats = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--watch-pa")) watch_pa = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--translate")) translate_va = strtoull(argv[++i], NULL, 0);
 
         else if (!strcmp(argv[i], "--break")) brk = strtoull(argv[++i], NULL, 0);
@@ -158,6 +160,8 @@ int main(int argc, char **argv) {
     m.log = log;
     m.trace = trace;
     m.watch_va = watch;
+    m.watch_pa = watch_pa;
+    m.stats_interval = stats; /* set after hv_machine_init, which clears the machine */
     HvCfgParams cfg = {.nr_cpus = 1, .ecid = ecid, .seed = seed, .mac_en0 = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01}};
     static const uint8_t mac[6] = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01};
     if (hv_vmapple_create(&board, &m, &cpu, ram_mb << 20, &disk, &aux, &cfg, mac) != 0 ||

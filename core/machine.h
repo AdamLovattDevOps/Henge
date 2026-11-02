@@ -13,6 +13,7 @@ typedef struct HvRam {
     uint8_t *host;
     int readonly;
     uint8_t *code_pages; /* one byte per 16 KB page: a translated block came from here */
+    uint32_t *page_gen;  /* per page: bumped to invalidate the blocks translated from it */
 } HvRam;
 
 typedef struct HvMmio {
@@ -27,17 +28,29 @@ typedef struct HvBlock {
     uint64_t va, pa;
     uint32_t flags;      /* HV_BLOCK_* state the translation depends on */
     uint32_t ninsns;
+    uint32_t gen;        /* page_gen of its page when translated */
     uint32_t *code;
     struct HvBlock *next;
 } HvBlock;
 
 #define HV_BLOCK_EL1   1u        /* translated for EL1 (selects tlb[1]) */
 #define HV_BLOCK_FPOFF 2u        /* CPACR_EL1.FPEN traps FP/SIMD at this EL */
+#define HV_BLOCK_SPX   4u        /* EL1 with SPSel = 1 (SP_EL1 in use, SP_EL0 banked) */
+#define HV_BLOCK_PAN   8u        /* EL1 with PSTATE.PAN set (selects TLB table 2) */
 
 #define HV_MAX_RAM 8
 #define HV_MAX_MMIO 48
-#define HV_BLOCK_HASH 4096
-#define HV_MAX_BLOCKS 65536
+#define HV_BLOCK_HASH 65536
+#define HV_MAX_BLOCKS (1 << 19)
+
+/* Counters for --stats: where the time goes. */
+typedef struct HvStats {
+    uint64_t blocks, translations, block_flushes;
+    uint64_t flush_smc, flush_ic, flush_full;  /* why translations were dropped */
+    uint64_t helper[12];      /* by HV_OP_* */
+    uint64_t tlb_flushes, fetch_walks, exceptions, interrupts;
+    uint64_t wfi, wfi_ticks;  /* WFI exits, host ticks spent asleep */
+} HvStats;
 
 typedef struct HvMachine {
     HvRam ram[HV_MAX_RAM];
@@ -70,6 +83,8 @@ typedef struct HvMachine {
     uint64_t access_pc;  /* guest PC of the load/store being emulated, for logs */
     uint64_t watch_va;   /* debugging: log every write that touches this guest VA (0: off) */
     uint64_t watch_pa;   /* debugging: the same by physical address */
+    HvStats stats;
+    int stats_interval;  /* seconds between --stats lines, 0 = off */
 } HvMachine;
 
 int hv_machine_init(HvMachine *m, size_t jit_bytes);
@@ -80,6 +95,8 @@ int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,
                         void (*write)(void *, uint64_t, uint64_t, unsigned), const char *name);
 
 HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa);
+/* Drop the translations made from the RAM page holding pa (it was written, or the guest invalidated it). */
+void hv_invalidate_code(HvMachine *m, uint64_t pa);
 HvMmio *hv_mmio_lookup(HvMachine *m, uint64_t pa);
 /* Host pointer for `len` bytes of guest RAM at pa, or NULL. */
 void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len);

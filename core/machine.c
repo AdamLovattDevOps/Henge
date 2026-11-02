@@ -20,7 +20,10 @@ int hv_machine_init(HvMachine *m, size_t jit_bytes) {
 
 void hv_machine_free(HvMachine *m) {
     hv_jit_region_close(&m->jit);
-    for (int i = 0; i < m->nram; i++) free(m->ram[i].code_pages);
+    for (int i = 0; i < m->nram; i++) {
+        free(m->ram[i].code_pages);
+        free(m->ram[i].page_gen);
+    }
     free(m->blocks);
 }
 
@@ -31,8 +34,10 @@ int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int
     r->size = size;
     r->host = host;
     r->readonly = readonly;
-    r->code_pages = calloc((size + (1u << HV_TLB_PAGE_BITS) - 1) >> HV_TLB_PAGE_BITS, 1);
-    return r->code_pages ? 0 : -1;
+    size_t pages = (size + (1u << HV_TLB_PAGE_BITS) - 1) >> HV_TLB_PAGE_BITS;
+    r->code_pages = calloc(pages, 1);
+    r->page_gen = calloc(pages, sizeof *r->page_gen);
+    return r->code_pages && r->page_gen ? 0 : -1;
 }
 
 int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,
@@ -49,6 +54,19 @@ HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa) {
         if (pa - r->pa < r->size) return r;
     }
     return NULL;
+}
+
+void hv_invalidate_code(HvMachine *m, uint64_t pa) {
+    HvRam *r = hv_ram_lookup(m, pa);
+    if (!r) return;
+    uint64_t pg = (pa - r->pa) >> HV_TLB_PAGE_BITS;
+    if (!r->code_pages[pg]) return;
+    /* Blocks remember the generation they were made under; a stale one is
+       retranslated the next time it is looked up. The block running now may
+       finish with the old code, as it would with a real instruction pipeline. */
+    r->code_pages[pg] = 0;
+    r->page_gen[pg]++;
+    m->stats.flush_smc++;
 }
 
 HvMmio *hv_mmio_lookup(HvMachine *m, uint64_t pa) {
@@ -88,13 +106,8 @@ int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
         if (r->readonly) return 0; /* ROM: writes are ignored */
         uint64_t off = pa - r->pa;
         uint64_t first = off >> HV_TLB_PAGE_BITS, last = (off + len - 1) >> HV_TLB_PAGE_BITS;
-        for (uint64_t pg = first; pg <= last; pg++) {
-            /* A write to a page we translated from: drop the translations. */
-            if (r->code_pages[pg]) {
-                memset(r->code_pages, 0, (r->size + (1u << HV_TLB_PAGE_BITS) - 1) >> HV_TLB_PAGE_BITS);
-                m->flush_pending = 1;
-            }
-        }
+        for (uint64_t pg = first; pg <= last; pg++)
+            if (r->code_pages[pg]) hv_invalidate_code(m, r->pa + (pg << HV_TLB_PAGE_BITS)); /* a write to code */
         if (m->watch_pa && m->watch_pa - pa < len) {
             uint64_t v = 0;
             memcpy(&v, (const uint8_t *)buf + (m->watch_pa - pa), len - (m->watch_pa - pa) < 8 ? len - (m->watch_pa - pa) : 8);

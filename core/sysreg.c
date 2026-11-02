@@ -183,7 +183,7 @@ static int write_reg(HvCpu *cpu, uint32_t reg, uint64_t v) {
     case R(3, 0, 1, 0, 0): cpu->sctlr_el1 = v; hv_tlb_flush(cpu); return 0;
     case R(3, 0, 1, 0, 1): cpu->actlr_el1 = v; return 0;
     case R(3, 0, 1, 0, 2): cpu->cpacr_el1 = v; return 0;
-    case R(3, 0, 2, 0, 0): cpu->ttbr0_el1 = v; hv_tlb_flush(cpu); return 0;
+    case R(3, 0, 2, 0, 0): cpu->ttbr0_el1 = v; hv_tlb_flush_user(cpu); return 0; /* a process switch */
     case R(3, 0, 2, 0, 1): cpu->ttbr1_el1 = v; hv_tlb_flush(cpu); return 0;
     case R(3, 0, 2, 0, 2): cpu->tcr_el1 = v; hv_tlb_flush(cpu); return 0;
     case R(3, 0, 5, 1, 0): cpu->afsr0_el1 = v; return 0;
@@ -292,8 +292,15 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
         static const uint8_t zero[64];
         return hv_vmem_xfer(cpu, xt & ~63ull, (void *)zero, 64, 1, cpu->el, pc);
     }
-    if (crn == 7 && (crm == 1 || crm == 5)) { /* IC IALLUIS, IALLU, IVAU: drop translations */
+    if (crn == 7 && op1 == 3 && crm == 5 && op2 == 1) { /* IC IVAU: just the page holding the address */
+        HvWalk w;
+        hv_mmu_walk(cpu, xt, HV_ACC_READ, cpu->el, &w);
+        if (!w.fsc) hv_invalidate_code(cpu->m, w.pa);
+        return 0;
+    }
+    if (crn == 7 && (crm == 1 || crm == 5)) { /* IC IALLUIS, IALLU: drop every translation */
         cpu->m->flush_pending = 1;
+        cpu->m->stats.flush_ic++;
         return 0;
     }
     if (crn == 7 && crm == 8 && op1 == 0 && op2 <= 3) { /* AT S1E1R, S1E1W, S1E0R, S1E0W */
@@ -304,9 +311,20 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
         else cpu->par_el1 = (w.pa & 0x0000fffffffff000ull) | (uint64_t)w.attr << 56 | 3u << 7;
         return 0;
     }
-    if (crn == 8 || crn == 9) { /* TLBI: everything, for now */
+    if (crn == 8 || crn == 9) { /* TLBI */
         if (cpu->el == 0) return undefined(cpu, pc);
-        hv_tlb_flush(cpu);
+        /* VAE1, VAAE1, VALE1, VAALE1 (and their IS/OS forms) name one page:
+           Xt[43:0] is VA[55:12]. Everything else (all, by ASID, ranges) drops it all. */
+        int by_va = crn == 8 && op1 == 0 && (crm == 1 || crm == 3 || crm == 7) && (op2 & 1);
+        int by_asid = crn == 8 && op1 == 0 && (crm == 1 || crm == 3 || crm == 7) && op2 == 2; /* ASIDE1: non-global (user) entries */
+        if (by_va) {
+            uint64_t va = (uint64_t)((int64_t)((xt & 0xfffffffffffull) << 20) >> 8);
+            hv_tlb_flush_va(cpu, va);
+        } else if (by_asid) {
+            hv_tlb_flush_user(cpu);
+        } else {
+            hv_tlb_flush(cpu);
+        }
         return 0;
     }
     if (crn == 7) return 0; /* other cache maintenance: caches are coherent here */

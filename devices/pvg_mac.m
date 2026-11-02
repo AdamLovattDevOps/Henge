@@ -67,6 +67,8 @@ static PGMemoryMapDescriptor *memory_map(void) {
 
 /* ---- frames: rendered offscreen, saved as a PNG now and then ---- */
 
+static double attach_time;
+
 static void save_png(id<MTLTexture> tex) {
     size_t row = (size_t)width * 4;
     NSMutableData *px = [NSMutableData dataWithLength:row * height];
@@ -75,12 +77,23 @@ static void save_png(id<MTLTexture> tex) {
     CGContextRef ctx = CGBitmapContextCreate(px.mutableBytes, width, height, 8, row, cs,
                                              kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
     CGImageRef img = CGBitmapContextCreateImage(ctx);
-    NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:shot_path]];
-    CGImageDestinationRef dst = CGImageDestinationCreateWithURL((__bridge CFURLRef)url, CFSTR("public.png"), 1, NULL);
-    if (dst) {
-        CGImageDestinationAddImage(dst, img, NULL);
-        CGImageDestinationFinalize(dst);
-        CFRelease(dst);
+    /* The latest frame, and one per minute named by seconds since start, to see when things happened. */
+    static long last_minute = -1;
+    long minute = (long)(([NSDate timeIntervalSinceReferenceDate] - attach_time) / 60);
+    NSString *latest = [NSString stringWithUTF8String:shot_path];
+    NSMutableArray *paths = [NSMutableArray arrayWithObject:latest];
+    if (minute != last_minute) {
+        last_minute = minute;
+        [paths addObject:[[latest stringByDeletingPathExtension] stringByAppendingFormat:@"-%04lds.png", minute * 60]];
+    }
+    for (NSString *path in paths) {
+        CGImageDestinationRef dst =
+            CGImageDestinationCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:path], CFSTR("public.png"), 1, NULL);
+        if (dst) {
+            CGImageDestinationAddImage(dst, img, NULL);
+            CGImageDestinationFinalize(dst);
+            CFRelease(dst);
+        }
     }
     CGImageRelease(img);
     CGContextRelease(ctx);
@@ -152,6 +165,7 @@ static void swap_handlers(const char *name, uint64_t (*rd)(void *, uint64_t, uns
 int hv_pvg_attach(HvVmapple *b, const char *screenshot) {
     board = b;
     shot_path = screenshot;
+    attach_time = [NSDate timeIntervalSinceReferenceDate];
     @autoreleasepool {
         mtl = MTLCreateSystemDefaultDevice();
         mtl_queue = [mtl newCommandQueue];

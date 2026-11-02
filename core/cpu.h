@@ -17,7 +17,7 @@ typedef struct HvTlbEntry {
 } HvTlbEntry;
 
 #define HV_TLB_PAGE_BITS 14
-#define HV_TLB_BITS 8
+#define HV_TLB_BITS 12 /* 4096 entries per EL: 64 MB of 16 KB pages */
 #define HV_TLB_SIZE (1u << HV_TLB_BITS)
 
 /* Guest CPU state. While a translated block runs, host x28 points here and the
@@ -39,17 +39,28 @@ typedef struct HvCpu {
     uint64_t fpsr;           /* 0x348 */
     uint64_t helper_routine; /* 0x350: hv_helper_entry */
     uint64_t helper_ret;     /* 0x358: where hv_helper_entry returns into the block */
-    uint64_t pad0[20];       /* keeps the TLB at 0x400 */
-    HvTlbEntry tlb[2][HV_TLB_SIZE]; /* 0x400: [0] for EL0 and unprivileged accesses, [1] for EL1 */
+    /* System registers translated code reads and writes directly. */
+    uint64_t tpidr_el0;      /* 0x360 */
+    uint64_t tpidrro_el0;    /* 0x368 */
+    uint64_t tpidr_el1;      /* 0x370 */
+    uint64_t elr_el1;        /* 0x378 */
+    uint64_t spsr_el1;       /* 0x380 */
+    uint64_t sp_el0;         /* 0x388: banked SP_EL0 while SPSel is 1 */
+    uint64_t daif;           /* 0x390: D, A, I, F in bits 9..6, as in SPSR */
+    uint64_t sp_el1;         /* 0x398: banked SP_EL1 while SPSel is 0 */
+    uint64_t pstate_extra;   /* 0x3a0: PAN (bit 22), UAO (23), SSBS (12), DIT (24), TCO (25) */
+    uint64_t sctlr_el1;      /* 0x3a8 */
+    uint64_t esr_el1;        /* 0x3b0 */
+    uint64_t far_el1;        /* 0x3b8 */
+    uint64_t pad0[8];        /* keeps the TLB at 0x400 */
+    /* 0x400: [0] EL0 and unprivileged accesses, [1] EL1, [2] EL1 with PSTATE.PAN set,
+       so toggling PAN (the kernel does it around every user copy) flushes nothing. */
+    HvTlbEntry tlb[3][HV_TLB_SIZE];
 
     /* The rest is only touched by C. */
     struct HvMachine *m;
     uint32_t el;
     uint32_t spsel;
-    uint64_t sp_el0;
-    uint64_t sp_el1;
-    uint64_t daif;           /* D, A, I, F in bits 9..6, as in SPSR */
-    uint64_t pstate_extra;   /* PAN (bit 22), UAO (23), SSBS (12), DIT (24), TCO (25) */
 
     /* Exclusive monitor, emulated: STXR succeeds by compare-and-swap against the
        value LDXR saw, the way QEMU does it. */
@@ -57,22 +68,14 @@ typedef struct HvCpu {
     uint64_t excl_val[2];
     uint32_t excl_size;
 
-    uint64_t sctlr_el1;
     uint64_t tcr_el1;
     uint64_t ttbr0_el1;
     uint64_t ttbr1_el1;
     uint64_t mair_el1;
     uint64_t amair_el1;
     uint64_t vbar_el1;
-    uint64_t elr_el1;
-    uint64_t spsr_el1;
-    uint64_t esr_el1;
-    uint64_t far_el1;
     uint64_t par_el1;
     uint64_t afsr0_el1, afsr1_el1;
-    uint64_t tpidr_el0;
-    uint64_t tpidrro_el0;
-    uint64_t tpidr_el1;
     uint64_t contextidr_el1;
     uint64_t cpacr_el1;
     uint64_t mdscr_el1;
@@ -103,6 +106,17 @@ typedef struct HvCpu {
 #define HV_CPU_FPSR        0x348
 #define HV_CPU_HELPER      0x350
 #define HV_CPU_HELPER_RET  0x358
+#define HV_CPU_TPIDR_EL0   0x360
+#define HV_CPU_TPIDRRO_EL0 0x368
+#define HV_CPU_TPIDR_EL1   0x370
+#define HV_CPU_ELR_EL1     0x378
+#define HV_CPU_SPSR_EL1    0x380
+#define HV_CPU_SP_EL0      0x388
+#define HV_CPU_DAIF        0x390
+#define HV_CPU_PSTATE_EXTRA 0x3a0
+#define HV_CPU_SCTLR_EL1   0x3a8
+#define HV_CPU_ESR_EL1     0x3b0
+#define HV_CPU_FAR_EL1     0x3b8
 #define HV_CPU_TLB         0x400
 #define HV_CPU_TLB_EL      (HV_TLB_SIZE * 32)
 
@@ -118,6 +132,9 @@ _Static_assert(offsetof(HvCpu, fpsr) == HV_CPU_FPSR, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, helper_routine) == HV_CPU_HELPER, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, helper_ret) == HV_CPU_HELPER_RET, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, tlb) == HV_CPU_TLB, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, tpidr_el0) == HV_CPU_TPIDR_EL0, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, daif) == HV_CPU_DAIF, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, far_el1) == HV_CPU_FAR_EL1, "HvCpu layout");
 _Static_assert(sizeof(HvTlbEntry) == 32, "TLB entries are indexed with lsl #5");
 
 /* Why the last block returned to the dispatcher. */
@@ -140,5 +157,10 @@ enum {
 #define HV_PSTATE_I      (1u << 7)
 #define HV_PSTATE_F      (1u << 6)
 #define HV_PSTATE_PAN    (1u << 22)
+
+/* Which TLB table accesses at this EL use (EL0 for LDTR/STTR). */
+static inline int hv_tlb_table(const HvCpu *cpu, int el) {
+    return el == 0 ? 0 : (cpu->pstate_extra & HV_PSTATE_PAN) ? 2 : 1;
+}
 
 #endif
