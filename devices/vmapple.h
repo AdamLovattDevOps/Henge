@@ -58,6 +58,7 @@ typedef struct HvVmapple {
     uint8_t *cfg, *rom, *ram;
     uint64_t ram_size;
     uint64_t panic_events;   /* last pvpanic event the guest reported */
+    void (*poll)(void);      /* extra device work on the CPU thread each tick (Mac PVG) */
 } HvVmapple;
 
 /* Builds the machine around m and cpu. Disks may be NULL (no device then).

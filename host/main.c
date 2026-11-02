@@ -1,5 +1,7 @@
 /* hengevm: boots the virtual Mac on the macOS host.
    hengevm --rom AVPBooter.vmapple2.bin --disk disk.img --aux auxiliary.bin --ecid N [--seed N] [--ram MB] [--log N] */
+#include <CoreFoundation/CoreFoundation.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,6 +10,7 @@
 #include "dispatch.h"
 #include "exception.h"
 #include "mmu.h"
+#include "pvg.h"
 #include "vmapple.h"
 
 static HvMachine m;
@@ -31,18 +34,83 @@ static const char *reason_name(int r) {
     }
 }
 
+typedef struct RunArgs {
+    uint64_t brk, brk_hits, dump_pa, dump_len;
+    const char *dump_path;
+    HvDisk *disk, *aux;
+} RunArgs;
+static RunArgs run_args;
+
+static void *cpu_thread(void *unused) {
+    (void)unused;
+    RunArgs *a = &run_args;
+    /* --break PC: stop the brk_hits-th time execution reaches PC. */
+    m.stop_pc = a->brk;
+    int r;
+    for (;;) {
+        r = hv_run(&cpu);
+        if (r != HV_EXIT_HALT || cpu.halted || cpu.pc != a->brk || --a->brk_hits == 0) break;
+        m.stop_pc = ~0ull; /* step past it: run one block, then re-arm */
+        uint64_t at = cpu.pc;
+        while (cpu.pc == at && !cpu.halted) {
+            m.stop_pc = ~0ull;
+            hv_run_one(&cpu);
+        }
+        m.stop_pc = a->brk;
+    }
+    if (cpu.pc == a->brk) {
+        fprintf(stderr, "hengevm: breakpoint %llx, x30 %llx:", (unsigned long long)a->brk, (unsigned long long)cpu.x[30]);
+        hv_debug_args(&cpu);
+        fprintf(stderr, "  stack:");
+        for (int i = 0; i < 8; i++) {
+            uint64_t v = 0, pa;
+            if (!hv_mmu_access(&cpu, cpu.sp + 8 * i, HV_ACC_READ, cpu.el, &pa)) hv_phys_read(&m, pa, &v, 8);
+            fprintf(stderr, " %llx", (unsigned long long)v);
+        }
+        fprintf(stderr, "\n");
+    }
+    fprintf(stderr, "\nhengevm: stopped (%s) after %llu blocks, %d translated\n", interrupted ? "interrupted" : reason_name(r),
+            (unsigned long long)cpu.icount, m.nblocks);
+    fprintf(stderr, "  pc %016llx el%u sp %016llx insn %08x\n", (unsigned long long)cpu.pc, cpu.el,
+            (unsigned long long)cpu.sp, cpu.exit_insn);
+    fprintf(stderr, "  esr %08llx far %016llx elr %016llx vbar %016llx sctlr %08llx\n", (unsigned long long)cpu.esr_el1,
+            (unsigned long long)cpu.far_el1, (unsigned long long)cpu.elr_el1, (unsigned long long)cpu.vbar_el1,
+            (unsigned long long)cpu.sctlr_el1);
+    for (int i = 0; i < 31; i += 4)
+        fprintf(stderr, "  x%-2d %016llx %016llx %016llx %016llx\n", i, (unsigned long long)cpu.x[i],
+                (unsigned long long)cpu.x[i + 1], (unsigned long long)cpu.x[i + 2],
+                (unsigned long long)(i + 3 < 31 ? cpu.x[i + 3] : 0));
+    if (a->dump_path) { /* --dump PA LEN FILE: guest physical memory after the run, for reading code */
+        FILE *f = fopen(a->dump_path, "wb");
+        void *p = hv_phys_ptr(&m, a->dump_pa, a->dump_len);
+        if (f && p) fwrite(p, 1, a->dump_len, f);
+        if (f) fclose(f);
+        fprintf(stderr, "hengevm: %s %llu bytes at %llx to %s\n", p ? "wrote" : "cannot dump", (unsigned long long)a->dump_len,
+                (unsigned long long)a->dump_pa, a->dump_path);
+    }
+    hv_disk_flush(a->disk);
+    hv_disk_flush(a->aux);
+    exit(0);
+    return NULL;
+}
+
 static void usage(void) {
-    fprintf(stderr, "usage: hengevm --rom FILE --disk FILE --aux FILE --ecid N [--seed N] [--ram MB] [--log N] [--trace 1] [--break PC [--break-hits N]] [--dump PA LEN FILE] [--aux-offset BYTES]\n");
+    fprintf(stderr, "usage: hengevm --rom FILE --disk FILE --aux FILE --ecid N [--seed N] [--ram MB] [--log N] [--trace 1] [--screenshot PNG] [--no-pvg] [--break PC [--break-hits N]] [--dump PA LEN FILE] [--aux-offset BYTES]\n");
     exit(2);
 }
 
 int main(int argc, char **argv) {
     const char *rom = NULL, *disk_path = NULL, *aux_path = NULL;
     uint64_t seed = 0, ecid = 0, ram_mb = 4096, aux_offset = 16384;
-    int log = 1, trace = 0;
+    int log = 1, trace = 0, use_pvg = 1;
+    const char *screenshot = NULL;
     uint64_t brk = ~0ull, brk_hits = 1, dump_pa = 0, dump_len = 0;
     const char *dump_path = NULL;
     for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--no-pvg")) {
+            use_pvg = 0;
+            continue;
+        }
         if (i + 1 >= argc) usage();
         if (!strcmp(argv[i], "--rom")) rom = argv[++i];
         else if (!strcmp(argv[i], "--disk")) disk_path = argv[++i];
@@ -52,6 +120,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--seed")) seed = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--log")) log = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--trace")) trace = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--screenshot")) screenshot = argv[++i];
+
         else if (!strcmp(argv[i], "--break")) brk = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--break-hits")) brk_hits = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--dump") && i + 3 < argc) {
@@ -87,51 +157,20 @@ int main(int argc, char **argv) {
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
-    /* --break PC: stop the brk_hits-th time execution reaches PC. */
-    m.stop_pc = brk;
-    int r;
-    for (;;) {
-        r = hv_run(&cpu);
-        if (r != HV_EXIT_HALT || cpu.halted || cpu.pc != brk || --brk_hits == 0) break;
-        m.stop_pc = ~0ull; /* step past it: run one block, then re-arm */
-        uint64_t at = cpu.pc;
-        while (cpu.pc == at && !cpu.halted) {
-            m.stop_pc = ~0ull;
-            hv_run_one(&cpu);
+    if (use_pvg) {
+        if (hv_pvg_attach(&board, screenshot) != 0) {
+            fprintf(stderr, "hengevm: ParavirtualizedGraphics device unavailable; graphics stays inert\n");
+        } else {
+            board.poll = hv_pvg_poll;
         }
-        m.stop_pc = brk;
     }
-    if (cpu.pc == brk) {
-        fprintf(stderr, "hengevm: breakpoint %llx, x30 %llx:", (unsigned long long)brk, (unsigned long long)cpu.x[30]);
-        hv_debug_args(&cpu);
-        fprintf(stderr, "  stack:");
-        for (int i = 0; i < 8; i++) {
-            uint64_t v = 0, pa;
-            if (!hv_mmu_access(&cpu, cpu.sp + 8 * i, HV_ACC_READ, cpu.el, &pa)) hv_phys_read(&m, pa, &v, 8);
-            fprintf(stderr, " %llx", (unsigned long long)v);
-        }
-        fprintf(stderr, "\n");
-    }
-    fprintf(stderr, "\nhengevm: stopped (%s) after %llu blocks, %d translated\n", interrupted ? "interrupted" : reason_name(r),
-            (unsigned long long)cpu.icount, m.nblocks);
-    fprintf(stderr, "  pc %016llx el%u sp %016llx insn %08x\n", (unsigned long long)cpu.pc, cpu.el,
-            (unsigned long long)cpu.sp, cpu.exit_insn);
-    fprintf(stderr, "  esr %08llx far %016llx elr %016llx vbar %016llx sctlr %08llx\n", (unsigned long long)cpu.esr_el1,
-            (unsigned long long)cpu.far_el1, (unsigned long long)cpu.elr_el1, (unsigned long long)cpu.vbar_el1,
-            (unsigned long long)cpu.sctlr_el1);
-    for (int i = 0; i < 31; i += 4)
-        fprintf(stderr, "  x%-2d %016llx %016llx %016llx %016llx\n", i, (unsigned long long)cpu.x[i],
-                (unsigned long long)cpu.x[i + 1], (unsigned long long)cpu.x[i + 2],
-                (unsigned long long)(i + 3 < 31 ? cpu.x[i + 3] : 0));
-    if (dump_path) { /* --dump PA LEN FILE: guest physical memory after the run, for reading code */
-        FILE *f = fopen(dump_path, "wb");
-        void *p = hv_phys_ptr(&m, dump_pa, dump_len);
-        if (f && p) fwrite(p, 1, dump_len, f);
-        if (f) fclose(f);
-        fprintf(stderr, "hengevm: %s %llu bytes at %llx to %s\n", p ? "wrote" : "cannot dump", (unsigned long long)dump_len,
-                (unsigned long long)dump_pa, dump_path);
-    }
-    hv_disk_flush(&disk);
-    hv_disk_flush(&aux);
+    run_args = (RunArgs){brk, brk_hits, dump_pa, dump_len, dump_path, &disk, &aux};
+    /* The CPU runs on its own thread: the graphics framework needs the main queue. */
+    pthread_t t;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 8u << 20);
+    pthread_create(&t, &attr, cpu_thread, NULL);
+    CFRunLoopRun();
     return 0;
 }

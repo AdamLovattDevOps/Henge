@@ -20,8 +20,15 @@ $(B)/hengevm-ref: host/hvf_ref.c host/hvf_ref.entitlements $(ENGINE) $(DEV)
 	$(CC) $(CFLAGS) host/hvf_ref.c $(ENGINE) $(DEV) -framework Hypervisor -o $@
 	codesign -s - -f --entitlements host/hvf_ref.entitlements $@
 
-$(B)/hengevm: host/main.c $(ENGINE) $(DEV)
-	$(CC) $(CFLAGS) host/main.c $(ENGINE) $(DEV) -o $@
+# Mac-only graphics device (ParavirtualizedGraphics.framework, as QEMU uses it).
+# Built for an older deployment target: the framework's memory callbacks are
+# marked obsolete in macOS 27 without a documented replacement.
+$(B)/pvg_mac.o: devices/pvg_mac.m devices/*.h core/*.h | $(B)
+	$(CC) -fobjc-arc -O2 -g -Wall -mmacosx-version-min=15.2 -Icore -Ihost -Idevices -c $< -o $@
+
+$(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o
+	$(CC) $(CFLAGS) host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o -framework ParavirtualizedGraphics -framework Metal \
+	    -framework Foundation -framework CoreGraphics -framework ImageIO -framework CoreFoundation -o $@
 
 $(B)/%.o: core/%.c core/*.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
