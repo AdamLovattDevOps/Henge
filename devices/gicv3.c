@@ -51,7 +51,8 @@ void hv_gicv3_update(HvGic *g) {
 void hv_gicv3_set_irq(HvGic *g, int intid, int level) {
     if (intid < 16 || intid >= HV_GIC_NUM_IRQS) return;
     level = level != 0;
-    if (g->edge[intid] && level && !g->level[intid]) g->latch[intid] = 1;
+    if (g->level[intid] == level) return; /* nothing changed: skip the rescan (the timer re-asserts every tick) */
+    if (g->edge[intid] && level) g->latch[intid] = 1;
     g->level[intid] = (uint8_t)level;
     hv_gicv3_update(g);
 }

@@ -55,7 +55,9 @@ typedef struct HvCpu {
     uint32_t exit_req;       /* 0x3c0: set (by another thread too) to make chained blocks leave */
     uint32_t pad1;
     uint64_t last_stub;      /* 0x3c8: patch slot of the chainable exit just taken, or 0 */
-    uint64_t pad0[6];        /* keeps the TLB at 0x400 */
+    uint64_t ijc;            /* 0x3d0: indirect-branch cache, HV_IJC_TABLES tables of {tag, entry} */
+    uint64_t ijc_salt[2];    /* 0x3d8: tags are VA ^ salt, [0] for user (EL0) tables, [1] kernel; a new salt empties them */
+    uint64_t pad0[3];        /* keeps the TLB at 0x400 */
     /* 0x400: [0] EL0 and unprivileged accesses, [1] EL1, [2] EL1 with PSTATE.PAN set,
        so toggling PAN (the kernel does it around every user copy) flushes nothing. */
     HvTlbEntry tlb[3][HV_TLB_SIZE];
@@ -122,7 +124,14 @@ typedef struct HvCpu {
 #define HV_CPU_FAR_EL1     0x3b8
 #define HV_CPU_EXIT_REQ    0x3c0
 #define HV_CPU_LAST_STUB   0x3c8
+#define HV_CPU_IJC         0x3d0
+#define HV_CPU_IJC_SALT    0x3d8
 #define HV_CPU_TLB         0x400
+
+/* Indirect-branch cache: one table per block-flags value, 4096 entries of 16 bytes. */
+#define HV_IJC_BITS 12
+#define HV_IJC_TABLES 16
+#define HV_IJC_TABLE_BYTES ((1u << HV_IJC_BITS) * 16)
 #define HV_CPU_TLB_EL      (HV_TLB_SIZE * 32)
 
 _Static_assert(offsetof(HvCpu, sp) == HV_CPU_SP, "HvCpu layout");
@@ -142,6 +151,7 @@ _Static_assert(offsetof(HvCpu, daif) == HV_CPU_DAIF, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, far_el1) == HV_CPU_FAR_EL1, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, exit_req) == HV_CPU_EXIT_REQ, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, last_stub) == HV_CPU_LAST_STUB, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, ijc_salt) == HV_CPU_IJC_SALT, "HvCpu layout");
 _Static_assert(sizeof(HvTlbEntry) == 32, "TLB entries are indexed with lsl #5");
 
 /* Why the last block returned to the dispatcher. */

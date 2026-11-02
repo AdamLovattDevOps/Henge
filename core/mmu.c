@@ -121,13 +121,24 @@ void hv_mmu_walk(HvCpu *cpu, uint64_t va, HvAccess acc, int el, HvWalk *out) {
 
 void hv_tlb_flush(HvCpu *cpu) {
     if (cpu->m) cpu->m->stats.tlb_flushes++;
+    hv_ijc_reset(cpu, 0); /* mappings changed: branch targets cached by VA are no longer trusted */
+    hv_ijc_reset(cpu, 1);
     memset(cpu->tlb, 0xff, sizeof cpu->tlb);
+}
+
+void hv_ijc_reset(HvCpu *cpu, int kernel) {
+    cpu->ijc_salt[kernel]++;
+    if (cpu->m) {
+        cpu->m->stats.ijc_resets++;
+        memset(cpu->m->ijc_pages[kernel], 0, sizeof cpu->m->ijc_pages[kernel]);
+    }
 }
 
 /* TTBR0 changed or an ASID was dropped: only user-half (TTBR0) translations go;
    the kernel's TTBR1 entries stay. */
 void hv_tlb_flush_user(HvCpu *cpu) {
     if (cpu->m) cpu->m->stats.tlb_flushes++;
+    hv_ijc_reset(cpu, 0); /* user VAs now name another process's code; the kernel's entries stay */
     for (int t = 0; t < 3; t++)
         for (uint32_t i = 0; i < HV_TLB_SIZE; i++) {
             HvTlbEntry *e = &cpu->tlb[t][i];
@@ -136,9 +147,24 @@ void hv_tlb_flush_user(HvCpu *cpu) {
         }
 }
 
+/* A page just got translated code: writes to it must take the slow path from now
+   on, so drop just the write permission of the entries that map it. */
+void hv_tlb_protect_code(HvCpu *cpu, const uint8_t *host_page) {
+    for (int t = 0; t < 3; t++)
+        for (uint32_t i = 0; i < HV_TLB_SIZE; i++) {
+            HvTlbEntry *e = &cpu->tlb[t][i];
+            if (e->write_tag != ~0ull && (const uint8_t *)(uintptr_t)(e->write_tag + e->addend) == host_page)
+                e->write_tag = ~0ull;
+        }
+}
+
 void hv_tlb_flush_va(HvCpu *cpu, uint64_t va) {
     /* Tagged addresses may sit in any slot's tag byte, so check by the low 56 bits. */
     uint32_t idx = (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1);
+    /* The page may hold cached branch targets even if its TLB entry is gone. */
+    int kernel = (va >> 55) & 1;
+    uint32_t h = (uint32_t)(va >> HV_TLB_PAGE_BITS) & 0xffff;
+    if (cpu->m && (cpu->m->ijc_pages[kernel][h >> 6] >> (h & 63) & 1)) hv_ijc_reset(cpu, kernel);
     for (int el = 0; el < 3; el++) {
         HvTlbEntry *e = &cpu->tlb[el][idx];
         memset(e, 0xff, sizeof *e);

@@ -45,6 +45,7 @@ typedef struct {
     uint32_t flags;
     int slow_mem;
     uint64_t page;       /* guest VA of the 16 KB page the block is in */
+    int no_ijc;          /* indirect branches always go to the dispatcher (breakpoints, tests' stop PC) */
 } Emit;
 
 static Emit E; /* translation runs on the dispatcher thread only */
@@ -66,6 +67,8 @@ static Emit E; /* translation runs on the dispatcher thread only */
 #define SUB_X(d, n, m) (0xcb000000u | (m) << 16 | (n) << 5 | (d))
 #define ADD_EXT(d, n, m, opt, sh) (0x8b200000u | (m) << 16 | (opt) << 13 | (sh) << 10 | (n) << 5 | (d))
 #define CBNZ_X(t) (0xb5000000u | (t))
+
+static void patch_branch(uint32_t *w, int64_t off);
 
 static inline int64_t sext(uint64_t v, int bits) {
     return (int64_t)(v << (64 - bits)) >> (64 - bits);
@@ -97,6 +100,42 @@ static void put_ool(Emit *e, Ool o) {
     e->ool[e->nool++] = o;
 }
 
+/* Guest x0/x1 are saved, x0 = target = cpu->pc. Jumps to the target block
+   through the indirect-branch cache for this block's flags if it is there and
+   nobody asked the CPU to leave, else leaves for the dispatcher (which fills
+   the cache). A hit enters the block at its first entry, which reloads guest
+   x1 and x0. Tags are VA ^ salt; the salt changes when mappings or code do. */
+static void put_ijc_jump(Emit *e) {
+    if (e->no_ijc) {
+        put(e, LDR_X(1, 28, HV_CPU_EXIT));
+        put(e, BR_X(1));
+        return;
+    }
+    put(e, 0xb9400000u | (HV_CPU_EXIT_REQ / 4) << 10 | 28 << 5 | 1); /* ldr w1, [x28, #exit_req] */
+    uint32_t to_exit = e->n;
+    put(e, 0x35000000u | 1);                                /* cbnz w1, exit (patched below) */
+    put(e, LDR_X(1, 28, HV_CPU_IJC));
+    uint32_t table = (e->flags & (HV_IJC_TABLES - 1)) * HV_IJC_TABLE_BYTES;
+    if (table) put(e, 0x91400000u | (table >> 12) << 10 | 1 << 5 | 1); /* add x1, x1, #table */
+    put(e, STR_X(2, 28, HV_CPU_SPILL(0)));
+    put(e, UBFM_X(2, 0, 2, 2 + HV_IJC_BITS - 1));           /* ubfx x2, x0, #2, #bits */
+    put(e, ADD_LSL(1, 1, 2, 4));
+    put(e, LDP_X(2, 1, 1, 0));                              /* x2 = tag, x1 = entry */
+    put(e, LDR_X(0, 28, HV_CPU_IJC_SALT + 8 * (e->flags & HV_BLOCK_EL1)));
+    put(e, 0xca000000u | 0 << 16 | 2 << 5 | 2);             /* eor x2, x2, x0 */
+    put(e, LDR_X(0, 28, HV_CPU_PC));
+    put(e, 0xca000000u | 0 << 16 | 2 << 5 | 2);             /* eor x2, x2, x0 */
+    uint32_t to_miss = e->n;
+    put(e, CBNZ_X(2));
+    put(e, LDR_X(2, 28, HV_CPU_SPILL(0)));
+    put(e, BR_X(1));                                        /* hit */
+    patch_branch(&e->w[to_miss], (int64_t)e->n - to_miss);
+    put(e, LDR_X(2, 28, HV_CPU_SPILL(0)));                  /* miss */
+    patch_branch(&e->w[to_exit], (int64_t)e->n - to_exit);
+    put(e, LDR_X(1, 28, HV_CPU_EXIT));
+    put(e, BR_X(1));
+}
+
 /* Leave the block with pc = target. */
 static void put_exit(Emit *e, uint64_t target) {
     put(e, STP_X(0, 1, 28, 0));
@@ -113,7 +152,11 @@ static void put_exit(Emit *e, uint64_t target) {
    mapping as this block, so the chain stays correct across page-table changes. */
 static void put_branch_exit(Emit *e, uint64_t target) {
     if ((target & ~((1ull << HV_TLB_PAGE_BITS) - 1)) != e->page) {
-        put_exit(e, target);
+        /* Another page may be remapped under us, so look it up by VA instead of chaining. */
+        put(e, STP_X(0, 1, 28, 0));
+        put_lit(e, 0, target);
+        put(e, STR_X(0, 28, HV_CPU_PC));
+        put_ijc_jump(e);
         return;
     }
     put(e, STP_X(0, 1, 28, 0));
@@ -352,21 +395,22 @@ static void translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
     put_branch_exit(e, pc + 4);
 }
 
-/* BR, BLR, RET and their PAC forms. Ends the block. */
+/* BR, BLR, RET and their PAC forms. Ends the block. The target is looked up
+   inline in the indirect-branch cache for this block's flags: a hit jumps
+   straight to the target block's first entry (which reloads guest x1 and x0);
+   a miss leaves for the dispatcher, which fills the cache. Tags are VA ^ salt,
+   and the salt changes whenever mappings or code change. */
 static void translate_branch_reg(Emit *e, uint32_t insn, uint64_t pc) {
     uint32_t opc = (insn >> 21) & 3;
     int rn = (insn >> 5) & 0x1f;
     if (opc == 2 && ((insn >> 11) & 0x1f) == 1) rn = 30; /* RETAA, RETAB: the Rn field is all ones, the target is x30 */
     put(e, STP_X(0, 1, 28, 0));
-    if (is_stolen(rn)) {
-        put(e, LDR_X(0, 28, slot_of(rn)));
-        put(e, STR_X(0, 28, HV_CPU_PC));
-    } else {
-        put(e, STR_X(rn, 28, HV_CPU_PC)); /* 31 stores XZR */
-    }
-    if (opc == 1) put_lit(e, 30, pc + 4);
-    put(e, LDR_X(1, 28, HV_CPU_EXIT));
-    put(e, BR_X(1));
+    if (is_stolen(rn)) put(e, LDR_X(0, 28, slot_of(rn)));
+    else if (rn == 31) put(e, 0xd2800000u);                 /* movz x0, #0 */
+    else if (rn != 0) put(e, MOV_X(0, rn));
+    put(e, STR_X(0, 28, HV_CPU_PC));
+    if (opc == 1) put_lit(e, 30, pc + 4);                   /* BLR: after reading Rn */
+    put_ijc_jump(e);
 }
 
 /* Loads and stores. A, T and U are borrowed host registers: A holds the guest
@@ -766,7 +810,11 @@ int hv_translate_block(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t 
     e->flags = b->flags;
     e->slow_mem = m->slow_mem;
     e->page = b->va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
+    e->no_ijc = !m->chain;
 
+    /* Two entries: +0 reloads guest x1 too (the indirect-branch cache jumps
+       here with x1 in use); +1 is for hv_enter and chained jumps. */
+    put(e, LDR_X(1, 28, 8));
     put(e, LDR_X(0, 28, 0));
     uint32_t max = avail < HV_MAX_BLOCK_INSNS ? avail : HV_MAX_BLOCK_INSNS;
     uint32_t i = 0;

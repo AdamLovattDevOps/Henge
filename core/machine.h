@@ -29,6 +29,8 @@ typedef struct HvBlock {
     uint32_t flags;      /* HV_BLOCK_* state the translation depends on */
     uint32_t ninsns;
     uint32_t gen;        /* page_gen of its page when translated */
+    struct HvRam *ram;   /* where its page lives, for a quick staleness check */
+    uint64_t pg;
     uint32_t *code;
     struct HvBlock *next;
 } HvBlock;
@@ -48,7 +50,7 @@ typedef struct HvBlock {
 typedef struct HvStats {
     uint64_t blocks, translations, block_flushes;
     uint64_t flush_smc, flush_ic, flush_full;  /* why translations were dropped */
-    uint64_t chained, unchains;
+    uint64_t chained, unchains, ijc_fills, ijc_resets;
     uint64_t helper[12];      /* by HV_OP_* */
     uint64_t tlb_flushes, fetch_walks, exceptions, interrupts;
     uint64_t wfi, wfi_ticks;  /* WFI exits, host ticks spent asleep */
@@ -62,6 +64,7 @@ typedef struct HvMachine {
 
     HvJitRegion jit;
     HvBlock *hash[HV_BLOCK_HASH];
+    HvBlock *jc[1 << 14];  /* direct-mapped cache in front of the hash */
     HvBlock *blocks;
     int nblocks;
     int flush_pending;   /* set by helpers; the dispatcher flushes once the block has left */
@@ -92,6 +95,8 @@ typedef struct HvMachine {
     uint32_t nchains;
     int unchain_pending;
     HvCpu *cpu;              /* the CPU, so device and invalidation code can ask it to leave */
+    uint64_t *ijc;           /* indirect-branch cache tables (cpu->ijc points here) */
+    uint64_t ijc_pages[2][1024]; /* hashed bitmap of the pages cached targets are in, so most TLBIs can leave the cache alone */
     int stats_interval;  /* seconds between --stats lines, 0 = off */
 } HvMachine;
 

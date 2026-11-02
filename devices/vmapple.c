@@ -88,8 +88,7 @@ static uint64_t tick(HvMachine *m, HvCpu *cpu) {
     uint64_t deadline = hv_timer_update(b->gic, cpu);
     hv_pl031_tick(b->rtc);
     if (b->poll) b->poll();
-    hv_gicv3_update(b->gic);
-    return deadline;
+    return deadline; /* every GIC state change already updated the CPU's lines */
 }
 
 int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size, HvDisk *root, HvDisk *aux,

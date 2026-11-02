@@ -31,6 +31,9 @@ void hv_mmu_walk(HvCpu *cpu, uint64_t va, HvAccess acc, int el, HvWalk *out);
 void hv_tlb_flush(HvCpu *cpu);
 void hv_tlb_flush_va(HvCpu *cpu, uint64_t va);
 void hv_tlb_flush_user(HvCpu *cpu);
+/* Empty the indirect-branch cache for user (0) or kernel (1) VAs. */
+void hv_ijc_reset(HvCpu *cpu, int kernel);
+void hv_tlb_protect_code(HvCpu *cpu, const uint8_t *host_page);
 
 /* Translates for a C access of `len` bytes that stays inside one 16 KB page,
    filling the TLB when the page is ordinary RAM. Returns 0 and sets *pa, or the

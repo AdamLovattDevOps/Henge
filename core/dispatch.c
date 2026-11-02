@@ -13,6 +13,11 @@
 
 void hv_flush_blocks(HvMachine *m) {
     m->stats.block_flushes++;
+    if (m->cpu) {
+        hv_ijc_reset(m->cpu, 0);
+        hv_ijc_reset(m->cpu, 1);
+    }
+    memset(m->jc, 0, sizeof m->jc);
     m->nchains = 0; /* the patched code goes away with the blocks */
     m->unchain_pending = 0;
     memset(m->hash, 0, sizeof m->hash);
@@ -36,12 +41,15 @@ static uint32_t hash_of(uint64_t va, uint64_t pa, uint32_t flags) {
 
 static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, const uint32_t *code, uint32_t avail) {
     HvMachine *m = cpu->m;
+    uint32_t j = (uint32_t)((va >> 2) ^ ((uint64_t)flags << 11)) & ((1u << 14) - 1);
+    HvBlock *c = m->jc[j];
+    if (c && c->va == va && c->pa == pa && c->flags == flags && c->ram->page_gen[c->pg] == c->gen) return c;
     uint32_t h = hash_of(va, pa, flags);
     HvRam *ram = hv_ram_lookup(m, pa);
     uint64_t pg = (pa - ram->pa) >> HV_TLB_PAGE_BITS;
     uint32_t gen = ram->page_gen[pg];
     for (HvBlock *b = m->hash[h]; b; b = b->next)
-        if (b->va == va && b->pa == pa && b->flags == flags && b->gen == gen) return b;
+        if (b->va == va && b->pa == pa && b->flags == flags && b->gen == gen) return m->jc[j] = b;
 
     for (int attempt = 0; attempt < 2; attempt++) {
         if (m->nblocks == HV_MAX_BLOCKS) {
@@ -49,7 +57,7 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
             hv_flush_blocks(m);
         }
         HvBlock *b = &m->blocks[m->nblocks];
-        *b = (HvBlock){.va = va, .pa = pa, .flags = flags, .gen = gen};
+        *b = (HvBlock){.va = va, .pa = pa, .flags = flags, .gen = gen, .ram = ram, .pg = pg};
         m->stats.translations++;
         if (hv_translate_block(m, b, code, avail) != 0) {
             m->stats.flush_full++;
@@ -63,7 +71,7 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
         /* Writes to this page must now take the slow path so we notice them. */
         if (!ram->code_pages[pg]) {
             ram->code_pages[pg] = 1;
-            hv_tlb_flush(cpu);
+            hv_tlb_protect_code(cpu, ram->host + (pg << HV_TLB_PAGE_BITS));
         }
         return b;
     }
@@ -130,22 +138,29 @@ static int wait_for_interrupt(HvCpu *cpu) {
 
 static void print_stats(HvCpu *cpu, int force) {
     static uint64_t last_t, start_t;
+    /* This uses floating point, and the host FP registers hold the guest's state. */
+    hv_fp_leave(cpu);
+    uint64_t zero = 0;
+    __asm__ volatile("msr fpcr, %0" ::"r"(zero));
     static HvStats last;
     HvMachine *m = cpu->m;
     uint64_t now = mach_absolute_time();
     if (!start_t) start_t = last_t = now;
-    if (!force && now - last_t < (uint64_t)m->stats_interval * 24000000ull) return;
+    if (!force && now - last_t < (uint64_t)m->stats_interval * 24000000ull) {
+        hv_fp_enter(cpu);
+        return;
+    }
     double dt = (double)(now - last_t) / 24e6;
     HvStats *s = &m->stats;
 #define RATE(f) ((double)(s->f - last.f) / dt)
     fprintf(stderr,
             "stats %5.0fs: blocks %.2fM/s, translated %.0f/s, slow mem %.0fK/s, mrs %.0fK/s msr %.0fK/s sys %.0fK/s, "
-            "exc %.0f/s irq %.0f/s, tlb flush %.0f/s, fetch walks %.0fK/s, wfi %.0f/s (%.0f%% idle), flushes %.0f/s (smc %.0f ic %.0f full %.0f), chained %.0f/s unchains %.0f/s, el%u pc %llx\n",
+            "exc %.0f/s irq %.0f/s, tlb flush %.0f/s, fetch walks %.0fK/s, wfi %.0f/s (%.0f%% idle), flushes %.0f/s (smc %.0f ic %.0f full %.0f), chained %.0f/s unchains %.0f/s ijc fills %.0fK/s resets %.0f/s, el%u pc %llx\n",
             (double)(now - start_t) / 24e6, RATE(blocks) / 1e6, RATE(translations), RATE(helper[HV_OP_MEM]) / 1e3,
             RATE(helper[HV_OP_MRS]) / 1e3, RATE(helper[HV_OP_MSR]) / 1e3, RATE(helper[HV_OP_SYS]) / 1e3,
             RATE(exceptions), RATE(interrupts), RATE(tlb_flushes), RATE(fetch_walks) / 1e3, RATE(wfi),
             100.0 * (double)(s->wfi_ticks - last.wfi_ticks) / (double)(now - last_t), RATE(block_flushes), RATE(flush_smc),
-            RATE(flush_ic), RATE(flush_full), RATE(chained), RATE(unchains), cpu->el,
+            RATE(flush_ic), RATE(flush_full), RATE(chained), RATE(unchains), RATE(ijc_fills) / 1e3, RATE(ijc_resets), cpu->el,
             (unsigned long long)cpu->pc);
 #undef RATE
     /* The five busiest system registers or SYS operations (reads + writes) this interval. */
@@ -163,6 +178,7 @@ static void print_stats(HvCpu *cpu, int force) {
     memset(reg_hist, 0, sizeof reg_hist);
     last = *s;
     last_t = now;
+    hv_fp_enter(cpu);
 }
 
 /* Undo every chain: the patch slots go back to "fall through to the exit". */
@@ -173,11 +189,15 @@ static void unchain_all(HvMachine *m) {
     for (uint32_t i = 0; i < m->nchains; i++) hv_jit_end_write(m->chains[i], 1);
     m->nchains = 0;
     m->stats.unchains++;
+    if (m->cpu) {
+        hv_ijc_reset(m->cpu, 0);
+        hv_ijc_reset(m->cpu, 1);
+    }
 }
 
 /* Patch the exit slot a block just left through so it jumps straight to b. */
 static void chain(HvMachine *m, uint32_t *slot, HvBlock *b) {
-    int64_t off = (int64_t)(b->code - slot);
+    int64_t off = (int64_t)(b->code + 1 - slot); /* the entry that expects x1 still live */
     if (off < -(1 << 25) || off >= (1 << 25) || m->nchains == HV_MAX_CHAINS) return;
     hv_jit_begin_write();
     *slot = 0x14000000u | (uint32_t)(off & 0x3ffffff);
@@ -189,11 +209,17 @@ static void chain(HvMachine *m, uint32_t *slot, HvBlock *b) {
 static int run(HvCpu *cpu, int one);
 
 int hv_run(HvCpu *cpu) {
-    return run(cpu, 0);
+    hv_fp_enter(cpu);
+    int r = run(cpu, 0);
+    hv_fp_leave(cpu);
+    return r;
 }
 
 int hv_run_one(HvCpu *cpu) {
-    return run(cpu, 1);
+    hv_fp_enter(cpu);
+    int r = run(cpu, 1);
+    hv_fp_leave(cpu);
+    return r;
 }
 
 /* Bring-up aid (log >= 4): report the first block entered with a host address
@@ -257,6 +283,18 @@ static int run(HvCpu *cpu, int one) {
             fprintf(stderr, "hengevm: cannot translate block at %llx\n", (unsigned long long)cpu->pc);
             return HV_EXIT_UNSUPPORTED;
         }
+        /* Remember it for indirect branches (not the tests' stop PC: that must reach us). */
+        /* EL0 tables only hold user VAs and EL1 tables kernel VAs, so each half has its own salt. */
+        int kernel = b->flags & HV_BLOCK_EL1;
+        if (m->chain && b->va != m->stop_pc && (int)((b->va >> 55) & 1) == kernel) {
+            uint64_t *t = m->ijc + (size_t)(b->flags & (HV_IJC_TABLES - 1)) * (HV_IJC_TABLE_BYTES / 8);
+            uint64_t *ent = t + ((b->va >> 2) & ((1u << HV_IJC_BITS) - 1)) * 2;
+            ent[0] = b->va ^ cpu->ijc_salt[kernel];
+            ent[1] = (uint64_t)(uintptr_t)b->code;
+            uint32_t h = (uint32_t)(b->va >> HV_TLB_PAGE_BITS) & 0xffff;
+            m->ijc_pages[kernel][h >> 6] |= 1ull << (h & 63);
+            m->stats.ijc_fills++;
+        }
         /* The block before left through a chainable direct branch to this one: link them. */
         if (pending_chain && !m->trace) chain(m, pending_chain, b);
         pending_chain = NULL;
@@ -268,7 +306,7 @@ static int run(HvCpu *cpu, int one) {
         cpu->icount++;
         m->stats.blocks++;
         if (m->stats_interval && (m->stats.blocks & 0xffff) == 0) print_stats(cpu, 0);
-        hv_enter(cpu, b->code);
+        hv_enter(cpu, b->code + 1);
 
         if (cpu->exit_reason == HV_EXIT_BRANCH && cpu->last_stub && m->chain) pending_chain = (uint32_t *)cpu->last_stub;
         switch (cpu->exit_reason) {

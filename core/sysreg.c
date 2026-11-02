@@ -79,8 +79,9 @@ static int read_reg(HvCpu *cpu, uint32_t reg, uint64_t *v) {
     case R(3, 0, 4, 2, 4): *v = cpu->pstate_extra & (1u << 23); return 0; /* UAO */
     case R(3, 3, 4, 2, 5): *v = cpu->pstate_extra & (1u << 24); return 0; /* DIT */
     case R(3, 3, 4, 2, 6): *v = cpu->pstate_extra & (1u << 12); return 0; /* SSBS */
-    case R(3, 3, 4, 4, 0): *v = cpu->fpcr; return 0;
-    case R(3, 3, 4, 4, 1): *v = cpu->fpsr; return 0;
+    /* FPCR/FPSR live in the host registers while the guest runs (hv_fp_enter). */
+    case R(3, 3, 4, 4, 0): __asm__ volatile("mrs %0, fpcr" : "=r"(*v)); return 0;
+    case R(3, 3, 4, 4, 1): __asm__ volatile("mrs %0, fpsr" : "=r"(*v)); return 0;
     case R(3, 0, 4, 1, 0): *v = cpu->spsel ? cpu->sp_el0 : cpu->sp; return 0; /* SP_EL0 */
     case R(3, 0, 4, 0, 0): *v = cpu->spsr_el1; return 0;
     case R(3, 0, 4, 0, 1): *v = cpu->elr_el1; return 0;
@@ -172,8 +173,8 @@ static int write_reg(HvCpu *cpu, uint32_t reg, uint64_t v) {
     case R(3, 0, 4, 2, 4): cpu->pstate_extra = (cpu->pstate_extra & ~(1ull << 23)) | (v & (1u << 23)); return 0;
     case R(3, 3, 4, 2, 5): cpu->pstate_extra = (cpu->pstate_extra & ~(1ull << 24)) | (v & (1u << 24)); return 0;
     case R(3, 3, 4, 2, 6): cpu->pstate_extra = (cpu->pstate_extra & ~(1ull << 12)) | (v & (1u << 12)); return 0;
-    case R(3, 3, 4, 4, 0): cpu->fpcr = v & 0x07ff9f00; return 0;
-    case R(3, 3, 4, 4, 1): cpu->fpsr = v & 0xf800009f; return 0;
+    case R(3, 3, 4, 4, 0): v &= 0x07ff9f00; __asm__ volatile("msr fpcr, %0" ::"r"(v)); return 0;
+    case R(3, 3, 4, 4, 1): v &= 0xf800009f; __asm__ volatile("msr fpsr, %0" ::"r"(v)); return 0;
     case R(3, 0, 4, 1, 0):
         if (!cpu->spsel) return -1; /* SP_EL0 is not accessible as a sysreg while it is the SP */
         cpu->sp_el0 = v;

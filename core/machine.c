@@ -17,7 +17,8 @@ int hv_machine_init(HvMachine *m, size_t jit_bytes) {
     m->stop_pc = ~0ull;
     m->chain = 1;
     m->chains = calloc(HV_MAX_CHAINS, sizeof *m->chains);
-    return m->chains ? 0 : -1;
+    m->ijc = calloc(HV_IJC_TABLES * HV_IJC_TABLE_BYTES / 8, 8);
+    return m->chains && m->ijc ? 0 : -1;
 }
 
 void hv_machine_free(HvMachine *m) {
@@ -28,6 +29,7 @@ void hv_machine_free(HvMachine *m) {
     }
     free(m->blocks);
     free(m->chains);
+    free(m->ijc);
 }
 
 int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int readonly) {
@@ -72,7 +74,11 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
     m->stats.flush_smc++;
     /* Chains may lead into the stale blocks: undo them, and make a running chain leave. */
     m->unchain_pending = 1;
-    if (m->cpu) __atomic_store_n(&m->cpu->exit_req, 1, __ATOMIC_RELAXED);
+    if (m->cpu) {
+        hv_ijc_reset(m->cpu, 0); /* the indirect-branch cache may point at stale blocks too */
+        hv_ijc_reset(m->cpu, 1);
+        __atomic_store_n(&m->cpu->exit_req, 1, __ATOMIC_RELAXED);
+    }
 }
 
 HvMmio *hv_mmio_lookup(HvMachine *m, uint64_t pa) {
@@ -139,6 +145,8 @@ void hv_cpu_reset(HvCpu *cpu, HvMachine *m) {
     memset(cpu, 0, sizeof *cpu);
     cpu->m = m;
     m->cpu = cpu;
+    cpu->ijc = (uint64_t)(uintptr_t)m->ijc;
+    cpu->ijc_salt[0] = cpu->ijc_salt[1] = 1; /* tags of an all-zero table never match */
     cpu->exit_routine = (uint64_t)hv_exit;
     cpu->helper_routine = (uint64_t)hv_helper_entry;
     cpu->el = 1;

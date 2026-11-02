@@ -23,6 +23,8 @@
     .globl _hv_enter
     .globl _hv_exit
     .globl _hv_helper_entry
+    .globl _hv_fp_enter
+    .globl _hv_fp_leave
 
 .macro SAVE_X2_X29
     stp x2, x3, [x28, #16]
@@ -45,10 +47,6 @@
 .macro SAVE_FLAGS_FP
     mrs x0, nzcv
     str x0, [x28, #CPU_NZCV]
-    mrs x0, fpcr
-    str x0, [x28, #CPU_FPCR]
-    mrs x0, fpsr
-    str x0, [x28, #CPU_FPSR]
     stp q0, q1, [x28, #320]
     stp q2, q3, [x28, #352]
     stp q4, q5, [x28, #384]
@@ -67,7 +65,9 @@
     stp q30, q31, [x28, #800]
 .endm
 
-// Uses x0 and x1 as temporaries. FPCR writes are slow, so skip unchanged ones.
+// Uses x0 and x1 as temporaries. FPCR and FPSR are not here: reading or writing
+// them stalls the pipeline, so the guest's values simply stay in the host
+// registers for as long as hv_run runs (see hv_fp_enter/hv_fp_leave).
 .macro LOAD_FLAGS_FP
     ldp q0, q1, [x28, #320]
     ldp q2, q3, [x28, #352]
@@ -85,19 +85,6 @@
     ldp q26, q27, [x28, #736]
     ldp q28, q29, [x28, #768]
     ldp q30, q31, [x28, #800]
-    ldr x0, [x28, #CPU_FPCR]
-    mrs x1, fpcr
-    cmp x0, x1
-    b.eq 1f
-    msr fpcr, x0
-1:
-    // FPSR writes serialize the pipeline on Apple cores: skip them when unchanged.
-    ldr x0, [x28, #CPU_FPSR]
-    mrs x1, fpsr
-    cmp x0, x1
-    b.eq 2f
-    msr fpsr, x0
-2:
     ldr x0, [x28, #CPU_NZCV]
     msr nzcv, x0
 .endm
@@ -170,3 +157,19 @@ _hv_helper_entry:
     LOAD_X1_X30
     ldr x0, [x28, #CPU_HELPER_RET]
     br x0
+
+// hv_fp_enter(cpu): the guest's FPCR and FPSR into the host registers.
+_hv_fp_enter:
+    ldr x1, [x0, #CPU_FPCR]
+    msr fpcr, x1
+    ldr x1, [x0, #CPU_FPSR]
+    msr fpsr, x1
+    ret
+
+// hv_fp_leave(cpu): and back into the HvCpu.
+_hv_fp_leave:
+    mrs x1, fpcr
+    str x1, [x0, #CPU_FPCR]
+    mrs x1, fpsr
+    str x1, [x0, #CPU_FPSR]
+    ret

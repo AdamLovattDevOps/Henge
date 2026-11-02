@@ -14,5 +14,8 @@ int hv_run_one(HvCpu *cpu);
 void hv_flush_blocks(HvMachine *m);
 
 void hv_enter(HvCpu *cpu, void *block);
+/* While hv_run runs, the host FPCR/FPSR hold the guest's; these move them in and out. */
+void hv_fp_enter(HvCpu *cpu);
+void hv_fp_leave(HvCpu *cpu);
 
 #endif
