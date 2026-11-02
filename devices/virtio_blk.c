@@ -109,6 +109,21 @@ HvVirtioBlk *hv_virtio_blk_create(HvMachine *m, HvPcie *bus, HvDisk *disk, int a
         uint16_t vendor = 0x106b, device = 0x1a00;
         memcpy(v->pci.config + 0, &vendor, 2);
         memcpy(v->pci.config + 2, &device, 2);
+        /* Apple vendor data (a virtio 1.2 PCI vendor-data capability, cfg_type
+           9, vendor 0x106b). AppleVirtIOStorageDevice reads 8 bytes of it: if
+           bit 0 of the first byte is clear, or the capability is missing, it
+           reports the disk as AES-XTS inline-encrypted, and APFS then refuses
+           an unencrypted Data volume. These disks are plain files, so bit 0
+           is set. QEMU's model has no such capability. */
+        uint8_t *cap = v->pci.config + 0x88;
+        v->pci.config[0x71] = 0x88; /* chain it after the notify capability */
+        cap[0] = 0x09;
+        cap[1] = 0x00;
+        cap[2] = 6 + 8;
+        cap[3] = 9;
+        memcpy(cap + 4, &vendor, 2);
+        memset(cap + 6, 0, 8);
+        cap[6] = 1; /* not inline-encrypted */
     }
     hv_pcie_attach(bus, &v->pci);
     return b;

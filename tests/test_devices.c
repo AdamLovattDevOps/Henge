@@ -259,6 +259,17 @@ static void test_virtio_blk(HvDisk *aux) {
     check("Apple virtio-blk (aux) enumerated", slot != (int)~0u, 1);
     if (slot < 0 || slot >= 32) return;
     check("class: SCSI storage", rd32(VMAPPLE_PCIE_ECAM + ((uint64_t)slot << 15) + 8) >> 8, 0x010000);
+    /* Walk the capabilities as AppleVirtIO's transport does: vendor data, cfg_type 9, vendor 0x106b. */
+    {
+        uint64_t c = VMAPPLE_PCIE_ECAM + ((uint64_t)slot << 15);
+        int found = 0;
+        for (uint8_t at = rd8(c + 0x34); at; at = rd8(c + at + 1)) {
+            if (rd8(c + at) != 0x09 || rd8(c + at + 3) != 9) continue;
+            uint16_t vend = (uint16_t)(rd8(c + at + 4) | rd8(c + at + 5) << 8);
+            if (vend == 0x106b && rd8(c + at + 2) >= 6 + 8 && (rd8(c + at + 6) & 1)) found = 1;
+        }
+        check("Apple vendor data says: not inline-encrypted", found, 1);
+    }
     uint64_t bar = VMAPPLE_PCIE_MMIO + 0x100000;
     uint64_t ring = setup_virtio(slot, bar, VMAPPLE_MEM + 0x100000);
     check("blk capacity", rd32(bar + 0x2000), (uint32_t)(aux->size / 512));

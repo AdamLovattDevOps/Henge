@@ -68,6 +68,8 @@ typedef struct HvMachine {
     int slow_mem;        /* tests: send every load and store through hv_mem_emulate */
     uint64_t stat_slow_mem; /* hv_mem_emulate calls */
     uint64_t access_pc;  /* guest PC of the load/store being emulated, for logs */
+    uint64_t watch_va;   /* debugging: log every write that touches this guest VA (0: off) */
+    uint64_t watch_pa;   /* debugging: the same by physical address */
 } HvMachine;
 
 int hv_machine_init(HvMachine *m, size_t jit_bytes);

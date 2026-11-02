@@ -287,6 +287,14 @@ int hv_mem_decode(uint32_t insn, HvMemOp *op) {
 
 int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, int el, uint64_t pc) {
     uint8_t *b = buf;
+    uint64_t w = cpu->m->watch_va;
+    if (write && w && w - va < len) {
+        uint64_t v = 0;
+        memcpy(&v, b + (w - va), len - (w - va) < 8 ? len - (w - va) : 8);
+        fprintf(stderr, "hengevm: watch: write to %llx = %llx (%u-byte store at %llx) by pc %llx x30 %llx\n",
+                (unsigned long long)w, (unsigned long long)v, len, (unsigned long long)va, (unsigned long long)pc,
+                (unsigned long long)cpu->x[30]);
+    }
     while (len) {
         uint32_t chunk = 4096 - (uint32_t)(va & 4095);
         if (chunk > len) chunk = len;

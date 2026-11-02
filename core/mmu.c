@@ -145,6 +145,10 @@ static void tlb_fill(HvCpu *cpu, uint64_t va, int el, const HvWalk *w) {
     e->read_tag = w->r ? page_va : ~0ull;
     /* Writes to ROM or to pages we translated from take the slow path. */
     e->write_tag = w->w && !ram->readonly && !ram->code_pages[pg] ? page_va : ~0ull;
+    /* A watched page takes the slow path for every write. */
+    if (cpu->m->watch_va && (cpu->m->watch_va & ~PAGE_MASK & 0x00ffffffffffffffull) == (page_va & 0x00ffffffffffffffull))
+        e->write_tag = ~0ull;
+    if (cpu->m->watch_pa && (cpu->m->watch_pa & ~PAGE_MASK) == page_pa) e->write_tag = ~0ull;
     e->exec_tag = w->x ? page_va : ~0ull;
 }
 

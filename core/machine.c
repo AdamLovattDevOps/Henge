@@ -95,6 +95,13 @@ int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
                 m->flush_pending = 1;
             }
         }
+        if (m->watch_pa && m->watch_pa - pa < len) {
+            uint64_t v = 0;
+            memcpy(&v, (const uint8_t *)buf + (m->watch_pa - pa), len - (m->watch_pa - pa) < 8 ? len - (m->watch_pa - pa) : 8);
+            fprintf(stderr, "hengevm: watch: write to pa %llx = %llx (%u bytes at pa %llx) by pc %llx\n",
+                    (unsigned long long)m->watch_pa, (unsigned long long)v, len, (unsigned long long)pa,
+                    (unsigned long long)m->access_pc);
+        }
         memcpy(r->host + off, buf, len);
         return 0;
     }

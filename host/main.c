@@ -40,6 +40,7 @@ typedef struct RunArgs {
     HvDisk *disk, *aux;
 } RunArgs;
 static RunArgs run_args;
+static uint64_t translate_va;
 
 static void *cpu_thread(void *unused) {
     (void)unused;
@@ -68,6 +69,12 @@ static void *cpu_thread(void *unused) {
             fprintf(stderr, " %llx", (unsigned long long)v);
         }
         fprintf(stderr, "\n");
+        if (translate_va) {
+            uint64_t pa = 0;
+            uint32_t fsc = hv_mmu_access(&cpu, translate_va, HV_ACC_READ, cpu.el, &pa);
+            fprintf(stderr, "  translate %llx -> pa %llx (fsc %x)\n", (unsigned long long)translate_va,
+                    (unsigned long long)pa, fsc);
+        }
     }
     fprintf(stderr, "\nhengevm: stopped (%s) after %llu blocks, %d translated\n", interrupted ? "interrupted" : reason_name(r),
             (unsigned long long)cpu.icount, m.nblocks);
@@ -95,7 +102,7 @@ static void *cpu_thread(void *unused) {
 }
 
 static void usage(void) {
-    fprintf(stderr, "usage: hengevm --rom FILE --disk FILE --aux FILE --ecid N [--seed N] [--ram MB] [--log N] [--trace 1] [--screenshot PNG] [--no-pvg] [--break PC [--break-hits N]] [--dump PA LEN FILE] [--aux-offset BYTES]\n");
+    fprintf(stderr, "usage: hengevm --rom FILE --disk FILE --aux FILE --ecid N [--seed N] [--ram MB] [--log N] [--trace 1] [--screenshot PNG] [--watch VA] [--no-pvg] [--break PC [--break-hits N]] [--dump PA LEN FILE] [--aux-offset BYTES]\n");
     exit(2);
 }
 
@@ -104,6 +111,7 @@ int main(int argc, char **argv) {
     uint64_t seed = 0, ecid = 0, ram_mb = 4096, aux_offset = 16384;
     int log = 1, trace = 0, use_pvg = 1;
     const char *screenshot = NULL;
+    uint64_t watch = 0;
     uint64_t brk = ~0ull, brk_hits = 1, dump_pa = 0, dump_len = 0;
     const char *dump_path = NULL;
     for (int i = 1; i < argc; i++) {
@@ -121,6 +129,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--log")) log = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--trace")) trace = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--screenshot")) screenshot = argv[++i];
+        else if (!strcmp(argv[i], "--watch")) watch = strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--watch-pa")) m.watch_pa = strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--translate")) translate_va = strtoull(argv[++i], NULL, 0);
 
         else if (!strcmp(argv[i], "--break")) brk = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--break-hits")) brk_hits = strtoull(argv[++i], NULL, 0);
@@ -146,6 +157,7 @@ int main(int argc, char **argv) {
     }
     m.log = log;
     m.trace = trace;
+    m.watch_va = watch;
     HvCfgParams cfg = {.nr_cpus = 1, .ecid = ecid, .seed = seed, .mac_en0 = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01}};
     static const uint8_t mac[6] = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01};
     if (hv_vmapple_create(&board, &m, &cpu, ram_mb << 20, &disk, &aux, &cfg, mac) != 0 ||
