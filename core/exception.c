@@ -42,6 +42,9 @@ void hv_pstate_set(HvCpu *cpu, uint64_t spsr) {
 
 void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set_far, uint64_t ret) {
     uint64_t spsr = hv_pstate_get(cpu);
+    if (cpu->m->trace)
+        fprintf(stderr, "exception type %d esr %08x far %llx from pc %llx el%u\n", type, esr, (unsigned long long)far,
+                (unsigned long long)ret, cpu->el);
     uint64_t offset = cpu->el == 0 ? 0x400 : cpu->spsel ? 0x200 : 0x000;
     cpu->spsr_el1 = spsr;
     cpu->elr_el1 = ret;

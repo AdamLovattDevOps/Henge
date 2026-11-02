@@ -177,12 +177,14 @@ static inline void seed_cpu(HvCpu *cpu, uint64_t seed, uint64_t sp) {
 }
 
 /* Native reference. Darwin may clear x18 on a context switch, so run until two
-   runs agree. */
-static inline void run_native(const TestProgram *p, const HvCpu *init, HvCpu *out) {
+   runs agree. reset (may be NULL) puts guest memory back before each run. */
+static inline void run_native(const TestProgram *p, const HvCpu *init, HvCpu *out, void (*reset)(void)) {
     HvCpu a, b;
     for (int tries = 0; tries < 10; tries++) {
+        if (reset) reset();
         a = *init;
         hv_native_run(&a, p->native);
+        if (reset) reset();
         b = *init;
         hv_native_run(&b, p->native);
         if (memcmp(a.x, b.x, sizeof a.x) == 0 && a.v[0] == b.v[0]) break;
@@ -191,7 +193,8 @@ static inline void run_native(const TestProgram *p, const HvCpu *init, HvCpu *ou
 }
 
 /* Through the JIT: code runs in place, guest PA = host address. */
-static inline int run_jit(HvMachine *m, const TestProgram *p, const HvCpu *init, HvCpu *out) {
+static inline int run_jit(HvMachine *m, const TestProgram *p, const HvCpu *init, HvCpu *out,
+                          void (*setup)(HvCpu *)) {
     HvCpu *cpu = out;
     hv_cpu_reset(cpu, m);
     memcpy(cpu->x, init->x, sizeof cpu->x);
@@ -201,12 +204,14 @@ static inline int run_jit(HvMachine *m, const TestProgram *p, const HvCpu *init,
     cpu->fpcr = init->fpcr;
     cpu->fpsr = init->fpsr;
     cpu->cpacr_el1 = 3u << 20; /* FP enabled */
+    if (setup) setup(cpu);
     cpu->pc = (uint64_t)(uintptr_t)p->start;
     m->stop_pc = (uint64_t)(uintptr_t)p->end;
     int r = hv_run(cpu);
     if (r != HV_EXIT_HALT) {
-        printf("  %s: dispatcher returned %d at pc %llx (insn %08x)\n", p->name, r, (unsigned long long)cpu->pc,
-               cpu->exit_insn);
+        printf("  %s: dispatcher returned %d at pc %llx (insn %08x) esr %llx far %llx elr %llx\n", p->name, r,
+               (unsigned long long)cpu->pc, cpu->exit_insn, (unsigned long long)cpu->esr_el1,
+               (unsigned long long)cpu->far_el1, (unsigned long long)cpu->elr_el1);
         return 1;
     }
     return 0;

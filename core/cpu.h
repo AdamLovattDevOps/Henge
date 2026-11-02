@@ -131,6 +131,7 @@ enum {
     HV_EXIT_UNSUPPORTED, /* the translator cannot handle this instruction yet */
     HV_EXIT_HALT,        /* PSCI off, or a test asked to stop */
     HV_EXIT_FLUSH,       /* translated code was invalidated (IC, self-modifying code) */
+    HV_EXIT_FAULT_LOOP,  /* fetching the exception vector itself faulted: the guest is dead */
 };
 
 /* PSTATE bits as laid out in SPSR. */

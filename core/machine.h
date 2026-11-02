@@ -60,6 +60,8 @@ typedef struct HvMachine {
 
     uint64_t stop_pc;    /* tests: leave the dispatcher when pc reaches this */
     int trace;           /* print every block entered */
+    int slow_mem;        /* tests: send every load and store through hv_mem_emulate */
+    uint64_t stat_slow_mem; /* hv_mem_emulate calls */
 } HvMachine;
 
 int hv_machine_init(HvMachine *m, size_t jit_bytes);

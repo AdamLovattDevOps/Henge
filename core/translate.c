@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "classify.h"
+#include "memop.h"
 #include "operands.h"
 
 /* A block is laid out as: entry `ldr x0, [x28]`, the translated instructions,
@@ -42,6 +43,7 @@ typedef struct {
     Ool ool[MAX_OOL];
     uint32_t nool;
     uint32_t flags;
+    int slow_mem;
 } Emit;
 
 static Emit E; /* translation runs on the dispatcher thread only */
@@ -58,6 +60,11 @@ static Emit E; /* translation runs on the dispatcher thread only */
 #define UBFM_X(d, n, immr, imms) (0xd3400000u | (immr) << 16 | (imms) << 10 | (n) << 5 | (d))
 #define BFM_X(d, n, immr, imms) (0xb3400000u | (immr) << 16 | (imms) << 10 | (n) << 5 | (d))
 #define B_OP 0x14000000u
+#define MOV_X(d, m) (0xaa0003e0u | (m) << 16 | (d))
+#define ADD_LSL(d, n, m, sh) (0x8b000000u | (m) << 16 | (sh) << 10 | (n) << 5 | (d))
+#define SUB_X(d, n, m) (0xcb000000u | (m) << 16 | (n) << 5 | (d))
+#define ADD_EXT(d, n, m, opt, sh) (0x8b200000u | (m) << 16 | (opt) << 13 | (sh) << 10 | (n) << 5 | (d))
+#define CBNZ_X(t) (0xb5000000u | (t))
 
 static inline int64_t sext(uint64_t v, int bits) {
     return (int64_t)(v << (64 - bits)) >> (64 - bits);
@@ -106,6 +113,22 @@ static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op) {
     put(e, LDR_X(1, 28, HV_CPU_HELPER));
     put(e, BLR_X(1));
     put(e, LDR_X(0, 28, 0));
+}
+
+/* d = n + imm for |imm| < 2^24; n and d are general registers, never SP. */
+static void put_add_imm(Emit *e, int d, int n, int64_t imm) {
+    if (imm == 0) {
+        if (d != n) put(e, MOV_X(d, n));
+        return;
+    }
+    uint32_t op = imm < 0 ? 0xd1000000u : 0x91000000u;
+    uint64_t a = imm < 0 ? (uint64_t)-imm : (uint64_t)imm;
+    if (a < 4096) {
+        put(e, op | (uint32_t)a << 10 | n << 5 | d);
+        return;
+    }
+    put(e, op | 1u << 22 | (uint32_t)(a >> 12) << 10 | n << 5 | d);
+    if (a & 0xfff) put(e, op | (uint32_t)(a & 0xfff) << 10 | d << 5 | d);
 }
 
 /* ---- scratch registers ---- */
@@ -322,6 +345,168 @@ static void translate_branch_reg(Emit *e, uint32_t insn, uint64_t pc) {
     put(e, BR_X(1));
 }
 
+/* Loads and stores. A, T and U are borrowed host registers: A holds the guest
+   address and then the host address, T and U index the TLB and then stand in
+   for x18/x28 operands. A miss goes out of line to hv_mem_emulate, which does
+   the whole instruction (writeback included) and comes back to the join. */
+static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
+    HvMemOp op;
+    if (hv_mem_decode(insn, &op) != 0) {
+        put_helper(e, pc, insn, HV_OP_UNDEF);
+        return;
+    }
+    if (e->slow_mem || op.kind == HV_MEM_EXCL || op.kind == HV_MEM_CASP) {
+        put_helper(e, pc, insn, HV_OP_MEM);
+        return;
+    }
+    int literal = op.mode == HV_ADDR_LITERAL;
+    int vec_kind = op.kind == HV_MEM_VEC_MULTI || op.kind == HV_MEM_VEC_SINGLE;
+    int pair = op.kind == HV_MEM_PAIR;
+    int rmw = op.kind == HV_MEM_CAS || op.kind == HV_MEM_ATOMIC;
+    int rm_used = op.mode == HV_ADDR_REG || (vec_kind && op.mode == HV_ADDR_POST && op.rm != 31);
+
+    uint32_t used = 0;
+    if (!literal) used |= 1u << op.rn;
+    if (!op.vec) used |= 1u << op.rt | (pair ? 1u << op.rt2 : 0);
+    if (rm_used) used |= 1u << op.rm;
+    if (rmw) used |= 1u << op.rs;
+    uint8_t s[3];
+    for (int i = 0; i < 3; i++) s[i] = pick(&used);
+    int A = s[0], T = s[1], U = s[2];
+    spill(e, s, 3);
+
+    /* Effective address into A. */
+    int base_stolen = !literal && (op.rn == 31 || is_stolen(op.rn));
+    int base = op.rn;
+    if (literal) {
+        put_lit(e, A, pc + op.imm);
+    } else {
+        if (base_stolen) {
+            put(e, LDR_X(A, 28, slot_of(op.rn)));
+            base = A;
+        }
+        switch (op.mode) {
+        case HV_ADDR_OFFSET:
+        case HV_ADDR_PRE:
+            put_add_imm(e, A, base, op.imm);
+            break;
+        case HV_ADDR_REG: {
+            int rm = op.rm;
+            if (is_stolen(rm)) {
+                put(e, LDR_X(T, 28, slot_of(rm)));
+                rm = T;
+            }
+            put(e, ADD_EXT(A, base, rm, op.ext, op.shift));
+            break;
+        }
+        default:
+            if (base != A) put(e, MOV_X(A, base));
+            break;
+        }
+    }
+
+    /* TLB: index from the first byte, tag check against the last one, so an
+       access that crosses into the next page misses. Uses no flags. */
+    int el_idx = op.unpriv ? 0 : (e->flags & HV_BLOCK_EL1) ? 1 : 0;
+    uint32_t tlb = HV_CPU_TLB + el_idx * HV_CPU_TLB_EL;
+    put(e, UBFM_X(T, A, HV_TLB_PAGE_BITS, HV_TLB_PAGE_BITS + HV_TLB_BITS - 1));
+    put(e, ADD_LSL(T, 28, T, 5));
+    put(e, LDR_X(U, T, tlb + (op.store ? 8 : 0)));
+    put(e, SUB_X(U, A, U));
+    if (op.align && op.bytes > 1) {
+        /* and U, U, #~(0x3fff & ~(bytes-1)): zero only if same page and aligned */
+        uint32_t k = __builtin_ctz(op.bytes);
+        put(e, 0x92400000u | 50u << 16 | (49u + k) << 10 | U << 5 | U);
+    } else {
+        if (op.bytes > 1) put_add_imm(e, U, U, op.bytes - 1);
+        put(e, UBFM_X(U, U, HV_TLB_PAGE_BITS, 63));
+    }
+    put(e, CBNZ_X(U));
+    put_ool(e, (Ool){.kind = OOL_SLOW, .pc = pc, .insn = insn, .nrestore = 3, .restore = {A, T, U}});
+    uint32_t slow = e->nool - 1;
+    put(e, LDR_X(U, T, tlb + 24));
+    put(e, ADD_LSL(A, A, U, 0));
+
+    /* Stand-ins for x18/x28 operands: Rt (or Rs for RMW) in T, the other in U. */
+    int rt = op.rt, rt2 = op.rt2, rs = op.rs;
+    int rt_stolen = !op.vec && is_stolen(op.rt);
+    int rt2_stolen = pair && !op.vec && is_stolen(op.rt2);
+    int rs_stolen = rmw && is_stolen(op.rs);
+    if (rmw) {
+        if (rs_stolen) rs = T;
+        if (rt_stolen) rt = (op.rt == op.rs) ? T : U;
+    } else {
+        if (rt_stolen) rt = T;
+        if (rt2_stolen) rt2 = (op.rt2 == op.rt) ? T : U;
+    }
+    if (rs_stolen) put(e, LDR_X(rs, 28, slot_of(op.rs)));
+    if (rt_stolen && rt != rs) put(e, LDR_X(rt, 28, slot_of(op.rt)));
+    if (rt2_stolen && rt2 != rt) put(e, LDR_X(rt2, 28, slot_of(op.rt2)));
+
+    uint32_t out;
+    switch (op.kind) {
+    case HV_MEM_PAIR: {
+        uint32_t opc = op.vec ? op.size - 2u : (op.sign ? 1u : op.size == 3 ? 2u : 0u);
+        out = opc << 30 | 0x29000000u | (uint32_t)op.vec << 26 | (uint32_t)op.load << 22 | rt2 << 10 | A << 5 | rt;
+        break;
+    }
+    case HV_MEM_SINGLE:
+    case HV_MEM_LITERAL:
+    case HV_MEM_LDRA: {
+        uint32_t size, opc;
+        if (op.vec) {
+            size = op.size == 4 ? 0 : op.size;
+            opc = (op.size == 4 ? 2u : 0u) | op.load;
+        } else {
+            size = op.size;
+            opc = op.store ? 0 : op.sign == 64 ? 2 : op.sign == 32 ? 3 : 1;
+        }
+        out = size << 30 | 0x39000000u | (uint32_t)op.vec << 26 | opc << 22 | A << 5 | rt;
+        break;
+    }
+    case HV_MEM_VEC_MULTI:
+    case HV_MEM_VEC_SINGLE:
+        out = (insn & ~(1u << 23) & ~(0x1fu << 16) & ~(0x1fu << 5)) | A << 5;
+        break;
+    default: /* ORDERED, CAS, ATOMIC: same instruction on the host address */
+        out = (insn & ~(0x1fu << 5) & ~0x1fu) | A << 5 | rt;
+        if ((insn & 0x3f200c00) == 0x19000000) out &= ~(0x1ffu << 12); /* LDAPUR/STLUR: drop imm9 */
+        if (rmw) out = (out & ~(0x1fu << 16)) | rs << 16;
+        break;
+    }
+    put(e, out);
+
+    if (rmw) {
+        if (rs_stolen && op.kind == HV_MEM_CAS) put(e, STR_X(rs, 28, slot_of(op.rs)));
+        if (rt_stolen && op.kind == HV_MEM_ATOMIC) put(e, STR_X(rt, 28, slot_of(op.rt)));
+    } else if (op.load) {
+        if (rt_stolen) put(e, STR_X(rt, 28, slot_of(op.rt)));
+        if (rt2_stolen) put(e, STR_X(rt2, 28, slot_of(op.rt2)));
+    }
+
+    /* Base writeback. */
+    if (op.mode == HV_ADDR_PRE || op.mode == HV_ADDR_POST) {
+        int b = op.rn;
+        if (base_stolen) {
+            put(e, LDR_X(T, 28, slot_of(op.rn)));
+            b = T;
+        }
+        if (vec_kind && op.rm != 31) {
+            int rm = op.rm;
+            if (is_stolen(rm)) {
+                put(e, LDR_X(U, 28, slot_of(rm)));
+                rm = U;
+            }
+            put(e, ADD_LSL(b, b, rm, 0));
+        } else {
+            put_add_imm(e, b, b, op.imm);
+        }
+        if (base_stolen) put(e, STR_X(T, 28, slot_of(op.rn)));
+    }
+    unspill(e, s, 3);
+    e->ool[slow].join = e->n;
+}
+
 static int is_fp_insn(uint32_t insn) {
     uint32_t op0 = (insn >> 25) & 0xf;
     if ((op0 & 0x7) == 0x7) return 1;                        /* SIMD and FP data processing */
@@ -356,7 +541,7 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
         return 0;
     case HV_INSN_LOAD_LITERAL:
     case HV_INSN_MEMORY:
-        put_helper(e, pc, insn, HV_OP_MEM);
+        translate_mem(e, insn, pc);
         return 0;
     case HV_INSN_SYSREG:
         if (((insn >> 21) & 1) && ((insn >> 19) & 3)) { /* MRS */
@@ -432,6 +617,7 @@ int hv_translate_block(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t 
     Emit *e = &E;
     e->n = e->npool = e->nfix = e->nool = 0;
     e->flags = b->flags;
+    e->slow_mem = m->slow_mem;
 
     put(e, LDR_X(0, 28, 0));
     uint32_t max = avail < HV_MAX_BLOCK_INSNS ? avail : HV_MAX_BLOCK_INSNS;

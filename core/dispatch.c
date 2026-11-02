@@ -63,6 +63,7 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
 uint32_t hv_helper(HvCpu *cpu, const HvHelperInfo *info) {
     switch (info->op) {
     case HV_OP_MEM:
+        cpu->m->stat_slow_mem++;
         return hv_mem_emulate(cpu, info->insn, info->pc);
     case HV_OP_MRS:
         return hv_sysreg_mrs(cpu, info->insn, info->pc);
@@ -109,6 +110,7 @@ static int wait_for_interrupt(HvCpu *cpu) {
 int hv_run(HvCpu *cpu) {
     HvMachine *m = cpu->m;
     uint32_t since_tick = 0;
+    uint64_t last_fault = ~0ull;
     for (;;) {
         if (m->flush_pending) {
             m->flush_pending = 0;
@@ -125,7 +127,12 @@ int hv_run(HvCpu *cpu) {
         uint64_t pa;
         uint32_t avail;
         const uint32_t *code = hv_mmu_fetch(cpu, cpu->pc, &pa, &avail);
-        if (!code) continue; /* the instruction abort was taken */
+        if (!code) { /* the instruction abort was taken */
+            if (cpu->pc == last_fault) return HV_EXIT_FAULT_LOOP;
+            last_fault = cpu->pc;
+            continue;
+        }
+        last_fault = ~0ull;
         HvBlock *b = lookup(cpu, cpu->pc, pa, block_flags(cpu), code, avail);
         if (!b) {
             fprintf(stderr, "hengevm: cannot translate block at %llx\n", (unsigned long long)cpu->pc);

@@ -21,6 +21,7 @@ static const TestProgram programs[] = {
 };
 
 int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
     static HvMachine m;
     if (hv_machine_init(&m, 4 << 20) != 0) {
         printf("machine init failed\n");
@@ -44,8 +45,8 @@ int main(void) {
             memset(&init, 0, sizeof init);
             seed_cpu(&init, i * 2 + variant + 1, sp);
             if (variant) init.nzcv = 0xa0000000;
-            run_native(p, &init, &native);
-            int bad = run_jit(&m, p, &init, &jit);
+            run_native(p, &init, &native, NULL);
+            int bad = run_jit(&m, p, &init, &jit, NULL);
             if (!bad) bad = compare_cpus(p->name, &native, &jit);
             printf("%-12s seed %d: %s\n", p->name, variant, bad ? "FAIL" : "ok");
             failed += bad != 0;
@@ -58,7 +59,7 @@ int main(void) {
         memset(&init, 0, sizeof init);
         seed_cpu(&init, 99, sp);
         for (int r = 0; r < 31; r++) init.x[r] = r & 1 ? 0xfffffe0007123450ull + r * 8 : 0x100004000ull + r * 8;
-        int bad = run_jit(&m, &pac_prog, &init, &jit);
+        int bad = run_jit(&m, &pac_prog, &init, &jit, NULL);
         HvCpu want = init;
         want.x[4] = 0;
         if (!bad) bad = compare_cpus("pac", &want, &jit);
