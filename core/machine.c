@@ -15,7 +15,9 @@ int hv_machine_init(HvMachine *m, size_t jit_bytes) {
     m->blocks = calloc(HV_MAX_BLOCKS, sizeof(HvBlock));
     if (!m->blocks) return -1;
     m->stop_pc = ~0ull;
-    return 0;
+    m->chain = 1;
+    m->chains = calloc(HV_MAX_CHAINS, sizeof *m->chains);
+    return m->chains ? 0 : -1;
 }
 
 void hv_machine_free(HvMachine *m) {
@@ -25,6 +27,7 @@ void hv_machine_free(HvMachine *m) {
         free(m->ram[i].page_gen);
     }
     free(m->blocks);
+    free(m->chains);
 }
 
 int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int readonly) {
@@ -67,6 +70,9 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
     r->code_pages[pg] = 0;
     r->page_gen[pg]++;
     m->stats.flush_smc++;
+    /* Chains may lead into the stale blocks: undo them, and make a running chain leave. */
+    m->unchain_pending = 1;
+    if (m->cpu) __atomic_store_n(&m->cpu->exit_req, 1, __ATOMIC_RELAXED);
 }
 
 HvMmio *hv_mmio_lookup(HvMachine *m, uint64_t pa) {
@@ -132,6 +138,7 @@ int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
 void hv_cpu_reset(HvCpu *cpu, HvMachine *m) {
     memset(cpu, 0, sizeof *cpu);
     cpu->m = m;
+    m->cpu = cpu;
     cpu->exit_routine = (uint64_t)hv_exit;
     cpu->helper_routine = (uint64_t)hv_helper_entry;
     cpu->el = 1;

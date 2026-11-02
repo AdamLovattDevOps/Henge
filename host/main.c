@@ -42,6 +42,17 @@ typedef struct RunArgs {
 static RunArgs run_args;
 static uint64_t translate_va;
 
+/* Chained blocks run without returning to the dispatcher; this makes them leave
+   every millisecond so timers, devices and interrupts are serviced. */
+static void *kicker_thread(void *unused) {
+    (void)unused;
+    for (;;) {
+        usleep(1000);
+        __atomic_store_n(&cpu.exit_req, 1, __ATOMIC_RELAXED);
+    }
+    return NULL;
+}
+
 static void *cpu_thread(void *unused) {
     (void)unused;
     RunArgs *a = &run_args;
@@ -102,14 +113,14 @@ static void *cpu_thread(void *unused) {
 }
 
 static void usage(void) {
-    fprintf(stderr, "usage: hengevm --rom FILE --disk FILE --aux FILE --ecid N [--seed N] [--ram MB] [--log N] [--trace 1] [--screenshot PNG] [--watch VA] [--stats SECONDS] [--no-pvg] [--break PC [--break-hits N]] [--dump PA LEN FILE] [--aux-offset BYTES]\n");
+    fprintf(stderr, "usage: hengevm --rom FILE --disk FILE --aux FILE --ecid N [--seed N] [--ram MB] [--log N] [--trace 1] [--screenshot PNG] [--watch VA] [--stats SECONDS] [--no-pvg] [--no-chain] [--break PC [--break-hits N]] [--dump PA LEN FILE] [--aux-offset BYTES]\n");
     exit(2);
 }
 
 int main(int argc, char **argv) {
     const char *rom = NULL, *disk_path = NULL, *aux_path = NULL;
     uint64_t seed = 0, ecid = 0, ram_mb = 4096, aux_offset = 16384;
-    int log = 1, trace = 0, use_pvg = 1;
+    int log = 1, trace = 0, use_pvg = 1, no_chain = 0;
     const char *screenshot = NULL;
     uint64_t watch = 0, watch_pa = 0;
     int stats = 0;
@@ -118,6 +129,10 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--no-pvg")) {
             use_pvg = 0;
+            continue;
+        }
+        if (!strcmp(argv[i], "--no-chain")) {
+            no_chain = 1;
             continue;
         }
         if (i + 1 >= argc) usage();
@@ -162,6 +177,7 @@ int main(int argc, char **argv) {
     m.watch_va = watch;
     m.watch_pa = watch_pa;
     m.stats_interval = stats; /* set after hv_machine_init, which clears the machine */
+    m.chain = !no_chain && brk == ~0ull; /* breakpoints need every block to come back */
     HvCfgParams cfg = {.nr_cpus = 1, .ecid = ecid, .seed = seed, .mac_en0 = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01}};
     static const uint8_t mac[6] = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01};
     if (hv_vmapple_create(&board, &m, &cpu, ram_mb << 20, &disk, &aux, &cfg, mac) != 0 ||
@@ -187,6 +203,8 @@ int main(int argc, char **argv) {
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 8u << 20);
     pthread_create(&t, &attr, cpu_thread, NULL);
+    pthread_t k;
+    pthread_create(&k, NULL, kicker_thread, NULL);
     CFRunLoopRun();
     return 0;
 }

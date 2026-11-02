@@ -52,7 +52,10 @@ typedef struct HvCpu {
     uint64_t sctlr_el1;      /* 0x3a8 */
     uint64_t esr_el1;        /* 0x3b0 */
     uint64_t far_el1;        /* 0x3b8 */
-    uint64_t pad0[8];        /* keeps the TLB at 0x400 */
+    uint32_t exit_req;       /* 0x3c0: set (by another thread too) to make chained blocks leave */
+    uint32_t pad1;
+    uint64_t last_stub;      /* 0x3c8: patch slot of the chainable exit just taken, or 0 */
+    uint64_t pad0[6];        /* keeps the TLB at 0x400 */
     /* 0x400: [0] EL0 and unprivileged accesses, [1] EL1, [2] EL1 with PSTATE.PAN set,
        so toggling PAN (the kernel does it around every user copy) flushes nothing. */
     HvTlbEntry tlb[3][HV_TLB_SIZE];
@@ -117,6 +120,8 @@ typedef struct HvCpu {
 #define HV_CPU_SCTLR_EL1   0x3a8
 #define HV_CPU_ESR_EL1     0x3b0
 #define HV_CPU_FAR_EL1     0x3b8
+#define HV_CPU_EXIT_REQ    0x3c0
+#define HV_CPU_LAST_STUB   0x3c8
 #define HV_CPU_TLB         0x400
 #define HV_CPU_TLB_EL      (HV_TLB_SIZE * 32)
 
@@ -135,6 +140,8 @@ _Static_assert(offsetof(HvCpu, tlb) == HV_CPU_TLB, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, tpidr_el0) == HV_CPU_TPIDR_EL0, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, daif) == HV_CPU_DAIF, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, far_el1) == HV_CPU_FAR_EL1, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, exit_req) == HV_CPU_EXIT_REQ, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, last_stub) == HV_CPU_LAST_STUB, "HvCpu layout");
 _Static_assert(sizeof(HvTlbEntry) == 32, "TLB entries are indexed with lsl #5");
 
 /* Why the last block returned to the dispatcher. */

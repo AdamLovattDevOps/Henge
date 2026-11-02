@@ -188,6 +188,7 @@ int main(void) {
     hv_machine_add_mmio(&m, 0x20000000, 0x1000, NULL, dev_read, dev_write, "test device");
     m.slow_mem = 0;
     failed += test_mmio(&m);
-    printf("%zu programs x 3 modes + mmio, %d failures\n", count, failed);
+    printf("%zu programs x 3 modes + mmio, %d failures, %llu chained exits\n", count, failed,
+           (unsigned long long)m.stats.chained);
     return failed != 0;
 }

@@ -44,6 +44,7 @@ typedef struct {
     uint32_t nool;
     uint32_t flags;
     int slow_mem;
+    uint64_t page;       /* guest VA of the 16 KB page the block is in */
 } Emit;
 
 static Emit E; /* translation runs on the dispatcher thread only */
@@ -99,6 +100,28 @@ static void put_ool(Emit *e, Ool o) {
 /* Leave the block with pc = target. */
 static void put_exit(Emit *e, uint64_t target) {
     put(e, STP_X(0, 1, 28, 0));
+    put_lit(e, 0, target);
+    put(e, STR_X(0, 28, HV_CPU_PC));
+    put(e, LDR_X(1, 28, HV_CPU_EXIT));
+    put(e, BR_X(1));
+}
+
+/* A direct branch to target. Within the block's own 16 KB page the exit is
+   chainable: the dispatcher may patch the slot to jump straight into the
+   target block (whose first instruction reloads x0), as long as nobody has
+   asked the CPU to leave. A same-page target always has the same physical
+   mapping as this block, so the chain stays correct across page-table changes. */
+static void put_branch_exit(Emit *e, uint64_t target) {
+    if ((target & ~((1ull << HV_TLB_PAGE_BITS) - 1)) != e->page) {
+        put_exit(e, target);
+        return;
+    }
+    put(e, STP_X(0, 1, 28, 0));
+    put(e, 0xb9400000u | (HV_CPU_EXIT_REQ / 4) << 10 | 28 << 5 | 0); /* ldr w0, [x28, #exit_req] */
+    put(e, 0x35000000u | 2u << 5 | 0);                                /* cbnz w0, +2: leave */
+    put(e, B_OP | 1);                                                 /* patch slot: b +1 until chained */
+    put(e, 0x10ffffe0u);                                              /* adr x0, slot (pc - 4) */
+    put(e, STR_X(0, 28, HV_CPU_LAST_STUB));
     put_lit(e, 0, target);
     put(e, STR_X(0, 28, HV_CPU_PC));
     put(e, LDR_X(1, 28, HV_CPU_EXIT));
@@ -294,19 +317,19 @@ static void translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
     if ((insn & 0x7c000000) == 0x14000000) { /* B, BL */
         uint64_t target = pc + (sext(insn & 0x3ffffff, 26) << 2);
         if (insn >> 31) put_const_to(e, 30, pc + 4);
-        put_exit(e, target);
+        put_branch_exit(e, target);
         return;
     }
     if ((insn & 0xff000000) == 0x54000000) { /* B.cond, BC.cond */
         uint64_t target = pc + (sext((insn >> 5) & 0x7ffff, 19) << 2);
         uint32_t cond = insn & 0xf;
         if (cond >= 14) {
-            put_exit(e, target);
+            put_branch_exit(e, target);
             return;
         }
         put(e, 0x54000000u | cond);
         put_ool(e, (Ool){.kind = OOL_EXIT, .pc = target});
-        put_exit(e, pc + 4);
+        put_branch_exit(e, pc + 4);
         return;
     }
     /* CBZ/CBNZ (imm19) and TBZ/TBNZ (imm14) */
@@ -317,7 +340,7 @@ static void translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
     if (!is_stolen(rt)) {
         put(e, bare);
         put_ool(e, (Ool){.kind = OOL_EXIT, .pc = target});
-        put_exit(e, pc + 4);
+        put_branch_exit(e, pc + 4);
         return;
     }
     uint8_t s = 9;
@@ -326,7 +349,7 @@ static void translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
     put(e, (bare & ~0x1fu) | s);
     put_ool(e, (Ool){.kind = OOL_EXIT, .pc = target, .nrestore = 1, .restore = {s}});
     unspill(e, &s, 1);
-    put_exit(e, pc + 4);
+    put_branch_exit(e, pc + 4);
 }
 
 /* BR, BLR, RET and their PAC forms. Ends the block. */
@@ -728,7 +751,7 @@ static void emit_ool(Emit *e) {
         patch_branch(&e->w[o->at], (int64_t)e->n - o->at);
         unspill(e, o->restore, o->nrestore);
         if (o->kind == OOL_EXIT) {
-            put_exit(e, o->pc);
+            put_branch_exit(e, o->pc); /* only branches use OOL exits */
         } else {
             put_helper(e, o->pc, o->insn, HV_OP_MEM);
             put(e, B_OP);
@@ -742,6 +765,7 @@ int hv_translate_block(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t 
     e->n = e->npool = e->nfix = e->nool = 0;
     e->flags = b->flags;
     e->slow_mem = m->slow_mem;
+    e->page = b->va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
 
     put(e, LDR_X(0, 28, 0));
     uint32_t max = avail < HV_MAX_BLOCK_INSNS ? avail : HV_MAX_BLOCK_INSNS;
@@ -754,7 +778,7 @@ int hv_translate_block(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t 
         i++;
         if (e->n + WORDS_PER_INSN_MAX * 2 > MAX_WORDS || e->npool + 8 > MAX_LITS || e->nool + 4 > MAX_OOL) break;
     }
-    if (!ended) put_exit(e, b->va + 4ull * i);
+    if (!ended) put_branch_exit(e, b->va + 4ull * i);
     b->ninsns = i;
     emit_ool(e);
 

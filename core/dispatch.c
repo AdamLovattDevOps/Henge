@@ -13,6 +13,8 @@
 
 void hv_flush_blocks(HvMachine *m) {
     m->stats.block_flushes++;
+    m->nchains = 0; /* the patched code goes away with the blocks */
+    m->unchain_pending = 0;
     memset(m->hash, 0, sizeof m->hash);
     m->nblocks = 0;
     hv_jit_reset(&m->jit);
@@ -138,12 +140,12 @@ static void print_stats(HvCpu *cpu, int force) {
 #define RATE(f) ((double)(s->f - last.f) / dt)
     fprintf(stderr,
             "stats %5.0fs: blocks %.2fM/s, translated %.0f/s, slow mem %.0fK/s, mrs %.0fK/s msr %.0fK/s sys %.0fK/s, "
-            "exc %.0f/s irq %.0f/s, tlb flush %.0f/s, fetch walks %.0fK/s, wfi %.0f/s (%.0f%% idle), flushes %.0f/s (smc %.0f ic %.0f full %.0f), el%u pc %llx\n",
+            "exc %.0f/s irq %.0f/s, tlb flush %.0f/s, fetch walks %.0fK/s, wfi %.0f/s (%.0f%% idle), flushes %.0f/s (smc %.0f ic %.0f full %.0f), chained %.0f/s unchains %.0f/s, el%u pc %llx\n",
             (double)(now - start_t) / 24e6, RATE(blocks) / 1e6, RATE(translations), RATE(helper[HV_OP_MEM]) / 1e3,
             RATE(helper[HV_OP_MRS]) / 1e3, RATE(helper[HV_OP_MSR]) / 1e3, RATE(helper[HV_OP_SYS]) / 1e3,
             RATE(exceptions), RATE(interrupts), RATE(tlb_flushes), RATE(fetch_walks) / 1e3, RATE(wfi),
             100.0 * (double)(s->wfi_ticks - last.wfi_ticks) / (double)(now - last_t), RATE(block_flushes), RATE(flush_smc),
-            RATE(flush_ic), RATE(flush_full), cpu->el,
+            RATE(flush_ic), RATE(flush_full), RATE(chained), RATE(unchains), cpu->el,
             (unsigned long long)cpu->pc);
 #undef RATE
     /* The five busiest system registers or SYS operations (reads + writes) this interval. */
@@ -161,6 +163,27 @@ static void print_stats(HvCpu *cpu, int force) {
     memset(reg_hist, 0, sizeof reg_hist);
     last = *s;
     last_t = now;
+}
+
+/* Undo every chain: the patch slots go back to "fall through to the exit". */
+static void unchain_all(HvMachine *m) {
+    if (!m->nchains) return;
+    hv_jit_begin_write();
+    for (uint32_t i = 0; i < m->nchains; i++) *m->chains[i] = 0x14000001; /* b +1 */
+    for (uint32_t i = 0; i < m->nchains; i++) hv_jit_end_write(m->chains[i], 1);
+    m->nchains = 0;
+    m->stats.unchains++;
+}
+
+/* Patch the exit slot a block just left through so it jumps straight to b. */
+static void chain(HvMachine *m, uint32_t *slot, HvBlock *b) {
+    int64_t off = (int64_t)(b->code - slot);
+    if (off < -(1 << 25) || off >= (1 << 25) || m->nchains == HV_MAX_CHAINS) return;
+    hv_jit_begin_write();
+    *slot = 0x14000000u | (uint32_t)(off & 0x3ffffff);
+    hv_jit_end_write(slot, 1);
+    m->chains[m->nchains++] = slot;
+    m->stats.chained++;
 }
 
 static int run(HvCpu *cpu, int one);
@@ -198,17 +221,26 @@ static int run(HvCpu *cpu, int one) {
     HvMachine *m = cpu->m;
     uint32_t since_tick = 0;
     uint64_t last_fault = ~0ull, prev_pc = 0;
+    uint32_t *pending_chain = NULL;
     for (;;) {
         if (m->flush_pending) {
             m->flush_pending = 0;
             hv_flush_blocks(m);
+            pending_chain = NULL;
+        }
+        if (m->unchain_pending) {
+            m->unchain_pending = 0;
+            unchain_all(m);
+            pending_chain = NULL;
         }
         if (cpu->halted) return HV_EXIT_HALT;
-        if (m->tick && ++since_tick >= 64) {
+        /* Someone asked the CPU to leave (the 1 ms kicker, a device, an invalidation): service devices now. */
+        int kicked = __atomic_exchange_n(&cpu->exit_req, 0, __ATOMIC_RELAXED) != 0;
+        if (m->tick && (kicked || ++since_tick >= 64)) {
             since_tick = 0;
             m->tick(m, cpu);
         }
-        hv_check_interrupts(cpu);
+        if (hv_check_interrupts(cpu)) pending_chain = NULL;
         if (cpu->pc == m->stop_pc) return HV_EXIT_HALT;
 
         uint64_t pa;
@@ -225,15 +257,20 @@ static int run(HvCpu *cpu, int one) {
             fprintf(stderr, "hengevm: cannot translate block at %llx\n", (unsigned long long)cpu->pc);
             return HV_EXIT_UNSUPPORTED;
         }
+        /* The block before left through a chainable direct branch to this one: link them. */
+        if (pending_chain && !m->trace) chain(m, pending_chain, b);
+        pending_chain = NULL;
         if (m->trace) fprintf(stderr, "block %llx el%u\n", (unsigned long long)cpu->pc, cpu->el);
         if (m->log >= 4 && host_pointer_check(cpu, prev_pc)) return HV_EXIT_UNSUPPORTED;
         prev_pc = cpu->pc;
         cpu->exit_reason = HV_EXIT_BRANCH;
+        cpu->last_stub = 0;
         cpu->icount++;
         m->stats.blocks++;
         if (m->stats_interval && (m->stats.blocks & 0xffff) == 0) print_stats(cpu, 0);
         hv_enter(cpu, b->code);
 
+        if (cpu->exit_reason == HV_EXIT_BRANCH && cpu->last_stub && m->chain) pending_chain = (uint32_t *)cpu->last_stub;
         switch (cpu->exit_reason) {
         case HV_EXIT_BRANCH:
         case HV_EXIT_EXCEPTION:

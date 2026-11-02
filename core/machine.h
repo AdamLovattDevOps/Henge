@@ -42,11 +42,13 @@ typedef struct HvBlock {
 #define HV_MAX_MMIO 48
 #define HV_BLOCK_HASH 65536
 #define HV_MAX_BLOCKS (1 << 19)
+#define HV_MAX_CHAINS (1 << 20)
 
 /* Counters for --stats: where the time goes. */
 typedef struct HvStats {
     uint64_t blocks, translations, block_flushes;
     uint64_t flush_smc, flush_ic, flush_full;  /* why translations were dropped */
+    uint64_t chained, unchains;
     uint64_t helper[12];      /* by HV_OP_* */
     uint64_t tlb_flushes, fetch_walks, exceptions, interrupts;
     uint64_t wfi, wfi_ticks;  /* WFI exits, host ticks spent asleep */
@@ -84,6 +86,12 @@ typedef struct HvMachine {
     uint64_t watch_va;   /* debugging: log every write that touches this guest VA (0: off) */
     uint64_t watch_pa;   /* debugging: the same by physical address */
     HvStats stats;
+    /* Block chaining: patched exit slots, so they can be undone when code changes. */
+    int chain;               /* enabled */
+    uint32_t **chains;
+    uint32_t nchains;
+    int unchain_pending;
+    HvCpu *cpu;              /* the CPU, so device and invalidation code can ask it to leave */
     int stats_interval;  /* seconds between --stats lines, 0 = off */
 } HvMachine;
 
