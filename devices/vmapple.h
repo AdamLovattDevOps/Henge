@@ -3,11 +3,13 @@
 
 #include <stdint.h>
 
+#include "aes.h"
 #include "bdif.h"
 #include "cfg.h"
 #include "gicv3.h"
 #include "pcie.h"
 #include "pl011.h"
+#include "pl061.h"
 #include "pl031.h"
 #include "virtio_blk.h"
 #include "virtio_net.h"
@@ -19,8 +21,11 @@
 #define VMAPPLE_GIC_REDIST 0x10010000ull
 #define VMAPPLE_UART       0x20010000ull
 #define VMAPPLE_RTC        0x20050000ull
+#define VMAPPLE_GPIO       0x20060000ull
 #define VMAPPLE_PVPANIC    0x20070000ull
 #define VMAPPLE_BDOOR      0x30000000ull
+#define VMAPPLE_AES_1      0x30220000ull
+#define VMAPPLE_AES_2      0x30230000ull
 #define VMAPPLE_RTC_SELECT 0x30240000ull /* not in QEMU's map; see vmapple.c */
 #define VMAPPLE_PCIE_ECAM  0x40000000ull
 #define VMAPPLE_PCIE_MMIO  0x50000000ull
@@ -29,6 +34,8 @@
 /* SPI numbers; the INTID is 32 more. */
 #define VMAPPLE_IRQ_UART 1
 #define VMAPPLE_IRQ_RTC 2
+#define VMAPPLE_IRQ_GPIO 5
+#define VMAPPLE_IRQ_AES 0x12
 #define VMAPPLE_IRQ_PCIE 0x20
 
 typedef struct HvVmapple {
@@ -37,8 +44,10 @@ typedef struct HvVmapple {
     HvGic *gic;
     HvPl011 *uart;
     HvPl031 *rtc;
+    HvPl061 *gpio;
     HvPcie *pcie;
     HvBdif *bdif;
+    HvAes *aes;
     HvVirtioBlk *aux_blk, *root_blk;
     HvVirtioNet *net;
     uint8_t *cfg, *rom, *ram;

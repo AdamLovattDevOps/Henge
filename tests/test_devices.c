@@ -355,6 +355,30 @@ static void test_virtio_net(void) {
     check("RX used length", used_len, 76);
 }
 
+/* FIPS-197 appendix C.1: AES-128, key 000102..0f, plaintext 00112233..ff. */
+static void test_aes(void) {
+    const uint64_t fifo = VMAPPLE_AES_1 + 0x200, src = VMAPPLE_MEM + 0x500000, dst = src + 0x100;
+    static const uint8_t pt[16] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+                                   0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff};
+    static const uint8_t ct[16] = {0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30,
+                                   0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4, 0xc5, 0x5a};
+    memcpy(ram(src), pt, 16);
+    check("aes status at reset", rd32(VMAPPLE_AES_1 + 0x0c), 0x3f80);
+    wr32(fifo, 1u << 28 | 1u << 20); /* KEY: context 0, AES-128, encrypt, ECB */
+    for (int i = 0; i < 4; i++) wr32(fifo, 0x03020100u + 0x04040404u * (uint32_t)i);
+    wr32(fifo, 5u << 28 | 16); /* DATA: 16 bytes */
+    wr32(fifo, 0);
+    wr32(fifo, (uint32_t)src);
+    wr32(fifo, (uint32_t)dst);
+    check("aes-128 ECB known answer", memcmp(ram(dst), ct, 16), 0);
+    wr32(VMAPPLE_AES_1 + 0x1c, 1u << 5);
+    wr32(fifo, 8u << 28 | 1u << 27 | 0x42); /* FLAG with interrupt */
+    check("aes flag raises SPI 0x12", board.gic->level[32 + VMAPPLE_IRQ_AES], 1);
+    check("aes flag info", rd32(VMAPPLE_AES_1 + 0x30), 0x42);
+    wr32(VMAPPLE_AES_1 + 0x18, 1u << 5);
+    check("aes interrupt cleared", board.gic->level[32 + VMAPPLE_IRQ_AES], 0);
+}
+
 static char uart_out[128];
 static int uart_n;
 static void capture_uart(void *opaque, uint8_t c) {
@@ -422,6 +446,16 @@ int main(void) {
     test_bdif(&root, &aux);
     test_virtio_blk(&aux);
     test_virtio_net();
+    test_aes();
+    /* PL061: power button on pin 3, rising edge */
+    wr32(VMAPPLE_GPIO + 0x40c, 1u << 3); /* IEV: rising edge */
+    wr32(VMAPPLE_GPIO + 0x410, 1u << 3);
+    check("gpio PeriphID0", rd32(VMAPPLE_GPIO + 0xfe0), 0x61);
+    hv_pl061_set_input(board.gpio, 3, 1);
+    check("gpio pin 3 reads high", rd32(VMAPPLE_GPIO + (1u << 3 << 2)), 1u << 3);
+    check("gpio edge raises SPI 5", board.gic->level[32 + VMAPPLE_IRQ_GPIO], 1);
+    wr32(VMAPPLE_GPIO + 0x41c, 1u << 3);
+    check("gpio interrupt cleared", board.gic->level[32 + VMAPPLE_IRQ_GPIO], 0);
     test_guest_programs();
 
     hv_disk_close(&root);

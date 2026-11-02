@@ -67,7 +67,9 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
     b->gic = hv_gicv3_create(m, VMAPPLE_GIC_DIST, VMAPPLE_GIC_REDIST);
     b->uart = hv_pl011_create(m, b->gic, VMAPPLE_UART, 32 + VMAPPLE_IRQ_UART);
     b->rtc = hv_pl031_create(m, b->gic, VMAPPLE_RTC, 32 + VMAPPLE_IRQ_RTC);
+    b->gpio = hv_pl061_create(m, b->gic, VMAPPLE_GPIO, 32 + VMAPPLE_IRQ_GPIO);
     b->bdif = hv_bdif_create(m, VMAPPLE_BDOOR, root, aux);
+    b->aes = hv_aes_create(m, b->gic, VMAPPLE_AES_1, VMAPPLE_AES_2, 32 + VMAPPLE_IRQ_AES);
     hv_machine_add_mmio(m, VMAPPLE_PVPANIC, 2, b, pvpanic_read, pvpanic_write, "pvpanic");
     hv_machine_add_mmio(m, VMAPPLE_RTC_SELECT, 0x4000, b, rtc_select_read, rtc_select_write, "rtc-select");
     HvCfgParams p = *cfg;
