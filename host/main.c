@@ -10,7 +10,9 @@
 
 #include "dispatch.h"
 #include "exception.h"
+#include "audio_mac.h"
 #include "mmu.h"
+#include "net_slirp.h"
 #include "pvg.h"
 #include "vmapple.h"
 
@@ -46,6 +48,13 @@ static uint64_t translate_va;
 /* Chained blocks run without returning to the dispatcher; this makes them leave
    every millisecond so timers, devices and interrupts are serviced. */
 static mach_port_t cpu_port;
+static int pvg_on, net_on;
+
+/* Host-side device work on the CPU thread each tick. */
+static void board_poll(void) {
+    if (pvg_on) hv_pvg_poll();
+    if (net_on) hv_net_poll();
+}
 
 /* --profile: where the CPU thread is right now. */
 static void sample_cpu(void) {
@@ -251,9 +260,15 @@ int main(int argc, char **argv) {
         if (hv_pvg_attach(&board, screenshot) != 0) {
             fprintf(stderr, "hengevm: ParavirtualizedGraphics device unavailable; graphics stays inert\n");
         } else {
-            board.poll = hv_pvg_poll;
+            pvg_on = 1;
         }
     }
+    if (board.net && !getenv("HV_NO_NET")) {
+        if (hv_net_attach(&m, board.net) != 0) fprintf(stderr, "hengevm: user-mode network unavailable\n");
+        else net_on = 1;
+    }
+    if (board.snd) hv_audio_attach(board.snd);
+    board.poll = board_poll;
     run_args = (RunArgs){brk, brk_hits, dump_pa, dump_len, dump_path, &disk, &aux};
     /* The CPU runs on its own thread: the graphics framework needs the main queue. */
     pthread_t t;

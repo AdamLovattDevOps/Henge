@@ -110,6 +110,7 @@ static uint64_t tick(HvMachine *m, HvCpu *cpu) {
     hv_xhci_poll(b->usb);
     hv_virtio_input_poll(b->keyboard);
     hv_virtio_input_poll(b->mouse);
+    hv_virtio_snd_poll(b->snd);
     return deadline; /* every GIC state change already updated the CPU's lines */
 }
 
@@ -153,6 +154,7 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
     if (order && !strcmp(order, "swap")) b->mouse = hv_virtio_input_create(m, b->pcie, HV_VINPUT_MOUSE);
     b->keyboard = hv_virtio_input_create(m, b->pcie, HV_VINPUT_KEYBOARD);
     if (!order) b->mouse = hv_virtio_input_create(m, b->pcie, HV_VINPUT_MOUSE);
+    if (!getenv("HV_NO_SOUND")) b->snd = hv_virtio_snd_create(m, b->pcie);
 
     m->tick = tick;
     m->tick_opaque = b;

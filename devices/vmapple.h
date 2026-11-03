@@ -15,6 +15,7 @@
 #include "virtio_input.h"
 #include "xhci.h"
 #include "virtio_net.h"
+#include "virtio_snd.h"
 
 /* The virtual Mac: QEMU's vmapple memory map and interrupt numbers (hw/vmapple/vmapple.c). */
 #define VMAPPLE_FIRMWARE   0x00100000ull /* 1 MB: the boot ROM */
@@ -58,6 +59,7 @@ typedef struct HvVmapple {
     HvAes *aes;
     HvVirtioBlk *aux_blk, *root_blk;
     HvVirtioNet *net;
+    HvVirtioSnd *snd;
     HvVirtioInput *keyboard, *mouse;
     HvXhci *usb;             /* USB controller with the keyboard macOS actually uses */
     uint8_t *cfg, *rom, *ram;

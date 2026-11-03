@@ -29,10 +29,12 @@ static void notify(HvVirtio *v, int q) {
 int hv_virtio_net_receive(HvVirtioNet *n, const uint8_t *frame, uint32_t len) {
     HvVirtio *v = &n->vio;
     static HvVirtqElem e;
-    if (!(v->status & 4) || !v->q[RXQ].enabled || hv_virtq_pop(v, RXQ, &e) <= 0 ||
-        hv_virtq_writable(&e) < HDR_LEN + len) {
+    if (!(v->status & 4) || !v->q[RXQ].enabled || hv_virtq_pop(v, RXQ, &e) <= 0) return 0;
+    if (hv_virtq_writable(&e) < HDR_LEN + len) { /* too small for it: drop the frame, return the buffer */
+        hv_virtq_push(v, RXQ, &e, 0);
+        hv_virtio_interrupt(v);
         n->rx_dropped++;
-        return 0;
+        return 1;
     }
     uint8_t hdr[HDR_LEN] = {0};
     hdr[10] = 1; /* num_buffers */
