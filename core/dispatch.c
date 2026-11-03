@@ -269,6 +269,15 @@ static void print_stats(HvCpu *cpu, int force) {
             100.0 * (double)(s->wfi_ticks - last.wfi_ticks) / (double)(now - last_t), RATE(block_flushes), RATE(flush_smc),
             RATE(flush_ic), RATE(flush_full), m->nblocks, (double)m->jit.used * 4 / (1 << 20), (unsigned long long)s->flush_full, RATE(chained), RATE(ijc_fills) / 1e3, RATE(ijc_resets), cpu->el,
             (unsigned long long)cpu->pc);
+    {
+        double tot = 0;
+        for (int k = 0; k < 6; k++) tot += RATE(why[k]);
+        fprintf(stderr, "  cache drops/s: full %.0f, ASID %.0f, user VA %.0f, kernel VA %.0f, code %.0f\n", RATE(reset_why[0]),
+                RATE(reset_why[1]), RATE(reset_why[2]), RATE(reset_why[3]), RATE(reset_why[4]));
+        fprintf(stderr, "  entries %.2fM/s: chain fill %.0f%%, kick %.0f%%, exception/sysreg %.0f%%, interrupt %.0f%%, cached target %.0f%%, cache miss %.0f%%\n",
+                tot / 1e6, 100 * RATE(why[0]) / tot, 100 * RATE(why[1]) / tot, 100 * RATE(why[2]) / tot,
+                100 * RATE(why[3]) / tot, 100 * RATE(why[4]) / tot, 100 * RATE(why[5]) / tot);
+    }
 #undef RATE
     if (m->prof) print_profile(m);
     /* The five busiest system registers or SYS operations (reads + writes) this interval. */
@@ -342,6 +351,7 @@ static int run(HvCpu *cpu, int one) {
     uint32_t since_tick = 0;
     uint64_t last_fault = ~0ull, prev_pc = 0;
     uint64_t *pending_chain = NULL;
+    uint32_t last_reason = HV_EXIT_BRANCH;
     for (;;) {
         if (m->flush_pending) {
             m->flush_pending = 0;
@@ -355,7 +365,11 @@ static int run(HvCpu *cpu, int one) {
             since_tick = 0;
             m->tick(m, cpu);
         }
-        if (hv_check_interrupts(cpu)) pending_chain = NULL;
+        int why = pending_chain ? 0 : kicked ? 1 : last_reason != HV_EXIT_BRANCH ? 2 : 5;
+        if (hv_check_interrupts(cpu)) {
+            pending_chain = NULL;
+            why = 3;
+        }
         if (cpu->pc == m->stop_pc) return HV_EXIT_HALT;
 
         uint64_t pa;
@@ -378,6 +392,7 @@ static int run(HvCpu *cpu, int one) {
         if (m->chain && b->va != m->stop_pc && (int)((b->va >> 55) & 1) == kernel) {
             uint64_t *t = m->ijc + (size_t)(b->flags & (HV_IJC_TABLES - 1)) * (HV_IJC_TABLE_BYTES / 8);
             uint64_t *ent = t + (((b->va ^ b->va >> 16) >> 2) & ((1u << HV_IJC_BITS) - 1)) * 2;
+            if (why == 5 && ent[0] == (b->va ^ cpu->ijc_salt[kernel])) why = 4; /* it was cached: not a miss */
             ent[0] = b->va ^ cpu->ijc_salt[kernel];
             ent[1] = (uint64_t)(uintptr_t)b->code;
             uint32_t h = (uint32_t)(b->va >> HV_TLB_PAGE_BITS) & 0xffff;
@@ -390,6 +405,7 @@ static int run(HvCpu *cpu, int one) {
         if (m->trace) fprintf(stderr, "block %llx el%u\n", (unsigned long long)cpu->pc, cpu->el);
         if (m->log >= 4 && host_pointer_check(cpu, prev_pc)) return HV_EXIT_UNSUPPORTED;
         prev_pc = cpu->pc;
+        m->stats.why[why]++;
         cpu->exit_reason = HV_EXIT_BRANCH;
         cpu->last_stub = 0;
         cpu->icount++;
@@ -398,6 +414,7 @@ static int run(HvCpu *cpu, int one) {
         hv_enter(cpu, b->code);
 
         if (cpu->exit_reason == HV_EXIT_BRANCH && cpu->last_stub && m->chain) pending_chain = (uint64_t *)cpu->last_stub;
+        last_reason = cpu->exit_reason;
         switch (cpu->exit_reason) {
         case HV_EXIT_BRANCH:
         case HV_EXIT_EXCEPTION:

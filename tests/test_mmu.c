@@ -6,6 +6,7 @@
 
 #include "machine.h"
 #include "mmu.h"
+#include "sysreg.h"
 
 #define PT_PA 0x80000000ull
 #define PT_SIZE (1u << 20)
@@ -174,6 +175,34 @@ int main(void) {
     expect("64K: 512 MB block", &cpu, 0x21234abcd, HV_ACC_READ, 1, 0x7234abcd, 0);
     map(r6, 16, 42, 0x300000000, 3, 0x40060000 | BLOCK | AF, 0);
     expect("block descriptor at level 3 is invalid", &cpu, 0x300000000, HV_ACC_READ, 1, 0, HV_FSC_TRANSLATION(3));
+
+    /* TLBI RVAE1IS: 6 pages of 16 KB from the base drop, the ones after stay; also for a kernel range. */
+    {
+        static const uint64_t bases[2] = {0x100000000ull, 0xfffffe0012340000ull};
+        for (int b = 0; b < 2; b++) {
+            hv_tlb_flush(&cpu);
+            int table = (bases[b] >> 55) & 1 ? 1 : 0;
+            for (int k = 0; k < 8; k++) {
+                uint64_t va = bases[b] + ((uint64_t)k << 14);
+                HvTlbEntry *t = &cpu.tlb[table][(va >> 14) & (HV_TLB_SIZE - 1)];
+                t->read_tag = va - HV_TLB_ADJ;
+                t->addend = 0;
+            }
+            cpu.el = 1;
+            cpu.x[1] = 5ull << 48 | 2ull << 46 | 0ull << 44 | 2ull << 39 | ((bases[b] >> 14) & 0x1fffffffffull);
+            hv_sysreg_sys(&cpu, 0xd5088221u, 0); /* tlbi rvae1is, x1 */
+            for (int k = 0; k < 8; k++) {
+                uint64_t va = bases[b] + ((uint64_t)k << 14);
+                int dropped = cpu.tlb[table][(va >> 14) & (HV_TLB_SIZE - 1)].read_tag == HV_TLB_INVALID;
+                checks++;
+                if (dropped != (k < 6)) {
+                    printf("  FAIL range TLBI, base %llx page %d: %s\n", (unsigned long long)bases[b], k,
+                           dropped ? "dropped" : "kept");
+                    failures++;
+                }
+            }
+        }
+    }
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;

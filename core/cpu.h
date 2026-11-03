@@ -61,7 +61,7 @@ typedef struct HvCpu {
     uint32_t pad1;
     uint64_t last_stub;      /* 0x3c8: slot of the unchained exit just taken, or 0 */
     uint64_t ijc;            /* 0x3d0: indirect-branch cache, HV_IJC_TABLES tables of {tag, entry} */
-    uint64_t ijc_salt[2];    /* 0x3d8: tags are VA ^ salt, [0] for user (EL0) tables, [1] kernel; a new salt empties them */
+    uint64_t ijc_salt[2];    /* 0x3d8: tags are VA ^ salt, [0] for user (EL0) tables, [1] kernel (see hv_ijc_* in mmu.c) */
     uint64_t pad0[3];        /* keeps the TLB at 0x400 */
     /* 0x400: [0] EL0 and unprivileged accesses, [1] EL1, [2] EL1 with PSTATE.PAN set,
        so toggling PAN (the kernel does it around every user copy) flushes nothing. */
@@ -99,6 +99,14 @@ typedef struct HvCpu {
 #define HV_USER_FILLS 2048
     uint16_t user_fills[HV_USER_FILLS];
     uint32_t nuser_fills;
+    /* Indirect-branch cache salts live in bits 63..48, which no user VA sets and
+       every kernel VA has all ones in, so each salt value names a distinct set
+       of tags. User salts are per ASID (asid_cid[ASID], 0 = none yet), so a
+       process switch keeps every process's entries; dropping one means giving
+       its ASID a fresh id. Ids only grow until they run out, then the tables
+       are cleared. */
+    uint16_t asid_cid[65536];
+    uint32_t next_cid, kernel_gen;
 
     /* Generic timer: physical and virtual. The counter is host time scaled to 24 MHz. */
     uint64_t cntv_ctl, cntv_cval;

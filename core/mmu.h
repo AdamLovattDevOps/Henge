@@ -31,8 +31,13 @@ void hv_mmu_walk(HvCpu *cpu, uint64_t va, HvAccess acc, int el, HvWalk *out);
 void hv_tlb_flush(HvCpu *cpu);
 void hv_tlb_flush_va(HvCpu *cpu, uint64_t va);
 void hv_tlb_flush_user(HvCpu *cpu);
-/* Empty the indirect-branch cache for user (0) or kernel (1) VAs. */
+/* Empty the indirect-branch cache for all user (0) or for kernel (1) VAs. */
 void hv_ijc_reset(HvCpu *cpu, int kernel);
+/* Forget one address space's cached user targets. */
+void hv_ijc_drop_asid(HvCpu *cpu, uint16_t asid);
+/* TTBR0 changed: use the new address space's user entries. */
+void hv_ijc_switch(HvCpu *cpu);
+void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid); /* asid -1: every address space */
 void hv_tlb_protect_code(HvCpu *cpu, const uint8_t *host_page);
 
 /* Translates for a C access of `len` bytes that stays inside one 16 KB page,

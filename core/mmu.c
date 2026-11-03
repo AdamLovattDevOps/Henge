@@ -121,25 +121,74 @@ void hv_mmu_walk(HvCpu *cpu, uint64_t va, HvAccess acc, int el, HvWalk *out) {
 
 void hv_tlb_flush(HvCpu *cpu) {
     if (cpu->m) cpu->m->stats.tlb_flushes++;
+    if (cpu->m) cpu->m->stats.reset_why[0]++;
     hv_ijc_reset(cpu, 0); /* mappings changed: branch targets cached by VA are no longer trusted */
     hv_ijc_reset(cpu, 1);
     memset(cpu->tlb, 0x80, sizeof cpu->tlb);
     cpu->nuser_fills = 0;
 }
 
+/* Clear the tables of one half (user tables are the even flags values, kernel ones odd). */
+static void ijc_clear(HvCpu *cpu, int kernel) {
+    if (!cpu->m || !cpu->m->ijc) return;
+    for (int t = kernel; t < HV_IJC_TABLES; t += 2)
+        memset(cpu->m->ijc + (size_t)t * (HV_IJC_TABLE_BYTES / 8), 0, HV_IJC_TABLE_BYTES);
+}
+
+/* ASIDs live in TTBR0 unless TCR.A1 puts them in TTBR1; then every process looks alike to us. */
+static int current_asid(HvCpu *cpu) {
+    return (cpu->tcr_el1 >> 22) & 1 ? -1 : (int)(cpu->ttbr0_el1 >> 48);
+}
+
+/* A user id no tag in the tables uses yet; when they run out, empty the user tables and start over. */
+static uint16_t fresh_cid(HvCpu *cpu) {
+    if (cpu->next_cid == 0 || cpu->next_cid > 0xffff) {
+        ijc_clear(cpu, 0);
+        memset(cpu->asid_cid, 0, sizeof cpu->asid_cid);
+        cpu->next_cid = 1;
+    }
+    return (uint16_t)cpu->next_cid++;
+}
+
+void hv_ijc_switch(HvCpu *cpu) {
+    int asid = current_asid(cpu);
+    if (asid < 0) { /* no ASIDs to tell processes apart: a switch forgets the old one */
+        cpu->ijc_salt[0] = (uint64_t)fresh_cid(cpu) << 48;
+        return;
+    }
+    if (!cpu->asid_cid[asid]) cpu->asid_cid[asid] = fresh_cid(cpu);
+    cpu->ijc_salt[0] = (uint64_t)cpu->asid_cid[asid] << 48;
+}
+
+void hv_ijc_drop_asid(HvCpu *cpu, uint16_t asid) {
+    if (cpu->m) cpu->m->stats.ijc_resets++;
+    cpu->asid_cid[asid] = 0;
+    int cur = current_asid(cpu);
+    if (cur == asid || cur < 0) hv_ijc_switch(cpu); /* without ASIDs, any drop may be about the current process */
+}
+
 void hv_ijc_reset(HvCpu *cpu, int kernel) {
-    cpu->ijc_salt[kernel]++;
     if (cpu->m) {
         cpu->m->stats.ijc_resets++;
         memset(cpu->m->ijc_pages[kernel], 0, sizeof cpu->m->ijc_pages[kernel]);
     }
+    if (kernel) {
+        /* Kernel VAs have 0xffff in bits 63..48, so the salt must not make that 0 (the empty tag). */
+        if (++cpu->kernel_gen >= 0xffff) {
+            ijc_clear(cpu, 1);
+            cpu->kernel_gen = 1;
+        }
+        cpu->ijc_salt[1] = (uint64_t)cpu->kernel_gen << 48;
+        return;
+    }
+    memset(cpu->asid_cid, 0, sizeof cpu->asid_cid);
+    hv_ijc_switch(cpu);
 }
 
 /* TTBR0 changed or an ASID was dropped: only user-half (TTBR0) translations go;
    the kernel's TTBR1 entries stay. */
 void hv_tlb_flush_user(HvCpu *cpu) {
     if (cpu->m) cpu->m->stats.tlb_flushes++;
-    hv_ijc_reset(cpu, 0); /* user VAs now name another process's code; the kernel's entries stay */
     uint32_t n = cpu->nuser_fills;
     cpu->nuser_fills = 0;
     if (n <= HV_USER_FILLS) {
@@ -169,17 +218,25 @@ void hv_tlb_protect_code(HvCpu *cpu, const uint8_t *host_page) {
         }
 }
 
-void hv_tlb_flush_va(HvCpu *cpu, uint64_t va) {
+void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid) {
     /* Tagged addresses may sit in any slot's tag byte, so check by the low 56 bits. */
     uint32_t idx = (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1);
     /* The page may hold cached branch targets even if its TLB entry is gone. */
     int kernel = (va >> 55) & 1;
     uint32_t h = (uint32_t)(va >> HV_TLB_PAGE_BITS) & 0xffff;
-    if (cpu->m && (cpu->m->ijc_pages[kernel][h >> 6] >> (h & 63) & 1)) hv_ijc_reset(cpu, kernel);
+    if (cpu->m && (cpu->m->ijc_pages[kernel][h >> 6] >> (h & 63) & 1)) {
+        cpu->m->stats.reset_why[kernel ? 3 : 2]++;
+        if (kernel || asid < 0) hv_ijc_reset(cpu, kernel);
+        else hv_ijc_drop_asid(cpu, (uint16_t)asid);
+    }
     for (int el = 0; el < 3; el++) {
         HvTlbEntry *e = &cpu->tlb[el][idx];
         memset(e, 0x80, sizeof *e);
     }
+}
+
+void hv_tlb_flush_va(HvCpu *cpu, uint64_t va) {
+    hv_tlb_flush_va_asid(cpu, va, -1);
 }
 
 static void tlb_fill(HvCpu *cpu, uint64_t va, int el, const HvWalk *w) {

@@ -184,18 +184,38 @@ static int write_reg(HvCpu *cpu, uint32_t reg, uint64_t v) {
         return 0;
     case R(3, 0, 4, 0, 0): cpu->spsr_el1 = v; return 0;
     case R(3, 0, 4, 0, 1): cpu->elr_el1 = v; return 0;
-    case R(3, 0, 1, 0, 0): cpu->sctlr_el1 = v; hv_tlb_flush(cpu); return 0;
+    case R(3, 0, 1, 0, 0): { /* SCTLR: xnu flips the PAC enables (EnIA/IB/DA/DB) on every process switch */
+        uint64_t changed = cpu->sctlr_el1 ^ v;
+        cpu->sctlr_el1 = v;
+        if (changed & (1u | 1u << 19 | 1u << 24 | 1u << 25)) hv_tlb_flush(cpu); /* M, WXN, E0E, EE: what translations depend on */
+        return 0;
+    }
     case R(3, 0, 1, 0, 1): cpu->actlr_el1 = v; return 0;
     case R(3, 0, 1, 0, 2): cpu->cpacr_el1 = v; return 0;
-    case R(3, 0, 2, 0, 0): cpu->ttbr0_el1 = v; hv_tlb_flush_user(cpu); return 0; /* a process switch */
-    case R(3, 0, 2, 0, 1): cpu->ttbr1_el1 = v; hv_tlb_flush(cpu); return 0;
-    case R(3, 0, 2, 0, 2): cpu->tcr_el1 = v; hv_tlb_flush(cpu); return 0;
+    case R(3, 0, 2, 0, 0): cpu->ttbr0_el1 = v; hv_tlb_flush_user(cpu); hv_ijc_switch(cpu); return 0; /* a process switch */
+    case R(3, 0, 2, 0, 1): { /* TTBR1: rewritten unchanged on context switches; its ASID field only counts with TCR.A1 */
+        uint64_t changed = (cpu->ttbr1_el1 ^ v) & ((cpu->tcr_el1 >> 22) & 1 ? ~0ull : 0x0000ffffffffffffull);
+        cpu->ttbr1_el1 = v;
+        if (changed) hv_tlb_flush(cpu);
+        return 0;
+    }
+    case R(3, 0, 2, 0, 2):
+        if (cpu->tcr_el1 != v) {
+            cpu->tcr_el1 = v;
+            hv_tlb_flush(cpu);
+        }
+        return 0;
     case R(3, 0, 5, 1, 0): cpu->afsr0_el1 = v; return 0;
     case R(3, 0, 5, 1, 1): cpu->afsr1_el1 = v; return 0;
     case R(3, 0, 5, 2, 0): cpu->esr_el1 = v; return 0;
     case R(3, 0, 6, 0, 0): cpu->far_el1 = v; return 0;
     case R(3, 0, 7, 4, 0): cpu->par_el1 = v; return 0;
-    case R(3, 0, 10, 2, 0): cpu->mair_el1 = v; hv_tlb_flush(cpu); return 0;
+    case R(3, 0, 10, 2, 0):
+        if (cpu->mair_el1 != v) {
+            cpu->mair_el1 = v;
+            hv_tlb_flush(cpu);
+        }
+        return 0;
     case R(3, 0, 10, 3, 0): cpu->amair_el1 = v; return 0;
     case R(3, 0, 12, 0, 0): cpu->vbar_el1 = v & ~0x7ffull; return 0;
     case R(3, 0, 13, 0, 1): cpu->contextidr_el1 = v; return 0;
@@ -321,12 +341,44 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
            Xt[43:0] is VA[55:12]. Everything else (all, by ASID, ranges) drops it all. */
         int by_va = crn == 8 && op1 == 0 && (crm == 1 || crm == 3 || crm == 7) && (op2 & 1);
         int by_asid = crn == 8 && op1 == 0 && (crm == 1 || crm == 3 || crm == 7) && op2 == 2; /* ASIDE1: non-global (user) entries */
+        /* RVAE1, RVAAE1, RVALE1, RVAALE1 (IS/OS/local): xnu uses these for every
+           multi-page unmap. Xt: ASID[63:48], TG[47:46], SCALE[45:44], NUM[43:39],
+           BaseADDR[36:0] in granule units; (NUM+1) << (5*SCALE+1) granules. */
+        int by_range = crn == 8 && op1 == 0 && (crm == 2 || crm == 5 || crm == 6) && (op2 & 1);
+        if (by_range) {
+            uint32_t tg = (xt >> 46) & 3;
+            int shift = tg == 1 ? 12 : tg == 2 ? 14 : tg == 3 ? 16 : 0;
+            uint64_t pages = (((xt >> 39) & 31) + 1) << (5 * ((xt >> 44) & 3) + 1);
+            int all_asids = op2 == 3 || op2 == 7;
+            /* BaseADDR is VA[36+shift:shift], sign-extended so TTBR1 ranges come out as kernel VAs. */
+            uint64_t va = shift ? (uint64_t)((int64_t)((xt & 0x1fffffffffull) << (64 - 37)) >> (64 - 37 - shift)) : 0;
+            uint64_t len = shift ? pages << shift : 0;
+            if (!shift || len > (256ull << HV_TLB_PAGE_BITS)) {
+                /* Reserved granule or a big range: drop that half. */
+                if ((va >> 55) & 1 || !shift) hv_tlb_flush(cpu);
+                else {
+                    hv_tlb_flush_user(cpu);
+                    if (all_asids) hv_ijc_reset(cpu, 0);
+                    else hv_ijc_drop_asid(cpu, (uint16_t)(xt >> 48));
+                }
+            } else {
+                uint64_t first = va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
+                for (uint64_t p = first; p < va + len; p += 1ull << HV_TLB_PAGE_BITS)
+                    hv_tlb_flush_va_asid(cpu, p, all_asids ? -1 : (int)(xt >> 48));
+            }
+            return 0;
+        }
         if (by_va) {
             uint64_t va = (uint64_t)((int64_t)((xt & 0xfffffffffffull) << 20) >> 8);
-            hv_tlb_flush_va(cpu, va);
+            int all_asids = op2 == 3 || op2 == 7; /* VAAE1, VAALE1 */
+            hv_tlb_flush_va_asid(cpu, va, all_asids ? -1 : (int)(xt >> 48));
         } else if (by_asid) {
             hv_tlb_flush_user(cpu);
+            cpu->m->stats.reset_why[1]++;
+            hv_ijc_drop_asid(cpu, (uint16_t)(xt >> 48));
         } else {
+            if (cpu->m->log >= 2)
+                fprintf(stderr, "tlbi-all S1_%u_C%u_C%u_%u pc %llx\n", op1, crn, crm, op2, (unsigned long long)pc);
             hv_tlb_flush(cpu);
         }
         return 0;

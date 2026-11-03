@@ -84,6 +84,7 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
     m->stats.flush_smc++;
     /* Make a running chain leave (chains stay patched: see chain() in dispatch.c). */
     if (m->cpu) {
+        m->stats.reset_why[4]++;
         hv_ijc_reset(m->cpu, 0); /* the indirect-branch cache may point at stale blocks too */
         hv_ijc_reset(m->cpu, 1);
         __atomic_store_n(&m->cpu->exit_req, 1, __ATOMIC_RELAXED);
@@ -155,7 +156,10 @@ void hv_cpu_reset(HvCpu *cpu, HvMachine *m) {
     cpu->m = m;
     m->cpu = cpu;
     cpu->ijc = (uint64_t)(uintptr_t)m->ijc;
-    cpu->ijc_salt[0] = cpu->ijc_salt[1] = 1; /* tags of an all-zero table never match */
+    cpu->next_cid = 1;
+    cpu->kernel_gen = 1;
+    cpu->ijc_salt[1] = 1ull << 48; /* tags of an all-zero table never match */
+    hv_ijc_switch(cpu);
     cpu->exit_routine = (uint64_t)hv_exit;
     cpu->helper_routine = (uint64_t)hv_helper_entry;
     cpu->el = 1;
