@@ -1,6 +1,7 @@
 /* hengevm: boots the virtual Mac on the macOS host.
    hengevm --rom AVPBooter.vmapple2.bin --disk disk.img --aux auxiliary.bin --ecid N [--seed N] [--ram MB] [--log N] */
 #include <CoreFoundation/CoreFoundation.h>
+#include <mach/mach.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -44,11 +45,26 @@ static uint64_t translate_va;
 
 /* Chained blocks run without returning to the dispatcher; this makes them leave
    every millisecond so timers, devices and interrupts are serviced. */
+static mach_port_t cpu_port;
+
+/* --profile: where the CPU thread is right now. */
+static void sample_cpu(void) {
+    arm_thread_state64_t st;
+    mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
+    if (thread_suspend(cpu_port) != KERN_SUCCESS) return;
+    kern_return_t kr = thread_get_state(cpu_port, ARM_THREAD_STATE64, (thread_state_t)&st, &n);
+    thread_resume(cpu_port);
+    if (kr != KERN_SUCCESS) return;
+    m.prof[m.prof_head & (HV_PROF_RING - 1)] = (uint64_t)arm_thread_state64_get_pc(st);
+    __atomic_store_n(&m.prof_head, m.prof_head + 1, __ATOMIC_RELEASE);
+}
+
 static void *kicker_thread(void *unused) {
     (void)unused;
     for (;;) {
         usleep(1000);
         __atomic_store_n(&cpu.exit_req, 1, __ATOMIC_RELAXED);
+        if (m.prof && cpu_port) sample_cpu();
     }
     return NULL;
 }
@@ -56,6 +72,7 @@ static void *kicker_thread(void *unused) {
 static void *cpu_thread(void *unused) {
     (void)unused;
     RunArgs *a = &run_args;
+    cpu_port = mach_thread_self();
     /* --break PC: stop the brk_hits-th time execution reaches PC. */
     m.stop_pc = a->brk;
     int r;
@@ -113,7 +130,7 @@ static void *cpu_thread(void *unused) {
 }
 
 static void usage(void) {
-    fprintf(stderr, "usage: hengevm --rom FILE --disk FILE --aux FILE --ecid N [--seed N] [--ram MB] [--log N] [--trace 1] [--screenshot PNG] [--watch VA] [--stats SECONDS] [--no-pvg] [--no-chain] [--break PC [--break-hits N]] [--dump PA LEN FILE] [--aux-offset BYTES]\n");
+    fprintf(stderr, "usage: hengevm --rom FILE --disk FILE --aux FILE --ecid N [--seed N] [--ram MB] [--log N] [--trace 1] [--screenshot PNG] [--watch VA] [--stats SECONDS [--profile 1]] [--no-pvg] [--no-chain] [--break PC [--break-hits N]] [--dump PA LEN FILE] [--aux-offset BYTES]\n");
     exit(2);
 }
 
@@ -123,7 +140,7 @@ int main(int argc, char **argv) {
     int log = 1, trace = 0, use_pvg = 1, no_chain = 0;
     const char *screenshot = NULL;
     uint64_t watch = 0, watch_pa = 0;
-    int stats = 0;
+    int stats = 0, profile = 0;
     uint64_t brk = ~0ull, brk_hits = 1, dump_pa = 0, dump_len = 0;
     const char *dump_path = NULL;
     for (int i = 1; i < argc; i++) {
@@ -147,6 +164,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--screenshot")) screenshot = argv[++i];
         else if (!strcmp(argv[i], "--watch")) watch = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--stats")) stats = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--profile")) profile = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--watch-pa")) watch_pa = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--translate")) translate_va = strtoull(argv[++i], NULL, 0);
 
@@ -168,7 +186,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "hengevm: cannot open the disks\n");
         return 1;
     }
-    if (hv_machine_init(&m, 256u << 20) != 0) {
+    if (hv_machine_init(&m, 768u << 20) != 0) {
         fprintf(stderr, "hengevm: cannot map the JIT region\n");
         return 1;
     }
@@ -177,6 +195,7 @@ int main(int argc, char **argv) {
     m.watch_va = watch;
     m.watch_pa = watch_pa;
     m.stats_interval = stats; /* set after hv_machine_init, which clears the machine */
+    if (profile) m.prof = calloc(HV_PROF_RING, sizeof *m.prof);
     m.chain = !no_chain && brk == ~0ull; /* breakpoints need every block to come back */
     HvCfgParams cfg = {.nr_cpus = 1, .ecid = ecid, .seed = seed, .mac_en0 = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01}};
     static const uint8_t mac[6] = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01};

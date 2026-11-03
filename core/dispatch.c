@@ -2,6 +2,8 @@
 
 #include <mach/mach_time.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <dlfcn.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -18,10 +20,9 @@ void hv_flush_blocks(HvMachine *m) {
         hv_ijc_reset(m->cpu, 1);
     }
     memset(m->jc, 0, sizeof m->jc);
-    m->nchains = 0; /* the patched code goes away with the blocks */
-    m->unchain_pending = 0;
     memset(m->hash, 0, sizeof m->hash);
     m->nblocks = 0;
+    m->nslots = 0;
     hv_jit_reset(&m->jit);
 }
 
@@ -41,7 +42,7 @@ static uint32_t hash_of(uint64_t va, uint64_t pa, uint32_t flags) {
 
 static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, const uint32_t *code, uint32_t avail) {
     HvMachine *m = cpu->m;
-    uint32_t j = (uint32_t)((va >> 2) ^ ((uint64_t)flags << 11)) & ((1u << 14) - 1);
+    uint32_t j = (uint32_t)((va >> 2) ^ (va >> 18) ^ ((uint64_t)flags << 13)) & ((1u << HV_JC_BITS) - 1);
     HvBlock *c = m->jc[j];
     if (c && c->va == va && c->pa == pa && c->flags == flags && c->ram->page_gen[c->pg] == c->gen) return c;
     uint32_t h = hash_of(va, pa, flags);
@@ -59,7 +60,24 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
         HvBlock *b = &m->blocks[m->nblocks];
         *b = (HvBlock){.va = va, .pa = pa, .flags = flags, .gen = gen, .ram = ram, .pg = pg};
         m->stats.translations++;
-        if (hv_translate_block(m, b, code, avail) != 0) {
+        if (m->stats_interval) { /* diagnostics: was this code translated before? (hashed bitmaps, so approximate) */
+            static uint64_t seen_va[1 << 18], seen_vapa[1 << 18];
+            uint32_t hv = (uint32_t)(((va >> 2) ^ flags) * 0x9e3779b97f4a7c15ull >> 40);
+            uint32_t hp = (uint32_t)((((va >> 2) ^ flags) * 0x9e3779b97f4a7c15ull ^ pa * 0xc2b2ae3d27d4eb4full) >> 40);
+            if (seen_va[hv >> 6] >> (hv & 63) & 1) m->stats.retrans_va++;
+            if (seen_vapa[hp >> 6] >> (hp & 63) & 1) m->stats.retrans_vapa++;
+            seen_va[hv >> 6] |= 1ull << (hv & 63);
+            seen_vapa[hp >> 6] |= 1ull << (hp & 63);
+        }
+        uint64_t t0 = m->stats_interval ? mach_absolute_time() : 0;
+        size_t used0 = m->jit.used;
+        int tr = hv_translate_block(m, b, code, avail);
+        if (m->stats_interval) {
+            m->stats.translate_ticks += mach_absolute_time() - t0;
+            m->stats.translated_insns += b->ninsns;
+            m->stats.translated_words += m->jit.used - used0;
+        }
+        if (tr != 0) {
             m->stats.flush_full++;
             hv_flush_blocks(m); /* JIT region full: start over */
             h = hash_of(va, pa, flags);
@@ -136,6 +154,88 @@ static int wait_for_interrupt(HvCpu *cpu) {
     return 0;
 }
 
+/* --profile: which guest blocks the sampled host PCs were in. Blocks are laid
+   out in the JIT region in the order they were made, so a binary search over
+   m->blocks finds the one holding a PC. */
+static void print_profile(HvMachine *m) {
+    enum { SLOTS = 4096 };
+    static struct { uint64_t va; uint32_t flags, n, ninsns; } top[SLOTS];
+    memset(top, 0, sizeof top);
+    uint32_t total = 0, outside = 0;
+    static struct { const char *name; uint32_t n; } fn[64];
+    static struct { uint32_t off, n; } run_off[256];
+    int nfn = 0, nrun = 0;
+    uint32_t head = __atomic_load_n(&m->prof_head, __ATOMIC_ACQUIRE);
+    if (head - m->prof_tail > HV_PROF_RING) m->prof_tail = head - HV_PROF_RING;
+    for (; m->prof_tail != head; m->prof_tail++) {
+        uint32_t *pc = (uint32_t *)(uintptr_t)m->prof[m->prof_tail & (HV_PROF_RING - 1)];
+        total++;
+        if (pc < m->jit.base || pc >= m->jit.base + m->jit.used || !m->nblocks) {
+            outside++;
+            Dl_info di;
+            const char *name = dladdr(pc, &di) && di.dli_sname ? di.dli_sname : "?";
+            static const char *detail;
+            if (!detail) detail = getenv("HV_PROF_FN") ? getenv("HV_PROF_FN") : "run";
+            if (!strcmp(name, detail)) { /* per-offset detail for one function (HV_PROF_FN, default the dispatcher loop) */
+                uint32_t off = (uint32_t)((uint8_t *)pc - (uint8_t *)di.dli_saddr);
+                int r = 0;
+                while (r < nrun && run_off[r].off != off) r++;
+                if (r == nrun && nrun < 256) { run_off[nrun].off = off; run_off[nrun++].n = 0; }
+                if (r < nrun) run_off[r].n++;
+            }
+            int k = 0;
+            while (k < nfn && strcmp(fn[k].name, name)) k++;
+            if (k == nfn && nfn < 64) { fn[nfn].name = name; fn[nfn++].n = 0; }
+            if (k < nfn) fn[k].n++;
+            continue;
+        }
+        int lo = 0, hi = m->nblocks - 1;
+        while (lo < hi) {
+            int mid = (lo + hi + 1) / 2;
+            if (m->blocks[mid].code <= pc) lo = mid;
+            else hi = mid - 1;
+        }
+        HvBlock *b = &m->blocks[lo];
+        uint32_t h = (uint32_t)((b->va >> 2) ^ b->flags) & (SLOTS - 1);
+        int probes = 0;
+        while (top[h].n && (top[h].va != b->va || top[h].flags != b->flags) && ++probes < 64) h = (h + 1) & (SLOTS - 1);
+        if (probes == 64) continue; /* table full: the block is too cold to make the list anyway */
+        top[h].va = b->va;
+        top[h].flags = b->flags;
+        top[h].ninsns = b->ninsns;
+        top[h].n++;
+    }
+    if (!total) return;
+    fprintf(stderr, "  profile: %u samples, %.0f%% outside translated code:", total, 100.0 * outside / total);
+    for (int k = 0; k < 10; k++) {
+        int best = -1;
+        for (int i = 0; i < nfn; i++)
+            if (fn[i].n && (best < 0 || fn[i].n > fn[best].n)) best = i;
+        if (best < 0) break;
+        fprintf(stderr, " %s %.1f%%", fn[best].name, 100.0 * fn[best].n / total);
+        fn[best].n = 0;
+    }
+    fprintf(stderr, "\n  %s+:", getenv("HV_PROF_FN") ? getenv("HV_PROF_FN") : "run");
+    for (int k = 0; k < 12; k++) {
+        int best = -1;
+        for (int i = 0; i < nrun; i++)
+            if (run_off[i].n && (best < 0 || run_off[i].n > run_off[best].n)) best = i;
+        if (best < 0) break;
+        fprintf(stderr, " %#x:%.1f%%", run_off[best].off, 100.0 * run_off[best].n / total);
+        run_off[best].n = 0;
+    }
+    fprintf(stderr, "\n");
+    for (int k = 0; k < 12; k++) {
+        int best = -1;
+        for (int i = 0; i < SLOTS; i++)
+            if (top[i].n && (best < 0 || top[i].n > top[best].n)) best = i;
+        if (best < 0 || top[best].n * 200 < total) break;
+        fprintf(stderr, "    %5.1f%%  %llx el%u (%u insns)\n", 100.0 * top[best].n / total,
+                (unsigned long long)top[best].va, top[best].flags & HV_BLOCK_EL1, top[best].ninsns);
+        top[best].n = 0;
+    }
+}
+
 static void print_stats(HvCpu *cpu, int force) {
     static uint64_t last_t, start_t;
     /* This uses floating point, and the host FP registers hold the guest's state. */
@@ -154,15 +254,16 @@ static void print_stats(HvCpu *cpu, int force) {
     HvStats *s = &m->stats;
 #define RATE(f) ((double)(s->f - last.f) / dt)
     fprintf(stderr,
-            "stats %5.0fs: blocks %.2fM/s, translated %.0f/s, slow mem %.0fK/s, mrs %.0fK/s msr %.0fK/s sys %.0fK/s, "
-            "exc %.0f/s irq %.0f/s, tlb flush %.0f/s, fetch walks %.0fK/s, wfi %.0f/s (%.0f%% idle), flushes %.0f/s (smc %.0f ic %.0f full %.0f), chained %.0f/s unchains %.0f/s ijc fills %.0fK/s resets %.0f/s, el%u pc %llx\n",
-            (double)(now - start_t) / 24e6, RATE(blocks) / 1e6, RATE(translations), RATE(helper[HV_OP_MEM]) / 1e3,
+            "stats %5.0fs: blocks %.2fM/s, translated %.0f/s (again: va %.0f%% va+pa %.0f%%; %.0f%% of time, %.1f insns, %.1fx), slow mem %.0fK/s, mrs %.0fK/s msr %.0fK/s sys %.0fK/s, "
+            "exc %.0f/s irq %.0f/s, tlb flush %.0f/s, fetch walks %.0fK/s, wfi %.0f/s (%.0f%% idle), flushes %.0f/s (smc %.0f ic %.0f full %.0f), blocks held %d (%.0f MB, %llu full flushes), chained %.0f/s ijc fills %.0fK/s resets %.0f/s, el%u pc %llx\n",
+            (double)(now - start_t) / 24e6, RATE(blocks) / 1e6, RATE(translations), 100.0 * RATE(retrans_va) / (RATE(translations) + 1e-9), 100.0 * RATE(retrans_vapa) / (RATE(translations) + 1e-9), 100.0 * (double)(s->translate_ticks - last.translate_ticks) / (double)(now - last_t), RATE(translated_insns) / (RATE(translations) + 1e-9), RATE(translated_words) / (RATE(translated_insns) + 1e-9), RATE(helper[HV_OP_MEM]) / 1e3,
             RATE(helper[HV_OP_MRS]) / 1e3, RATE(helper[HV_OP_MSR]) / 1e3, RATE(helper[HV_OP_SYS]) / 1e3,
             RATE(exceptions), RATE(interrupts), RATE(tlb_flushes), RATE(fetch_walks) / 1e3, RATE(wfi),
             100.0 * (double)(s->wfi_ticks - last.wfi_ticks) / (double)(now - last_t), RATE(block_flushes), RATE(flush_smc),
-            RATE(flush_ic), RATE(flush_full), RATE(chained), RATE(unchains), RATE(ijc_fills) / 1e3, RATE(ijc_resets), cpu->el,
+            RATE(flush_ic), RATE(flush_full), m->nblocks, (double)m->jit.used * 4 / (1 << 20), (unsigned long long)s->flush_full, RATE(chained), RATE(ijc_fills) / 1e3, RATE(ijc_resets), cpu->el,
             (unsigned long long)cpu->pc);
 #undef RATE
+    if (m->prof) print_profile(m);
     /* The five busiest system registers or SYS operations (reads + writes) this interval. */
     for (int k = 0; k < 5; k++) {
         uint32_t best = 0, bi = 0;
@@ -181,28 +282,13 @@ static void print_stats(HvCpu *cpu, int force) {
     hv_fp_enter(cpu);
 }
 
-/* Undo every chain: the patch slots go back to "fall through to the exit". */
-static void unchain_all(HvMachine *m) {
-    if (!m->nchains) return;
-    hv_jit_begin_write();
-    for (uint32_t i = 0; i < m->nchains; i++) *m->chains[i] = 0x14000001; /* b +1 */
-    for (uint32_t i = 0; i < m->nchains; i++) hv_jit_end_write(m->chains[i], 1);
-    m->nchains = 0;
-    m->stats.unchains++;
-    if (m->cpu) {
-        hv_ijc_reset(m->cpu, 0);
-        hv_ijc_reset(m->cpu, 1);
-    }
-}
-
-/* Patch the exit slot a block just left through so it jumps straight to b. */
-static void chain(HvMachine *m, uint32_t *slot, HvBlock *b) {
-    int64_t off = (int64_t)(b->code + 1 - slot); /* the entry that expects x1 still live */
-    if (off < -(1 << 25) || off >= (1 << 25) || m->nchains == HV_MAX_CHAINS) return;
-    hv_jit_begin_write();
-    *slot = 0x14000000u | (uint32_t)(off & 0x3ffffff);
-    hv_jit_end_write(slot, 1);
-    m->chains[m->nchains++] = slot;
+/* Fill the slot of the chainable exit a block just left through, so it jumps
+   straight to b next time. Chains never need undoing: both blocks are in the
+   same 16 KB page, so when that page's code is invalidated the stale blocks are
+   only reachable from each other, and the exit_req check before every chained
+   jump gets a block that just wrote its own page back to the dispatcher. */
+static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
+    *slot = (uint64_t)(uintptr_t)b->code;
     m->stats.chained++;
 }
 
@@ -247,16 +333,11 @@ static int run(HvCpu *cpu, int one) {
     HvMachine *m = cpu->m;
     uint32_t since_tick = 0;
     uint64_t last_fault = ~0ull, prev_pc = 0;
-    uint32_t *pending_chain = NULL;
+    uint64_t *pending_chain = NULL;
     for (;;) {
         if (m->flush_pending) {
             m->flush_pending = 0;
             hv_flush_blocks(m);
-            pending_chain = NULL;
-        }
-        if (m->unchain_pending) {
-            m->unchain_pending = 0;
-            unchain_all(m);
             pending_chain = NULL;
         }
         if (cpu->halted) return HV_EXIT_HALT;
@@ -288,7 +369,7 @@ static int run(HvCpu *cpu, int one) {
         int kernel = b->flags & HV_BLOCK_EL1;
         if (m->chain && b->va != m->stop_pc && (int)((b->va >> 55) & 1) == kernel) {
             uint64_t *t = m->ijc + (size_t)(b->flags & (HV_IJC_TABLES - 1)) * (HV_IJC_TABLE_BYTES / 8);
-            uint64_t *ent = t + ((b->va >> 2) & ((1u << HV_IJC_BITS) - 1)) * 2;
+            uint64_t *ent = t + (((b->va ^ b->va >> 16) >> 2) & ((1u << HV_IJC_BITS) - 1)) * 2;
             ent[0] = b->va ^ cpu->ijc_salt[kernel];
             ent[1] = (uint64_t)(uintptr_t)b->code;
             uint32_t h = (uint32_t)(b->va >> HV_TLB_PAGE_BITS) & 0xffff;
@@ -308,7 +389,7 @@ static int run(HvCpu *cpu, int one) {
         if (m->stats_interval && (m->stats.blocks & 0xffff) == 0) print_stats(cpu, 0);
         hv_enter(cpu, b->code + 1);
 
-        if (cpu->exit_reason == HV_EXIT_BRANCH && cpu->last_stub && m->chain) pending_chain = (uint32_t *)cpu->last_stub;
+        if (cpu->exit_reason == HV_EXIT_BRANCH && cpu->last_stub && m->chain) pending_chain = (uint64_t *)cpu->last_stub;
         switch (cpu->exit_reason) {
         case HV_EXIT_BRANCH:
         case HV_EXIT_EXCEPTION:

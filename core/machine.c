@@ -16,9 +16,9 @@ int hv_machine_init(HvMachine *m, size_t jit_bytes) {
     if (!m->blocks) return -1;
     m->stop_pc = ~0ull;
     m->chain = 1;
-    m->chains = calloc(HV_MAX_CHAINS, sizeof *m->chains);
     m->ijc = calloc(HV_IJC_TABLES * HV_IJC_TABLE_BYTES / 8, 8);
-    return m->chains && m->ijc ? 0 : -1;
+    m->slots = calloc(HV_MAX_SLOTS, sizeof *m->slots);
+    return m->ijc && m->slots ? 0 : -1;
 }
 
 void hv_machine_free(HvMachine *m) {
@@ -28,8 +28,8 @@ void hv_machine_free(HvMachine *m) {
         free(m->ram[i].page_gen);
     }
     free(m->blocks);
-    free(m->chains);
     free(m->ijc);
+    free(m->slots);
 }
 
 int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int readonly) {
@@ -72,8 +72,7 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
     r->code_pages[pg] = 0;
     r->page_gen[pg]++;
     m->stats.flush_smc++;
-    /* Chains may lead into the stale blocks: undo them, and make a running chain leave. */
-    m->unchain_pending = 1;
+    /* Make a running chain leave (chains stay patched: see chain() in dispatch.c). */
     if (m->cpu) {
         hv_ijc_reset(m->cpu, 0); /* the indirect-branch cache may point at stale blocks too */
         hv_ijc_reset(m->cpu, 1);

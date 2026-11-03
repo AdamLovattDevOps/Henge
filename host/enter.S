@@ -26,14 +26,14 @@
     .globl _hv_fp_enter
     .globl _hv_fp_leave
 
+// Not x6, x7, x15: guest x6, x7 and x15 live in the HvCpu, the host registers are scratch.
 .macro SAVE_X2_X29
     stp x2, x3, [x28, #16]
     stp x4, x5, [x28, #32]
-    stp x6, x7, [x28, #48]
     stp x8, x9, [x28, #64]
     stp x10, x11, [x28, #80]
     stp x12, x13, [x28, #96]
-    stp x14, x15, [x28, #112]
+    str x14, [x28, #112]
     stp x16, x17, [x28, #128]
     stp x19, x20, [x28, #152]
     stp x21, x22, [x28, #168]

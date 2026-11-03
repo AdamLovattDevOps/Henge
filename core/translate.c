@@ -46,6 +46,7 @@ typedef struct {
     int slow_mem;
     uint64_t page;       /* guest VA of the 16 KB page the block is in */
     int no_ijc;          /* indirect branches always go to the dispatcher (breakpoints, tests' stop PC) */
+    HvMachine *m;
 } Emit;
 
 static Emit E; /* translation runs on the dispatcher thread only */
@@ -118,7 +119,8 @@ static void put_ijc_jump(Emit *e) {
     uint32_t table = (e->flags & (HV_IJC_TABLES - 1)) * HV_IJC_TABLE_BYTES;
     if (table) put(e, 0x91400000u | (table >> 12) << 10 | 1 << 5 | 1); /* add x1, x1, #table */
     put(e, STR_X(2, 28, HV_CPU_SPILL(0)));
-    put(e, UBFM_X(2, 0, 2, 2 + HV_IJC_BITS - 1));           /* ubfx x2, x0, #2, #bits */
+    put(e, 0xca400000u | 0 << 16 | 16 << 10 | 0 << 5 | 2);   /* eor x2, x0, x0, lsr #16 */
+    put(e, UBFM_X(2, 2, 2, 2 + HV_IJC_BITS - 1));           /* ubfx x2, x2, #2, #bits */
     put(e, ADD_LSL(1, 1, 2, 4));
     put(e, LDP_X(2, 1, 1, 0));                              /* x2 = tag, x1 = entry */
     put(e, LDR_X(0, 28, HV_CPU_IJC_SALT + 8 * (e->flags & HV_BLOCK_EL1)));
@@ -146,12 +148,14 @@ static void put_exit(Emit *e, uint64_t target) {
 }
 
 /* A direct branch to target. Within the block's own 16 KB page the exit is
-   chainable: the dispatcher may patch the slot to jump straight into the
-   target block (whose first instruction reloads x0), as long as nobody has
-   asked the CPU to leave. A same-page target always has the same physical
-   mapping as this block, so the chain stays correct across page-table changes. */
+   chainable: it jumps to the block whose entry the dispatcher stored in this
+   exit's slot (plain data, so chaining never rewrites code), as long as nobody
+   has asked the CPU to leave. An empty slot leaves with its address in
+   last_stub so the dispatcher can fill it. A same-page target always has the
+   same physical mapping as this block, so the chain stays correct across
+   page-table changes. Other pages go through the indirect-branch cache. */
 static void put_branch_exit(Emit *e, uint64_t target) {
-    if ((target & ~((1ull << HV_TLB_PAGE_BITS) - 1)) != e->page) {
+    if ((target & ~((1ull << HV_TLB_PAGE_BITS) - 1)) != e->page || e->m->nslots == HV_MAX_SLOTS) {
         /* Another page may be remapped under us, so look it up by VA instead of chaining. */
         put(e, STP_X(0, 1, 28, 0));
         put_lit(e, 0, target);
@@ -159,12 +163,18 @@ static void put_branch_exit(Emit *e, uint64_t target) {
         put_ijc_jump(e);
         return;
     }
+    uint64_t *slot = &e->m->slots[e->m->nslots++];
+    *slot = 0;
     put(e, STP_X(0, 1, 28, 0));
     put(e, 0xb9400000u | (HV_CPU_EXIT_REQ / 4) << 10 | 28 << 5 | 0); /* ldr w0, [x28, #exit_req] */
-    put(e, 0x35000000u | 2u << 5 | 0);                                /* cbnz w0, +2: leave */
-    put(e, B_OP | 1);                                                 /* patch slot: b +1 until chained */
-    put(e, 0x10ffffe0u);                                              /* adr x0, slot (pc - 4) */
+    uint32_t to_exit = e->n;
+    put(e, 0x35000000u | 0);                                          /* cbnz w0, exit (patched below) */
+    put_lit(e, 0, (uint64_t)(uintptr_t)slot);
+    put(e, LDR_X(1, 0, 0));
+    put(e, 0xb4000000u | 2u << 5 | 1);                                /* cbz x1, +2: not chained yet */
+    put(e, BR_X(1));                                                  /* the target's first entry reloads x1, x0 */
     put(e, STR_X(0, 28, HV_CPU_LAST_STUB));
+    patch_branch(&e->w[to_exit], (int64_t)e->n - to_exit);
     put_lit(e, 0, target);
     put(e, STR_X(0, 28, HV_CPU_PC));
     put(e, LDR_X(1, 28, HV_CPU_EXIT));
@@ -200,8 +210,15 @@ static void put_add_imm(Emit *e, int d, int n, int64_t imm) {
 /* ---- scratch registers ---- */
 
 /* Host registers that can be borrowed: any guest-allocated one, saved in cpu->spill. */
-static const uint8_t candidates[] = {9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8,
+/* Host x6, x7 and x15 hold no guest register (guest x6, x7, x15 live in the
+   HvCpu, like x18 and x28: they are the least used in compiled code), so they
+   are free scratch: picked first and never spilled. */
+static const uint8_t candidates[] = {6, 7, 15, 9, 10, 11, 12, 13, 14, 0, 1, 2, 3, 4, 5, 8,
                                      16, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 29, 30};
+
+static int is_free(int reg) {
+    return reg == 6 || reg == 7 || reg == 15;
+}
 
 static int pick(uint32_t *used) {
     for (unsigned i = 0; i < sizeof candidates; i++) {
@@ -214,21 +231,33 @@ static int pick(uint32_t *used) {
     return -1;
 }
 
+/* Free scratch registers need no saving; the rest go to cpu->spill in order. */
+static int need_spill(const uint8_t *regs, int n, uint8_t *out) {
+    int k = 0;
+    for (int i = 0; i < n; i++)
+        if (!is_free(regs[i])) out[k++] = regs[i];
+    return k;
+}
+
 static void spill(Emit *e, const uint8_t *regs, int n) {
+    uint8_t r[4];
+    n = need_spill(regs, n, r);
     int i = 0;
-    for (; i + 1 < n; i += 2) put(e, STP_X(regs[i], regs[i + 1], 28, HV_CPU_SPILL(i)));
-    if (i < n) put(e, STR_X(regs[i], 28, HV_CPU_SPILL(i)));
+    for (; i + 1 < n; i += 2) put(e, STP_X(r[i], r[i + 1], 28, HV_CPU_SPILL(i)));
+    if (i < n) put(e, STR_X(r[i], 28, HV_CPU_SPILL(i)));
 }
 
 static void unspill(Emit *e, const uint8_t *regs, int n) {
+    uint8_t r[4];
+    n = need_spill(regs, n, r);
     int i = 0;
-    for (; i + 1 < n; i += 2) put(e, LDP_X(regs[i], regs[i + 1], 28, HV_CPU_SPILL(i)));
-    if (i < n) put(e, LDR_X(regs[i], 28, HV_CPU_SPILL(i)));
+    for (; i + 1 < n; i += 2) put(e, LDP_X(r[i], r[i + 1], 28, HV_CPU_SPILL(i)));
+    if (i < n) put(e, LDR_X(r[i], 28, HV_CPU_SPILL(i)));
 }
 
 /* Where a register the translator does not keep in a host register lives. */
 static int is_stolen(int reg) {
-    return reg == 18 || reg == 28;
+    return reg == 18 || reg == 28 || is_free(reg);
 }
 
 static uint32_t slot_of(int reg) {
@@ -260,9 +289,9 @@ static void translate_copy(Emit *e, uint32_t insn) {
         put(e, insn);
         return;
     }
-    /* One scratch per distinct stolen register (x18, x28, SP). */
-    int guest_of[3] = {-1, -1, -1}, scratch_of[3];
-    uint8_t regs[3];
+    /* One scratch per distinct stolen register; x6, x7 and x15 use their own host register. */
+    int guest_of[4] = {-1, -1, -1, -1}, scratch_of[4];
+    uint8_t regs[4];
     int n = 0;
     for (int f = 0; f < 4; f++) {
         if (stolen[f] < 0) continue;
@@ -270,7 +299,7 @@ static void translate_copy(Emit *e, uint32_t insn) {
         while (k < n && guest_of[k] != stolen[f]) k++;
         if (k == n) {
             guest_of[n] = stolen[f];
-            scratch_of[n] = pick(&used);
+            scratch_of[n] = is_free(stolen[f]) ? stolen[f] : pick(&used);
             regs[n] = scratch_of[n];
             n++;
         }
@@ -300,7 +329,7 @@ static void put_const_to(Emit *e, int rd, uint64_t value) {
         put_lit(e, rd, value);
         return;
     }
-    uint8_t s = 9;
+    uint8_t s = 15; /* free scratch: the spill below is empty */
     spill(e, &s, 1);
     put_lit(e, s, value);
     put(e, STR_X(s, 28, slot_of(rd)));
@@ -386,7 +415,7 @@ static void translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
         put_branch_exit(e, pc + 4);
         return;
     }
-    uint8_t s = 9;
+    uint8_t s = 15; /* free scratch: the spill below is empty */
     spill(e, &s, 1);
     put(e, LDR_X(s, 28, slot_of(rt)));
     put(e, (bare & ~0x1fu) | s);
@@ -590,7 +619,7 @@ static void put_load_field(Emit *e, int rt, uint32_t off) {
         put(e, LDR_X(rt, 28, off));
         return;
     }
-    uint8_t s = 9;
+    uint8_t s = 15; /* free scratch: the spill below is empty */
     spill(e, &s, 1);
     put(e, LDR_X(s, 28, off));
     put(e, STR_X(s, 28, slot_of(rt)));
@@ -602,7 +631,7 @@ static void put_store_field(Emit *e, int rt, uint32_t off) {
         put(e, STR_X(rt, 28, off)); /* 31 stores XZR */
         return;
     }
-    uint8_t s = 9;
+    uint8_t s = 15; /* free scratch: the spill below is empty */
     spill(e, &s, 1);
     put(e, LDR_X(s, 28, slot_of(rt)));
     put(e, STR_X(s, 28, off));
@@ -616,7 +645,7 @@ static void put_native_sysreg(Emit *e, uint32_t insn, int read) {
         put(e, insn);
         return;
     }
-    uint8_t s = 9;
+    uint8_t s = 15; /* free scratch: the spill below is empty */
     spill(e, &s, 1);
     if (read) {
         put(e, (insn & ~0x1fu) | s);
@@ -811,6 +840,7 @@ int hv_translate_block(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t 
     e->slow_mem = m->slow_mem;
     e->page = b->va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
     e->no_ijc = !m->chain;
+    e->m = m;
 
     /* Two entries: +0 reloads guest x1 too (the indirect-branch cache jumps
        here with x1 in use); +1 is for hv_enter and chained jumps. */

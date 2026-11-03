@@ -54,7 +54,7 @@ typedef struct HvCpu {
     uint64_t far_el1;        /* 0x3b8 */
     uint32_t exit_req;       /* 0x3c0: set (by another thread too) to make chained blocks leave */
     uint32_t pad1;
-    uint64_t last_stub;      /* 0x3c8: patch slot of the chainable exit just taken, or 0 */
+    uint64_t last_stub;      /* 0x3c8: slot of the unchained exit just taken, or 0 */
     uint64_t ijc;            /* 0x3d0: indirect-branch cache, HV_IJC_TABLES tables of {tag, entry} */
     uint64_t ijc_salt[2];    /* 0x3d8: tags are VA ^ salt, [0] for user (EL0) tables, [1] kernel; a new salt empties them */
     uint64_t pad0[3];        /* keeps the TLB at 0x400 */
@@ -128,8 +128,9 @@ typedef struct HvCpu {
 #define HV_CPU_IJC_SALT    0x3d8
 #define HV_CPU_TLB         0x400
 
-/* Indirect-branch cache: one table per block-flags value, 4096 entries of 16 bytes. */
-#define HV_IJC_BITS 12
+/* Indirect-branch cache: one table per block-flags value, 64K entries of 16 bytes,
+   indexed by ((va ^ va >> 16) >> 2) so code at the same offset in different pages spreads out. */
+#define HV_IJC_BITS 16
 #define HV_IJC_TABLES 16
 #define HV_IJC_TABLE_BYTES ((1u << HV_IJC_BITS) * 16)
 #define HV_CPU_TLB_EL      (HV_TLB_SIZE * 32)

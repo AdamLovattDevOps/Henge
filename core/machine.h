@@ -42,15 +42,19 @@ typedef struct HvBlock {
 
 #define HV_MAX_RAM 8
 #define HV_MAX_MMIO 48
-#define HV_BLOCK_HASH 65536
-#define HV_MAX_BLOCKS (1 << 19)
-#define HV_MAX_CHAINS (1 << 20)
+#define HV_BLOCK_HASH (1 << 21) /* one bucket per block: chains are walked on every front-cache miss */
+#define HV_JC_BITS 16
+#define HV_MAX_BLOCKS (1 << 21) /* a macOS boot runs well over a million distinct blocks; a full flush retranslates them all */
+#define HV_PROF_RING (1 << 16)
+#define HV_MAX_SLOTS (1 << 22)  /* chainable exits: about two per block */
 
 /* Counters for --stats: where the time goes. */
 typedef struct HvStats {
     uint64_t blocks, translations, block_flushes;
     uint64_t flush_smc, flush_ic, flush_full;  /* why translations were dropped */
-    uint64_t chained, unchains, ijc_fills, ijc_resets;
+    uint64_t chained, ijc_fills, ijc_resets;
+    uint64_t translate_ticks, translated_insns, translated_words; /* time spent translating, guest and host code size */
+    uint64_t retrans_va, retrans_vapa; /* translations of a VA (and VA+PA) translated before: diagnostics */
     uint64_t helper[12];      /* by HV_OP_* */
     uint64_t tlb_flushes, fetch_walks, exceptions, interrupts;
     uint64_t wfi, wfi_ticks;  /* WFI exits, host ticks spent asleep */
@@ -64,7 +68,7 @@ typedef struct HvMachine {
 
     HvJitRegion jit;
     HvBlock *hash[HV_BLOCK_HASH];
-    HvBlock *jc[1 << 14];  /* direct-mapped cache in front of the hash */
+    HvBlock *jc[1 << HV_JC_BITS]; /* direct-mapped cache in front of the hash */
     HvBlock *blocks;
     int nblocks;
     int flush_pending;   /* set by helpers; the dispatcher flushes once the block has left */
@@ -89,15 +93,16 @@ typedef struct HvMachine {
     uint64_t watch_va;   /* debugging: log every write that touches this guest VA (0: off) */
     uint64_t watch_pa;   /* debugging: the same by physical address */
     HvStats stats;
-    /* Block chaining: patched exit slots, so they can be undone when code changes. */
-    int chain;               /* enabled */
-    uint32_t **chains;
-    uint32_t nchains;
-    int unchain_pending;
+    int chain;               /* block chaining and the indirect-branch cache are enabled */
+    uint64_t *slots;         /* chainable exits' targets (0: not chained) */
+    uint32_t nslots;
     HvCpu *cpu;              /* the CPU, so device and invalidation code can ask it to leave */
     uint64_t *ijc;           /* indirect-branch cache tables (cpu->ijc points here) */
     uint64_t ijc_pages[2][1024]; /* hashed bitmap of the pages cached targets are in, so most TLBIs can leave the cache alone */
     int stats_interval;  /* seconds between --stats lines, 0 = off */
+    /* --profile: host PCs of the CPU thread sampled every millisecond, drained by the stats line. */
+    uint64_t *prof;
+    uint32_t prof_head, prof_tail;
 } HvMachine;
 
 int hv_machine_init(HvMachine *m, size_t jit_bytes);
