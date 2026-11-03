@@ -73,6 +73,11 @@ static void *kicker_thread(void *unused) {
 static void *type_thread(void *unused) {
     (void)unused;
     sleep((unsigned)atoi(getenv("HV_TYPE_AT")));
+    for (int i = 0; i < 60; i++) { /* shake it: macOS enlarges the pointer, so new glyphs get sent */
+        hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_X, i & 1 ? 120 : -120);
+        hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+        usleep(15000);
+    }
     for (int i = 0; i < 40; i++) { /* the pointer: up and to the left, so it shows */
         hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_X, -10);
         hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_Y, -6);

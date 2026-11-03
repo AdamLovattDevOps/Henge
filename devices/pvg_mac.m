@@ -3,6 +3,8 @@
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
 #import <QuartzCore/QuartzCore.h>
+#import <objc/message.h>
+#import <objc/runtime.h>
 #import <ImageIO/ImageIO.h>
 #import <Metal/Metal.h>
 #import <ParavirtualizedGraphics/ParavirtualizedGraphics.h>
@@ -104,29 +106,112 @@ static void save_png(id<MTLTexture> tex) {
 
 static CAMetalLayer *window_layer; /* --window: where frames go */
 
-/* Draw the current frame into the window: render into a texture, copy it to the drawable. */
-static void show_frame(void) {
+/* The pointer comes separately (glyph image, hotspot, position), so the window
+   draws the screen and then the glyph on top. */
+static int cursor_shown = 1;
+static PGDisplayCoord_t glyph_hot;
+static id<MTLTexture> screen_tex, glyph_tex;
+static id<MTLRenderPipelineState> quad_pipe;
+static void present(void);
+
+/* A new pointer image: premultiplied BGRA into a texture of its own size. */
+static void set_glyph(CGImageRef img, PGDisplayCoord_t hot) {
+    if (!img) return;
+    size_t w = CGImageGetWidth(img), h = CGImageGetHeight(img);
+    if (!w || !h || w > 1024 || h > 1024) return;
+    NSMutableData *px = [NSMutableData dataWithLength:w * h * 4];
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(px.mutableBytes, w, h, 8, w * 4, cs,
+                                             kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), img);
+    CGContextRelease(ctx);
+    CGColorSpaceRelease(cs);
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                  width:width
-                                                                                 height:height
+                                                                                  width:w
+                                                                                 height:h
+                                                                              mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> t = [mtl newTextureWithDescriptor:td];
+    [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:px.bytes bytesPerRow:w * 4];
+    glyph_tex = t;
+    glyph_hot = hot;
+    if (window_layer) present();
+}
+
+static id<MTLTexture> new_texture(uint32_t w, uint32_t h) {
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                  width:w
+                                                                                 height:h
                                                                               mipmapped:NO];
     td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
     td.storageMode = MTLStorageModePrivate;
-    static id<MTLTexture> tex;
-    if (!tex || tex.width != width || tex.height != height) tex = [mtl newTextureWithDescriptor:td];
+    return [mtl newTextureWithDescriptor:td];
+}
+
+static id<MTLRenderPipelineState> make_pipe(void) {
+    NSString *src = @"#include <metal_stdlib>\n"
+                     "using namespace metal;\n"
+                     "struct V { float4 pos [[position]]; float2 uv; };\n"
+                     "vertex V vs(uint vid [[vertex_id]], constant float4 &r [[buffer(0)]]) {\n"
+                     "  float2 c = float2(vid & 1, vid >> 1);\n"
+                     "  V o; o.pos = float4(r.xy + c * r.zw, 0, 1); o.uv = float2(c.x, 1 - c.y); return o; }\n"
+                     "fragment float4 fs(V in [[stage_in]], texture2d<float> t [[texture(0)]]) {\n"
+                     "  constexpr sampler s(filter::linear); return t.sample(s, in.uv); }\n";
+    NSError *err = nil;
+    id<MTLLibrary> lib = [mtl newLibraryWithSource:src options:nil error:&err];
+    if (!lib) return nil;
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [lib newFunctionWithName:@"vs"];
+    pd.fragmentFunction = [lib newFunctionWithName:@"fs"];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    pd.colorAttachments[0].blendingEnabled = YES; /* the glyph is premultiplied */
+    pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+    pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+    pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    return [mtl newRenderPipelineStateWithDescriptor:pd error:&err];
+}
+
+/* Draw the screen, then the pointer, into the window. */
+static void present(void) {
+    if (!screen_tex || !quad_pipe) return;
     if (!CGSizeEqualToSize(window_layer.drawableSize, CGSizeMake(width, height)))
         window_layer.drawableSize = CGSizeMake(width, height);
     id<CAMetalDrawable> drawable = [window_layer nextDrawable];
     if (!drawable) return;
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = drawable.texture;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLCommandBuffer> cb = [mtl_queue commandBuffer];
-    if (![pgdisp encodeCurrentFrameToCommandBuffer:cb texture:tex region:MTLRegionMake2D(0, 0, width, height)]) return;
-    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-    [blit copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
-               sourceSize:MTLSizeMake(width, height, 1) toTexture:drawable.texture destinationSlice:0
-         destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
-    [blit endEncoding];
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    [enc setRenderPipelineState:quad_pipe];
+    float full[4] = {-1, -1, 2, 2};
+    [enc setVertexBytes:full length:sizeof full atIndex:0];
+    [enc setFragmentTexture:screen_tex atIndex:0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    PGDisplayCoord_t at = pgdisp.cursorPosition;
+    if (glyph_tex && cursor_shown && at.x != 0xffff) {
+        float w = 2.0f * glyph_tex.width / width, h = 2.0f * glyph_tex.height / height;
+        float x = 2.0f * ((float)at.x - glyph_hot.x) / width - 1, top = 1 - 2.0f * ((float)at.y - glyph_hot.y) / height;
+        float r[4] = {x, top - h, w, h};
+        [enc setVertexBytes:r length:sizeof r atIndex:0];
+        [enc setFragmentTexture:glyph_tex atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    }
+    [enc endEncoding];
     [cb presentDrawable:drawable];
     [cb commit];
+}
+
+/* A new frame from the guest: copy the screen, then draw it with the pointer. */
+static void show_frame(void) {
+    if (!quad_pipe) quad_pipe = make_pipe();
+    if (!screen_tex || screen_tex.width != width || screen_tex.height != height) screen_tex = new_texture(width, height);
+    id<MTLCommandBuffer> cb = [mtl_queue commandBuffer];
+    if (![pgdisp encodeCurrentFrameToCommandBuffer:cb texture:screen_tex region:MTLRegionMake2D(0, 0, width, height)]) return;
+    [cb commit];
+    present();
 }
 
 static void new_frame(void) {
@@ -233,12 +318,27 @@ int hv_pvg_attach(HvVmapple *b, const char *screenshot) {
         };
         dd.modeChangeHandler = ^(PGDisplayCoord_t size, OSType format) {
             (void)format;
+            if (board->m->log) fprintf(stderr, "hengevm: pvg: display mode %ux%u\n", size.x, size.y);
+            if (size.x < 320 || size.y < 240) return; /* a pointer glyph passed off as a mode: not the screen */
             width = size.x;
             height = size.y;
-            if (board->m->log) fprintf(stderr, "hengevm: pvg: display mode %ux%u\n", width, height);
         };
+        /* The pointer is not drawn into frames: it moves separately, so redraw the window when it does. */
+        /* macOS 27's private replacement for the obsolete cursorGlyphHandler:
+           (CGImageRef glyph, PGDisplayCoord_t hotSpot). Without one the framework
+           passes the glyph off as a 128x128 display mode and frame. */
+        void (^glyph_handler)(id, PGDisplayCoord_t) = ^(id image, PGDisplayCoord_t hot) {
+            set_glyph((__bridge CGImageRef)image, hot);
+        };
+        SEL set_glyph_handler = NSSelectorFromString(@"setCursorGlyphHandler2:");
+        if ([dd respondsToSelector:set_glyph_handler])
+            ((void (*)(id, SEL, id))objc_msgSend)(dd, set_glyph_handler, glyph_handler);
         dd.cursorShowHandler = ^(BOOL show) {
-            (void)show;
+            cursor_shown = show;
+            if (window_layer) present();
+        };
+        dd.cursorMoveHandler = ^{
+            if (window_layer) present();
         };
         pgdisp = [pgdev newDisplayWithDescriptor:dd port:0 serialNum:1];
         PGDisplayMode *mode = [[PGDisplayMode alloc] initWithSizeInPixels:(PGDisplayCoord_t){1920, 1080}
