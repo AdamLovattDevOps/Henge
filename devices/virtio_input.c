@@ -1,5 +1,6 @@
 #include "virtio_input.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -38,7 +39,10 @@ static void answer(HvVirtioInput *d) {
         size = 1;
         break;
     case CFG_ID_DEVIDS: { /* bustype BUS_VIRTUAL, vendor, product, version */
-        uint16_t ids[4] = {0x06, 0x0627, (uint16_t)(kbd ? 1 : 2), 1};
+        /* AppleVirtIOInputKeyboard always says vendor Apple (0x5ac) and takes the
+           product from here; HV_KBD_PRODUCT tries others (experiment). */
+        uint16_t prod = (uint16_t)(kbd ? (getenv("HV_KBD_PRODUCT") ? atoi(getenv("HV_KBD_PRODUCT")) : 1) : 2);
+        uint16_t ids[4] = {0x06, 0x0627, prod, 1};
         memcpy(data, ids, sizeof ids);
         size = sizeof ids;
         break;
@@ -70,6 +74,8 @@ static void answer(HvVirtioInput *d) {
         break;
     }
     c[2] = (uint8_t)size;
+    if (getenv("HV_INPUT_LOG")) /* debugging: what the guest driver asks */
+        fprintf(stderr, "virtio-input %s: select %#x subsel %u -> size %u\n", kbd ? "keyboard" : "mouse", select, subsel, size);
 }
 
 static void config_write(HvVirtio *v, uint32_t off, uint64_t val, unsigned size) {
@@ -80,6 +86,7 @@ static void config_write(HvVirtio *v, uint32_t off, uint64_t val, unsigned size)
 
 /* The status queue carries LED changes: hand the buffers straight back. */
 static void notify(HvVirtio *v, int q) {
+    if (getenv("HV_INPUT_LOG")) fprintf(stderr, "virtio-input %s: notify queue %d\n", ((HvVirtioInput *)v->dev)->kind == HV_VINPUT_KEYBOARD ? "keyboard" : "mouse", q);
     if (q != STATUSQ) return; /* new event buffers: delivered at the next poll */
     static HvVirtqElem e;
     int any = 0;

@@ -13,6 +13,7 @@
 #include "pl031.h"
 #include "virtio_blk.h"
 #include "virtio_input.h"
+#include "xhci.h"
 #include "virtio_net.h"
 
 /* The virtual Mac: QEMU's vmapple memory map and interrupt numbers (hw/vmapple/vmapple.c). */
@@ -58,6 +59,7 @@ typedef struct HvVmapple {
     HvVirtioBlk *aux_blk, *root_blk;
     HvVirtioNet *net;
     HvVirtioInput *keyboard, *mouse;
+    HvXhci *usb;             /* USB controller with the keyboard macOS actually uses */
     uint8_t *cfg, *rom, *ram;
     uint64_t ram_size;
     uint64_t panic_events;   /* last pvpanic event the guest reported */

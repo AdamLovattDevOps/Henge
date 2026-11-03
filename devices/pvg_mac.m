@@ -372,6 +372,7 @@ static const uint16_t keymap[128] = {
 
 static void key(uint16_t mac, int down) {
     if (mac >= 128 || !keymap[mac]) return;
+    hv_xhci_key_linux(board->usb, keymap[mac], down); /* the USB keyboard: the one macOS listens to */
     hv_virtio_input_send(board->keyboard, HV_EV_KEY, keymap[mac], down);
     hv_virtio_input_send(board->keyboard, HV_EV_SYN, 0, 0);
 }
