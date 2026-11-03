@@ -387,7 +387,7 @@ static int run(HvCpu *cpu, int one) {
         cpu->icount++;
         m->stats.blocks++;
         if (m->stats_interval && (m->stats.blocks & 0xffff) == 0) print_stats(cpu, 0);
-        hv_enter(cpu, b->code + 1);
+        hv_enter(cpu, b->code);
 
         if (cpu->exit_reason == HV_EXIT_BRANCH && cpu->last_stub && m->chain) pending_chain = (uint64_t *)cpu->last_stub;
         switch (cpu->exit_reason) {

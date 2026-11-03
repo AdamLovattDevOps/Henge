@@ -21,14 +21,16 @@ translated block unchanged. Only these are rewritten:
 
 - loads and stores, which go through the guest MMU (an inline TLB, with a slow
   path for misses and device accesses);
-- PC-relative instructions and branches, which get the guest PC filled in, and
-  indirect branches, which exit to the dispatcher;
+- PC-relative instructions and branches, which get the guest PC filled in;
+  same-page branches chain directly to the target block, and indirect branches
+  go through a small cache and fall back to the dispatcher;
 - system register access, exceptions, and barriers that touch guest state, which
   call helpers;
 - pointer-authentication instructions, which become a strip or a no-op, since the
   host's keys cannot be the guest's;
 - any instruction that uses a register the translator reserves for itself; those
-  registers are kept in the guest context instead.
+  registers are kept in the guest context instead. Guest x6, x7, x15, x18 and
+  x28 are kept in the CPU context, so the host's x6, x7 and x15 are free scratch.
 
 Guest and host both use 16 KB pages, so guest RAM maps onto host pages directly.
 

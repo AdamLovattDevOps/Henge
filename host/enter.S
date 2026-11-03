@@ -1,10 +1,14 @@
 // Entering and leaving translated code.
 //
 // hv_enter(HvCpu *cpu, void *block) saves the host's callee-saved registers,
-// loads the guest registers, and jumps to the block. Every block starts with
-// `ldr x0, [x28]`, because x0 carries the block address until then.
+// loads the guest registers, and jumps to the block. Blocks have no prologue:
+// x0 and x1 are already guest values, so a chained block can jump straight in.
 // The block leaves through cpu->exit_routine, which is hv_exit below: by then
 // the block has stored guest x0, x1 and pc into the HvCpu.
+//
+// Host x6, x7 and x15 are free scratch: guest x6, x7 and x15 live in the HvCpu
+// (they are the least used guest registers), so the translator never spills
+// them and hv_exit does not save them.
 //
 // hv_helper_entry is how a block calls C without leaving: the block stores
 // guest x0, x1 and x30, puts a HvHelperInfo pointer in x0 and does `blr` to it.
@@ -93,11 +97,10 @@
     ldr x1, [x28, #8]
     ldp x2, x3, [x28, #16]
     ldp x4, x5, [x28, #32]
-    ldp x6, x7, [x28, #48]
     ldp x8, x9, [x28, #64]
     ldp x10, x11, [x28, #80]
     ldp x12, x13, [x28, #96]
-    ldp x14, x15, [x28, #112]
+    ldr x14, [x28, #112]
     ldp x16, x17, [x28, #128]
     ldp x19, x20, [x28, #152]
     ldp x21, x22, [x28, #168]
@@ -123,8 +126,9 @@ _hv_enter:
     mov x28, x0
     LOAD_FLAGS_FP
     LOAD_X1_X30
-    ldr x0, [sp, #160]
-    br x0
+    ldr x15, [sp, #160]
+    ldr x0, [x28, #0]
+    br x15
 
 _hv_exit:
     // x0, x1 and pc are already in the HvCpu.
