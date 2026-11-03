@@ -70,6 +70,26 @@ int main(void) {
         printf("%-12s       : %s\n", "pac", bad ? "FAIL" : "ok");
         failed += bad != 0;
     }
+    /* Again with a JIT region so small that it fills (and everything is flushed)
+       in the middle of a program, chains pending and all. */
+    {
+        static HvMachine small;
+        if (hv_machine_init(&small, 1024) != 0) return 1;
+        hv_machine_add_ram(&small, (uint64_t)(uintptr_t)jit_programs_begin, jit_programs_finish - jit_programs_begin,
+                           (void *)jit_programs_begin, 1);
+        hv_machine_add_ram(&small, (uint64_t)(uintptr_t)stack, 65536, stack, 0);
+        for (size_t i = 0; i < count; i++) {
+            static HvCpu init, native, jit;
+            memset(&init, 0, sizeof init);
+            seed_cpu(&init, i * 2 + 1, sp);
+            run_native(&programs[i], &init, &native, NULL);
+            int bad = run_jit(&small, &programs[i], &init, &jit, NULL);
+            if (!bad) bad = compare_cpus(programs[i].name, &native, &jit);
+            if (bad) printf("%-12s with a full JIT region: FAIL\n", programs[i].name);
+            failed += bad != 0;
+        }
+        printf("with a 1 KB JIT region: %llu flushes\n", (unsigned long long)small.stats.block_flushes);
+    }
     printf("%zu programs x 2 seeds, %d failures, %d blocks translated\n", count, failed, m.nblocks);
     return failed != 0;
 }

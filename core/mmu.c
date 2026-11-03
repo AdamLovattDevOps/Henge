@@ -218,16 +218,47 @@ void hv_tlb_protect_code(HvCpu *cpu, const uint8_t *host_page) {
         }
 }
 
+/* Forget one salt's cached targets in one 16 KB page. A page's 4096 possible
+   targets have 4096 known slots in each table, so only those are looked at. */
+static void ijc_clear_page(HvCpu *cpu, uint64_t page, int kernel, uint64_t salt) {
+    HvMachine *m = cpu->m;
+    for (int t = kernel; t < HV_IJC_TABLES; t += 2) {
+        if (!(m->ijc_tables_used >> t & 1)) continue;
+        uint64_t *tab = m->ijc + (size_t)t * (HV_IJC_TABLE_BYTES / 8);
+        for (uint32_t o = 0; o < (1u << HV_TLB_PAGE_BITS) / 4; o++) {
+            uint64_t tag = (page | (uint64_t)o << 2) ^ salt;
+            uint64_t *ent = tab + (size_t)hv_ijc_index(tag) * 2;
+            if (ent[0] == tag) ent[0] = 0;
+        }
+    }
+}
+
 void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid) {
     /* Tagged addresses may sit in any slot's tag byte, so check by the low 56 bits. */
     uint32_t idx = (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1);
     /* The page may hold cached branch targets even if its TLB entry is gone. */
     int kernel = (va >> 55) & 1;
-    uint32_t h = (uint32_t)(va >> HV_TLB_PAGE_BITS) & 0xffff;
-    if (cpu->m && (cpu->m->ijc_pages[kernel][h >> 6] >> (h & 63) & 1)) {
-        cpu->m->stats.reset_why[kernel ? 3 : 2]++;
-        if (kernel || asid < 0) hv_ijc_reset(cpu, kernel);
-        else hv_ijc_drop_asid(cpu, (uint16_t)asid);
+    HvMachine *m = cpu->m;
+    if (m) {
+        int drop = 0;
+        if (kernel) {
+            uint32_t k = hv_ijc_key(va, cpu->ijc_salt[1]);
+            drop = m->ijc_keyed[k >> 6] >> (k & 63) & 1;
+        } else if (asid < 0) { /* every address space: any process's targets in the page count */
+            uint32_t h = (uint32_t)(va >> HV_TLB_PAGE_BITS) & 0xffff;
+            drop = m->ijc_pages[0][h >> 6] >> (h & 63) & 1;
+        } else {
+            uint64_t salt = current_asid(cpu) < 0 ? cpu->ijc_salt[0] : (uint64_t)cpu->asid_cid[asid] << 48;
+            uint32_t k = hv_ijc_key(va, salt);
+            drop = (salt >> 48) && (m->ijc_keyed[k >> 6] >> (k & 63) & 1);
+        }
+        if (drop) {
+            m->stats.reset_why[kernel ? 3 : 2]++;
+            uint64_t page = va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
+            if (kernel) ijc_clear_page(cpu, page, 1, cpu->ijc_salt[1]);
+            else if (asid < 0) hv_ijc_reset(cpu, 0); /* every address space: their slots differ, so start the user half over */
+            else ijc_clear_page(cpu, page, 0, current_asid(cpu) < 0 ? cpu->ijc_salt[0] : (uint64_t)cpu->asid_cid[asid] << 48);
+        }
     }
     for (int el = 0; el < 3; el++) {
         HvTlbEntry *e = &cpu->tlb[el][idx];

@@ -33,6 +33,13 @@ void hv_tlb_flush_va(HvCpu *cpu, uint64_t va);
 void hv_tlb_flush_user(HvCpu *cpu);
 /* Empty the indirect-branch cache for all user (0) or for kernel (1) VAs. */
 void hv_ijc_reset(HvCpu *cpu, int kernel);
+/* The indirect-branch cache slot of a tag (VA ^ salt); translated code computes the same. */
+static inline uint32_t hv_ijc_index(uint64_t tag) {
+    return (uint32_t)(((tag ^ tag >> 16 ^ tag >> 46) >> 2) & ((1u << HV_IJC_BITS) - 1));
+}
+static inline uint32_t hv_ijc_key(uint64_t va, uint64_t salt) {
+    return (uint32_t)(((va >> 14) * 0x9e3779b97f4a7c15ull ^ (salt >> 48) * 0xc2b2ae3d27d4eb4full) >> 44);
+}
 /* Forget one address space's cached user targets. */
 void hv_ijc_drop_asid(HvCpu *cpu, uint16_t asid);
 /* TTBR0 changed: use the new address space's user entries. */

@@ -62,7 +62,8 @@ typedef struct HvCpu {
     uint64_t last_stub;      /* 0x3c8: slot of the unchained exit just taken, or 0 */
     uint64_t ijc;            /* 0x3d0: indirect-branch cache, HV_IJC_TABLES tables of {tag, entry} */
     uint64_t ijc_salt[2];    /* 0x3d8: tags are VA ^ salt, [0] for user (EL0) tables, [1] kernel (see hv_ijc_* in mmu.c) */
-    uint64_t pad0[3];        /* keeps the TLB at 0x400 */
+    uint64_t miss_site;      /* 0x3e8: --stats: guest PC of the branch whose cache lookup just missed */
+    uint64_t pad0[2];        /* keeps the TLB at 0x400 */
     /* 0x400: [0] EL0 and unprivileged accesses, [1] EL1, [2] EL1 with PSTATE.PAN set,
        so toggling PAN (the kernel does it around every user copy) flushes nothing. */
     HvTlbEntry tlb[3][HV_TLB_SIZE];
@@ -145,6 +146,7 @@ typedef struct HvCpu {
 #define HV_CPU_LAST_STUB   0x3c8
 #define HV_CPU_IJC         0x3d0
 #define HV_CPU_IJC_SALT    0x3d8
+#define HV_CPU_MISS_SITE   0x3e8
 #define HV_CPU_TLB         0x400
 
 /* Indirect-branch cache: one table per block-flags value, 64K entries of 16 bytes,

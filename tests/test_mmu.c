@@ -204,6 +204,52 @@ int main(void) {
         }
     }
 
+    /* A TLBI by VA and ASID forgets the indirect-branch cache entries of that page
+       for that address space, and nothing else. Entries are filled the way the dispatcher does it. */
+    {
+        hv_cpu_reset(&cpu, &m);
+        cpu.tcr_el1 = 0;
+        cpu.ttbr0_el1 = 7ull << 48;
+        hv_ijc_switch(&cpu);
+        uint64_t salt = cpu.ijc_salt[0];
+        static const uint64_t vas[3] = {0x100004010ull, 0x100007ffcull, 0x100008010ull}; /* page P twice, then page Q */
+        uint64_t *ents[3];
+        for (int i = 0; i < 3; i++) {
+            uint64_t *ent = m.ijc + (size_t)hv_ijc_index(vas[i] ^ salt) * 2;
+            ent[0] = vas[i] ^ salt;
+            ent[1] = 0x1234;
+            ents[i] = ent;
+            uint32_t k = hv_ijc_key(vas[i], salt);
+            m.ijc_keyed[k >> 6] |= 1ull << (k & 63);
+            uint32_t h = (uint32_t)(vas[i] >> 14) & 0xffff;
+            m.ijc_pages[0][h >> 6] |= 1ull << (h & 63);
+        }
+        m.ijc_tables_used |= 1;
+        hv_tlb_flush_va_asid(&cpu, 0x100004000ull, 7);
+        int want[3] = {0, 0, 1};
+        for (int i = 0; i < 3; i++) {
+            checks++;
+            if ((ents[i][0] != 0) != want[i]) {
+                printf("  FAIL branch cache after TLBI of page P: entry %d %s\n", i, ents[i][0] ? "kept" : "dropped");
+                failures++;
+            }
+        }
+        /* Another address space's TLBI of page Q leaves this one's entry alone. */
+        hv_tlb_flush_va_asid(&cpu, 0x100008000ull, 9);
+        checks++;
+        if (!ents[2][0]) {
+            printf("  FAIL another ASID's TLBI dropped our entry\n");
+            failures++;
+        }
+        hv_tlb_flush_va_asid(&cpu, 0x100008000ull, -1); /* all address spaces */
+        checks++;
+        uint64_t now = vas[2] ^ cpu.ijc_salt[0]; /* what a lookup would compare against now */
+        if (m.ijc[(size_t)hv_ijc_index(now) * 2] == now) {
+            printf("  FAIL an all-ASID TLBI kept the entry\n");
+            failures++;
+        }
+    }
+
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;
 }

@@ -36,6 +36,7 @@ typedef struct {
        access in a page's last HV_TLB_ADJ bytes) and go back if it passes. */
     uint8_t recheck, addr, t, u, bytes;
     uint32_t tag_off;
+    uint64_t site;      /* guest PC of the instruction that branches out of line */
 } Ool;
 
 typedef struct {
@@ -52,6 +53,7 @@ typedef struct {
     uint64_t page;       /* guest VA of the 16 KB page the block is in */
     int no_ijc;          /* indirect branches always go to the dispatcher (breakpoints, tests' stop PC) */
     HvMachine *m;
+    uint64_t cur_pc;     /* guest PC of the instruction being translated (or whose out-of-line exit is) */
 } Emit;
 
 static Emit E; /* translation runs on the dispatcher thread only */
@@ -103,6 +105,7 @@ static void put_info(Emit *e, int reg, uint64_t pc, uint32_t insn, uint32_t op) 
 
 static void put_ool(Emit *e, Ool o) {
     o.at = e->n - 1; /* the branch just emitted */
+    o.site = e->cur_pc;
     e->ool[e->nool++] = o;
 }
 
@@ -121,25 +124,31 @@ static void put_ijc_jump(Emit *e) {
     put(e, 0xb9400000u | (HV_CPU_EXIT_REQ / 4) << 10 | 28 << 5 | 6); /* ldr w6, [x28, #exit_req] */
     uint32_t to_exit = e->n;
     put(e, 0x35000000u | 6);                                /* cbnz w6, exit (patched below) */
+    /* The tag, VA ^ salt, also picks the slot (hv_ijc_index), so each address
+       space's copy of shared library code gets its own slots. */
+    put(e, LDR_X(15, 28, HV_CPU_IJC_SALT + 8 * (e->flags & HV_BLOCK_EL1)));
+    put(e, 0xca000000u | 0 << 16 | 15 << 5 | 15);           /* eor x15, x15, x0: the tag */
     put(e, LDR_X(6, 28, HV_CPU_IJC));
-    uint32_t table = (e->flags & (HV_IJC_TABLES - 1)) * HV_IJC_TABLE_BYTES;
-    if (table) put(e, 0x91400000u | (table >> 12) << 10 | 6 << 5 | 6); /* add x6, x6, #table */
-    put(e, 0xca400000u | 0 << 16 | 16 << 10 | 0 << 5 | 7);   /* eor x7, x0, x0, lsr #16 */
+    uint64_t table = (uint64_t)(e->flags & (HV_IJC_TABLES - 1)) * HV_IJC_TABLE_BYTES;
+    if (table) {
+        put(e, 0xd2a00000u | (uint32_t)(table >> 16) << 5 | 7); /* movz x7, #table >> 16, lsl #16 */
+        put(e, ADD_LSL(6, 6, 7, 0));
+    }
+    put(e, 0xca400000u | 15 << 16 | 16 << 10 | 15 << 5 | 7); /* eor x7, x15, x15, lsr #16 */
+    put(e, 0xca400000u | 15 << 16 | 46 << 10 | 7 << 5 | 7);  /* eor x7, x7, x15, lsr #46 */
     put(e, UBFM_X(7, 7, 2, 2 + HV_IJC_BITS - 1));           /* ubfx x7, x7, #2, #bits */
     put(e, ADD_LSL(6, 6, 7, 4));
-    put(e, LDP_X(7, 15, 6, 0));                             /* x7 = tag, x15 = entry */
-    put(e, LDR_X(6, 28, HV_CPU_IJC_SALT + 8 * (e->flags & HV_BLOCK_EL1)));
-    put(e, 0xca000000u | 6 << 16 | 7 << 5 | 7);             /* eor x7, x7, x6 */
-    put(e, LDR_X(6, 28, HV_CPU_PC));
-    put(e, 0xca000000u | 6 << 16 | 7 << 5 | 7);             /* eor x7, x7, x6 */
+    put(e, LDP_X(7, 6, 6, 0));                              /* x7 = tag, x6 = entry */
+    put(e, 0xca000000u | 15 << 16 | 7 << 5 | 7);            /* eor x7, x7, x15 */
     uint32_t to_miss = e->n;
     put(e, CBNZ_X(7));
-    put(e, LDR_X(0, 28, 0));                                /* guest x0, x1 */
-    put(e, LDR_X(1, 28, 8));
-    put(e, BR_X(15));                                       /* hit */
+    put(e, LDP_X(0, 1, 28, 0));                             /* guest x0, x1 */
+    put(e, BR_X(6));                                        /* hit */
     patch_branch(&e->w[to_miss], (int64_t)e->n - to_miss);
     patch_branch(&e->w[to_exit], (int64_t)e->n - to_exit);
-    put(e, LDR_X(1, 28, HV_CPU_EXIT));                      /* miss */
+    put_lit(e, 1, e->cur_pc);                               /* miss: say where, for --stats */
+    put(e, STR_X(1, 28, HV_CPU_MISS_SITE));
+    put(e, LDR_X(1, 28, HV_CPU_EXIT));
     put(e, BR_X(1));
 }
 
@@ -950,6 +959,7 @@ static void emit_ool(Emit *e) {
         }
         unspill(e, o->restore, o->nrestore);
         if (o->kind == OOL_EXIT) {
+            e->cur_pc = o->site;
             put_branch_exit(e, o->pc); /* only branches use OOL exits */
         } else {
             put_helper(e, o->pc, o->insn, o->kind == OOL_SYS ? HV_OP_SYS : HV_OP_MEM);
@@ -976,6 +986,7 @@ int hv_translate_block(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t 
     while (i < max && !ended) {
         uint64_t pc = b->va + 4ull * i;
         if (i > 0 && pc == m->stop_pc) break; /* so the dispatcher sees stop_pc at a block start */
+        e->cur_pc = pc;
         ended = translate_one(e, code[i], pc);
         i++;
         if (e->n + WORDS_PER_INSN_MAX * 2 > MAX_WORDS || e->npool + 8 > MAX_LITS || e->nool + 4 > MAX_OOL) break;

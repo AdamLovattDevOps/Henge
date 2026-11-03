@@ -186,7 +186,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "hengevm: cannot open the disks\n");
         return 1;
     }
-    if (hv_machine_init(&m, 768u << 20) != 0) {
+    size_t jit_mb = getenv("HV_JIT_MB") ? (size_t)atoi(getenv("HV_JIT_MB")) : 768; /* debugging: a small region flushes often */
+    if (hv_machine_init(&m, jit_mb << 20) != 0) {
         fprintf(stderr, "hengevm: cannot map the JIT region\n");
         return 1;
     }

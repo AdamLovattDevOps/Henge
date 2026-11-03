@@ -1,5 +1,6 @@
 #include "dispatch.h"
 
+#include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -130,6 +131,23 @@ uint32_t hv_helper(HvCpu *cpu, const HvHelperInfo *info) {
         return 1;
     case HV_OP_UNDEF:
     default:
+        if (!cpu->el && ((info->pc >> 55) & 1)) { /* EL0 in kernel code: which block is this? */
+            HvMachine *m = cpu->m;
+            uint32_t *host = (uint32_t *)(uintptr_t)cpu->helper_ret; /* the block's blr into hv_helper_entry */
+            int lo = 0, hi = m->nblocks - 1;
+            while (lo < hi) {
+                int mid = (lo + hi + 1) / 2;
+                if (m->blocks[mid].code <= host) lo = mid;
+                else hi = mid - 1;
+            }
+            HvBlock *b = m->nblocks ? &m->blocks[lo] : NULL;
+            fprintf(stderr, "hengevm: el0 runs kernel code: block %llx flags %u (index %d of %d), flushes %llu, last stub %llx, "
+                            "miss site %llx\n  recent:", b ? (unsigned long long)b->va : 0ull, b ? b->flags : 0, lo, m->nblocks,
+                    (unsigned long long)m->stats.block_flushes, (unsigned long long)cpu->last_stub,
+                    (unsigned long long)cpu->miss_site);
+            for (int k = 15; k >= 0; k--) fprintf(stderr, " %llx", (unsigned long long)m->stats.recent[(m->stats.nrecent - 1 - k) & 15]);
+            fprintf(stderr, "\n");
+        }
         hv_raise_undef(cpu, info->pc);
         return 1;
     }
@@ -272,8 +290,23 @@ static void print_stats(HvCpu *cpu, int force) {
     {
         double tot = 0;
         for (int k = 0; k < 6; k++) tot += RATE(why[k]);
+        /* How much of the interval the CPU thread actually ran: below 100% means the host took it away. */
+        static double last_busy;
+        thread_basic_info_data_t ti;
+        mach_msg_type_number_t cnt = THREAD_BASIC_INFO_COUNT;
+        mach_port_t self = mach_thread_self();
+        if (thread_info(self, THREAD_BASIC_INFO, (thread_info_t)&ti, &cnt) == KERN_SUCCESS) {
+            double busy = ti.user_time.seconds + ti.user_time.microseconds / 1e6 + ti.system_time.seconds +
+                          ti.system_time.microseconds / 1e6;
+            fprintf(stderr, "  cpu thread ran %.0f%% of the interval\n", 100 * (busy - last_busy) / dt);
+            last_busy = busy;
+        }
+        mach_port_deallocate(mach_task_self(), self);
         fprintf(stderr, "  cache drops/s: full %.0f, ASID %.0f, user VA %.0f, kernel VA %.0f, code %.0f\n", RATE(reset_why[0]),
                 RATE(reset_why[1]), RATE(reset_why[2]), RATE(reset_why[3]), RATE(reset_why[4]));
+        fprintf(stderr, "  misses at: RET %.0fK/s, BR/BLR %.0fK/s, B/BL %.0fK/s, conditional %.0fK/s, MSR %.0fK/s, other %.0fK/s, unknown %.0fK/s\n",
+                RATE(miss_kind[0]) / 1e3, RATE(miss_kind[1]) / 1e3, RATE(miss_kind[2]) / 1e3, RATE(miss_kind[3]) / 1e3,
+                RATE(miss_kind[4]) / 1e3, RATE(miss_kind[5]) / 1e3, RATE(miss_kind[6]) / 1e3);
         fprintf(stderr, "  entries %.2fM/s: chain fill %.0f%%, kick %.0f%%, exception/sysreg %.0f%%, interrupt %.0f%%, cached target %.0f%%, cache miss %.0f%%\n",
                 tot / 1e6, 100 * RATE(why[0]) / tot, 100 * RATE(why[1]) / tot, 100 * RATE(why[2]) / tot,
                 100 * RATE(why[3]) / tot, 100 * RATE(why[4]) / tot, 100 * RATE(why[5]) / tot);
@@ -372,6 +405,15 @@ static int run(HvCpu *cpu, int one) {
         }
         if (cpu->pc == m->stop_pc) return HV_EXIT_HALT;
 
+        if (m->log && !cpu->el && ((cpu->pc >> 55) & 1)) { /* EL0 can never run kernel code: say how we got here */
+            static int reported;
+            if (reported++ < 4)
+                fprintf(stderr, "hengevm: el0 at kernel pc %llx: previous block %llx, exit reason %u, why %d, miss site %llx, "
+                                "elr %llx spsr %llx x30 %llx\n",
+                        (unsigned long long)cpu->pc, (unsigned long long)prev_pc, last_reason, why,
+                        (unsigned long long)cpu->miss_site, (unsigned long long)cpu->elr_el1,
+                        (unsigned long long)cpu->spsr_el1, (unsigned long long)cpu->x[30]);
+        }
         uint64_t pa;
         uint32_t avail;
         const uint32_t *code = hv_mmu_fetch(cpu, cpu->pc, &pa, &avail);
@@ -381,7 +423,11 @@ static int run(HvCpu *cpu, int one) {
             continue;
         }
         last_fault = ~0ull;
+        uint64_t flushes = m->stats.block_flushes;
         HvBlock *b = lookup(cpu, cpu->pc, pa, block_flags(cpu), code, avail);
+        /* A full flush while translating freed the slot the last exit came through,
+           and new blocks may have it now: chaining it would rewrite one of theirs. */
+        if (m->stats.block_flushes != flushes) pending_chain = NULL;
         if (!b) {
             fprintf(stderr, "hengevm: cannot translate block at %llx\n", (unsigned long long)cpu->pc);
             return HV_EXIT_UNSUPPORTED;
@@ -391,12 +437,26 @@ static int run(HvCpu *cpu, int one) {
         int kernel = b->flags & HV_BLOCK_EL1;
         if (m->chain && b->va != m->stop_pc && (int)((b->va >> 55) & 1) == kernel) {
             uint64_t *t = m->ijc + (size_t)(b->flags & (HV_IJC_TABLES - 1)) * (HV_IJC_TABLE_BYTES / 8);
-            uint64_t *ent = t + (((b->va ^ b->va >> 16) >> 2) & ((1u << HV_IJC_BITS) - 1)) * 2;
-            if (why == 5 && ent[0] == (b->va ^ cpu->ijc_salt[kernel])) why = 4; /* it was cached: not a miss */
-            ent[0] = b->va ^ cpu->ijc_salt[kernel];
+            uint64_t tag = b->va ^ cpu->ijc_salt[kernel];
+            uint64_t *ent = t + (size_t)hv_ijc_index(tag) * 2;
+            if (why == 5 && ent[0] == tag) why = 4; /* it was cached: not a miss */
+            ent[0] = tag;
             ent[1] = (uint64_t)(uintptr_t)b->code;
-            uint32_t h = (uint32_t)(b->va >> HV_TLB_PAGE_BITS) & 0xffff;
-            m->ijc_pages[kernel][h >> 6] |= 1ull << (h & 63);
+            m->ijc_tables_used |= 1u << (b->flags & (HV_IJC_TABLES - 1));
+            if (!kernel) {
+                uint32_t h = (uint32_t)(b->va >> HV_TLB_PAGE_BITS) & 0xffff;
+                m->ijc_pages[0][h >> 6] |= 1ull << (h & 63);
+            }
+            uint32_t k = hv_ijc_key(b->va, cpu->ijc_salt[kernel]);
+            if (!(m->ijc_keyed[k >> 6] >> (k & 63) & 1)) {
+                m->ijc_keyed[k >> 6] |= 1ull << (k & 63);
+                if (++m->ijc_keyed_count > (1u << 17)) { /* an eighth full: start the cache and the filter over */
+                    hv_ijc_reset(cpu, 0);
+                    hv_ijc_reset(cpu, 1);
+                    memset(m->ijc_keyed, 0, sizeof m->ijc_keyed);
+                    m->ijc_keyed_count = 0;
+                }
+            }
             m->stats.ijc_fills++;
         }
         /* The block before left through a chainable direct branch to this one: link them. */
@@ -406,6 +466,25 @@ static int run(HvCpu *cpu, int one) {
         if (m->log >= 4 && host_pointer_check(cpu, prev_pc)) return HV_EXIT_UNSUPPORTED;
         prev_pc = cpu->pc;
         m->stats.why[why]++;
+        m->stats.recent[m->stats.nrecent++ & 15] = cpu->pc | cpu->el;
+        if (why == 5 && m->stats_interval) {
+            int kind = 6;
+            /* A plain walk: fetching could raise an abort in the guest. */
+            HvWalk w;
+            uint32_t i = 0;
+            if (cpu->miss_site) hv_mmu_walk(cpu, cpu->miss_site, HV_ACC_EXEC, cpu->el, &w);
+            if (cpu->miss_site && !w.fsc && hv_phys_read(m, w.pa, &i, 4) == 0) {
+                if ((i & 0xfffffc1fu) == 0xd65f0000u || (i & 0xfffffbffu) == 0xd65f0bffu) kind = 0;         /* RET, RETAA/AB */
+                else if ((i & 0xfe9f0000u) == 0xd61f0000u) kind = 1; /* BR, BLR and their PAC forms (bit 24) */
+                else if ((i & 0x7c000000u) == 0x14000000u) kind = 2;                                         /* B, BL */
+                else if ((i & 0xff000010u) == 0x54000000u || (i & 0x7e000000u) == 0x34000000u ||
+                         (i & 0x7e000000u) == 0x36000000u) kind = 3;                                        /* B.cond, CB(N)Z, TB(N)Z */
+                else if ((i & 0xfff8f01fu) == 0xd500401fu) kind = 4;                                         /* MSR (immediate) */
+                else kind = 5;
+            }
+            m->stats.miss_kind[kind]++;
+            cpu->miss_site = 0;
+        }
         cpu->exit_reason = HV_EXIT_BRANCH;
         cpu->last_stub = 0;
         cpu->icount++;

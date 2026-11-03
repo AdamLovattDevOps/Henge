@@ -82,13 +82,14 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
     r->code_pages[pg] = 0;
     r->page_gen[pg]++;
     m->stats.flush_smc++;
-    /* Make a running chain leave (chains stay patched: see chain() in dispatch.c). */
+    /* The indirect-branch cache may lead into the stale blocks: start it over. */
     if (m->cpu) {
-        m->stats.reset_why[4]++;
-        hv_ijc_reset(m->cpu, 0); /* the indirect-branch cache may point at stale blocks too */
+        hv_ijc_reset(m->cpu, 0);
         hv_ijc_reset(m->cpu, 1);
-        __atomic_store_n(&m->cpu->exit_req, 1, __ATOMIC_RELAXED);
     }
+    m->stats.reset_why[4]++;
+    /* Make a running chain leave (chains stay patched: see chain() in dispatch.c). */
+    if (m->cpu) __atomic_store_n(&m->cpu->exit_req, 1, __ATOMIC_RELAXED);
 }
 
 HvMmio *hv_mmio_lookup(HvMachine *m, uint64_t pa) {

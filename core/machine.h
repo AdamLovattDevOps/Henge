@@ -45,9 +45,9 @@ typedef struct HvBlock {
 #define HV_MAX_MMIO 48
 #define HV_BLOCK_HASH (1 << 21) /* one bucket per block: chains are walked on every front-cache miss */
 #define HV_JC_BITS 16
-#define HV_MAX_BLOCKS (1 << 21) /* a macOS boot runs well over a million distinct blocks; a full flush retranslates them all */
+#define HV_MAX_BLOCKS (3 << 20) /* a macOS boot runs well over a million distinct blocks; a full flush retranslates them all */
 #define HV_PROF_RING (1 << 16)
-#define HV_MAX_SLOTS (1 << 22)  /* chainable exits: about two per block */
+#define HV_MAX_SLOTS (6 << 20)  /* chainable exits: about two per block */
 
 /* Counters for --stats: where the time goes. */
 typedef struct HvStats {
@@ -56,6 +56,9 @@ typedef struct HvStats {
     uint64_t chained, ijc_fills, ijc_resets;
     uint64_t reset_why[5];    /* cache drops: full flush, TLBI by ASID, TLBI user VA, TLBI kernel VA, code change */
     uint64_t why[6];          /* dispatcher entries by cause: chain fill, kick, exception/sysreg, interrupt, cached target, cache miss */
+    uint64_t miss_kind[7];    /* cache misses by the branch that missed: RET, BR/BLR, B/BL, conditional, MSR, other, unknown */
+    uint64_t recent[16];      /* debugging: the last blocks the dispatcher entered (pc | el) */
+    uint64_t nrecent;
     uint64_t translate_ticks, translated_insns, translated_words; /* time spent translating, guest and host code size */
     uint64_t retrans_va, retrans_vapa; /* translations of a VA (and VA+PA) translated before: diagnostics */
     uint64_t helper[12];      /* by HV_OP_* */
@@ -101,7 +104,14 @@ typedef struct HvMachine {
     uint32_t nslots;
     HvCpu *cpu;              /* the CPU, so device and invalidation code can ask it to leave */
     uint64_t *ijc;           /* indirect-branch cache tables (cpu->ijc points here) */
-    uint64_t ijc_pages[2][1024]; /* hashed bitmap of the pages cached targets are in, so most TLBIs can leave the cache alone */
+    uint64_t ijc_pages[2][1024]; /* hashed bitmap of the user pages any process cached targets in (for all-ASID TLBIs) */
+    /* Hashed bitmap of (page, salt) pairs with cached targets: a TLBI for one
+       address space drops its entries only if that address space cached
+       something in the page. A new salt makes old bits meaningless, so this is
+       only cleared (with the whole cache) when it gets an eighth full. */
+    uint64_t ijc_keyed[1 << 14];
+    uint32_t ijc_keyed_count;
+    uint32_t ijc_tables_used; /* bit per flags value whose table was ever filled */
     int stats_interval;  /* seconds between --stats lines, 0 = off */
     /* Device threads (disk I/O, graphics) wake the CPU out of WFI with hv_machine_wake. */
     pthread_mutex_t wake_mu;
