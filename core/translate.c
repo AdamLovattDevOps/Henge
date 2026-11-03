@@ -719,6 +719,35 @@ static void put_native_sysreg(Emit *e, uint32_t insn, int read) {
     unspill(e, &s, 1);
 }
 
+/* MRS/MSR of a PSTATE bit kept in cpu->pstate_extra at the same position as in the register. */
+static void put_pstate_bit(Emit *e, int rt, int bit, int read) {
+    uint32_t used = 1u << rt;
+    uint8_t s[3];
+    for (int i = 0; i < 3; i++) s[i] = pick(&used);
+    int t = s[0], u = s[1], v = s[2];
+    spill(e, s, 3);
+    put(e, LDR_X(t, 28, HV_CPU_PSTATE_EXTRA));
+    if (read) {
+        put(e, UBFM_X(t, t, bit, bit));                       /* ubfx t, t, #bit, #1 */
+        put(e, UBFM_X(t, t, (64 - bit) & 63, 63 - bit));      /* lsl t, t, #bit */
+        if (rt != 31) put(e, is_stolen(rt) ? STR_X(t, 28, slot_of(rt)) : MOV_X(rt, t));
+    } else {
+        int r = rt;
+        if (rt == 31) {
+            put(e, 0xd2800000u | v);                          /* movz v, #0 */
+            r = v;
+        } else if (is_stolen(rt)) {
+            put(e, LDR_X(v, 28, slot_of(rt)));
+            r = v;
+        }
+        put(e, 0xca000000u | (uint32_t)r << 16 | (uint32_t)t << 5 | (uint32_t)u); /* eor u, t, r */
+        put(e, UBFM_X(u, u, bit, bit));                       /* the bit that differs */
+        put(e, 0xca000000u | (uint32_t)u << 16 | (uint32_t)bit << 10 | (uint32_t)t << 5 | (uint32_t)t); /* eor t, t, u, lsl #bit */
+        put(e, STR_X(t, 28, HV_CPU_PSTATE_EXTRA));
+    }
+    unspill(e, s, 3);
+}
+
 static int translate_sysreg_inline(Emit *e, uint32_t insn) {
     if (((insn >> 19) & 3) == 0) return 0; /* MSR (immediate) */
     int read = (insn >> 21) & 1, rt = insn & 0x1f;
@@ -777,6 +806,10 @@ static int translate_sysreg_inline(Emit *e, uint32_t insn) {
         if (!read || !el1) return 0;
         put_const_to(e, rt, 4);
         return 1;
+    case SR(3, 3, 4, 2, 5): /* DIT: one bit of PSTATE, nothing depends on it here */
+    case SR(3, 3, 4, 2, 6): /* SSBS */
+        put_pstate_bit(e, rt, reg == SR(3, 3, 4, 2, 5) ? 24 : 12, read);
+        return 1;
     default:
         return 0;
     }
@@ -825,6 +858,22 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
             return 0;
         }
         put_helper(e, pc, insn, HV_OP_MSR); /* state blocks depend on may change */
+        if (((insn >> 19) & 3) == 0 && (e->flags & HV_BLOCK_EL1)) {
+            /* MSR SPSel/PAN, #imm at EL1: the flags of the next block are known, so
+               go to it through that flags' indirect-branch cache instead of the dispatcher. */
+            uint32_t op1 = (insn >> 16) & 7, op2 = (insn >> 5) & 7, imm = (insn >> 8) & 1;
+            uint32_t bit = op1 == 0 && op2 == 5 ? HV_BLOCK_SPX : op1 == 0 && op2 == 4 ? HV_BLOCK_PAN : 0;
+            if (bit) {
+                uint32_t flags = e->flags;
+                put(e, STP_X(0, 1, 28, 0));
+                put_lit(e, 0, pc + 4);
+                put(e, STR_X(0, 28, HV_CPU_PC));
+                e->flags = imm ? flags | bit : flags & ~bit;
+                put_ijc_jump(e);
+                e->flags = flags;
+                return 1;
+            }
+        }
         put_exit(e, pc + 4);
         return 1;
     case HV_INSN_SYS: {
@@ -840,7 +889,9 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
             return 0;
         }
         put_helper(e, pc, insn, HV_OP_SYS);
-        if (crn == 7 && crm != 1 && crm != 5) return 0; /* DC and AT continue; IC and TLBI leave */
+        /* DC and AT continue, and so does IC IVAU: invalidating code sets exit_req,
+           so the block leaves at its next exit if it mattered. IC IALLU and TLBI leave. */
+        if (crn == 7 && ((crm != 1 && crm != 5) || (op1 == 3 && crm == 5 && op2 == 1))) return 0;
         put_exit(e, pc + 4);
         return 1;
     }

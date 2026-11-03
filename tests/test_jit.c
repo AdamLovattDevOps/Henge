@@ -11,13 +11,14 @@ DECLARE_PROGRAM(simd_fp);
 DECLARE_PROGRAM(stolen);
 DECLARE_PROGRAM(pcrel);
 DECLARE_PROGRAM(long_block);
+DECLARE_PROGRAM(pstate_bits);
 DECLARE_PROGRAM(pac);
 extern const char jit_programs_begin[], jit_programs_finish[];
 
 static const TestProgram programs[] = {
     TEST_PROGRAM(arith),   TEST_PROGRAM(loop),   TEST_PROGRAM(condbr),
     TEST_PROGRAM(csel_ops), TEST_PROGRAM(bl_sub), TEST_PROGRAM(simd_fp),
-    TEST_PROGRAM(stolen),  TEST_PROGRAM(pcrel),  TEST_PROGRAM(long_block),
+    TEST_PROGRAM(stolen),  TEST_PROGRAM(pcrel),  TEST_PROGRAM(long_block), TEST_PROGRAM(pstate_bits),
 };
 
 int main(void) {

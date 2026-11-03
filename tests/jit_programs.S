@@ -218,6 +218,21 @@ pcrel_target:
 END pcrel
 
 // More instructions than one block holds.
+// DIT is a PSTATE bit the translator reads and writes inline; x6 and x7 live in the HvCpu.
+PROGRAM pstate_bits
+    movz x1, #0x100, lsl #16
+    msr dit, x1
+    mrs x2, dit
+    msr dit, xzr
+    mrs x3, dit
+    msr dit, x6
+    mrs x7, dit
+    orr x4, x7, #1
+    msr dit, x4
+    mrs x5, dit
+    msr dit, xzr
+END pstate_bits
+
 PROGRAM long_block
     mov x0, #0
     .rept 300

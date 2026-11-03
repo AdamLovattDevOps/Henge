@@ -77,14 +77,14 @@ static void save_png(id<MTLTexture> tex) {
     CGContextRef ctx = CGBitmapContextCreate(px.mutableBytes, width, height, 8, row, cs,
                                              kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
     CGImageRef img = CGBitmapContextCreateImage(ctx);
-    /* The latest frame, and one per 15 s named by seconds since start, to see when things happened. */
+    /* The latest frame, and one per 5 s named by seconds since start, to see when things happened. */
     static long last_minute = -1;
-    long minute = (long)(([NSDate timeIntervalSinceReferenceDate] - attach_time) / 15);
+    long minute = (long)(([NSDate timeIntervalSinceReferenceDate] - attach_time) / 5);
     NSString *latest = [NSString stringWithUTF8String:shot_path];
     NSMutableArray *paths = [NSMutableArray arrayWithObject:latest];
     if (minute != last_minute) {
         last_minute = minute;
-        [paths addObject:[[latest stringByDeletingPathExtension] stringByAppendingFormat:@"-%04lds.png", minute * 15]];
+        [paths addObject:[[latest stringByDeletingPathExtension] stringByAppendingFormat:@"-%04lds.png", minute * 5]];
     }
     for (NSString *path in paths) {
         CGImageDestinationRef dst =
