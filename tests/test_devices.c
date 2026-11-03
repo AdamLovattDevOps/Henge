@@ -291,7 +291,7 @@ static void test_virtio_blk(HvDisk *aux) {
     check("blk read completed", used_idx(ring), 1);
     check("blk read status", ram(status)[0], 0);
     check("blk read data", memcmp(ram(data), want, 1024), 0);
-    int line = 32 + VMAPPLE_IRQ_PCIE + slot % 4;
+    int line = 32 + VMAPPLE_IRQ_PCIE + slot;
     check("INTx raised", board.gic->level[line], 1);
     check("ISR", rd8(bar + 0x1000), 1);
     check("ISR read drops INTx", board.gic->level[line], 0);

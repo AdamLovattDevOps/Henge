@@ -1,6 +1,8 @@
 #include "pvg.h"
 
+#import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
+#import <QuartzCore/QuartzCore.h>
 #import <ImageIO/ImageIO.h>
 #import <Metal/Metal.h>
 #import <ParavirtualizedGraphics/ParavirtualizedGraphics.h>
@@ -100,8 +102,36 @@ static void save_png(id<MTLTexture> tex) {
     CGColorSpaceRelease(cs);
 }
 
+static CAMetalLayer *window_layer; /* --window: where frames go */
+
+/* Draw the current frame into the window: render into a texture, copy it to the drawable. */
+static void show_frame(void) {
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                  width:width
+                                                                                 height:height
+                                                                              mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
+    td.storageMode = MTLStorageModePrivate;
+    static id<MTLTexture> tex;
+    if (!tex || tex.width != width || tex.height != height) tex = [mtl newTextureWithDescriptor:td];
+    if (!CGSizeEqualToSize(window_layer.drawableSize, CGSizeMake(width, height)))
+        window_layer.drawableSize = CGSizeMake(width, height);
+    id<CAMetalDrawable> drawable = [window_layer nextDrawable];
+    if (!drawable) return;
+    id<MTLCommandBuffer> cb = [mtl_queue commandBuffer];
+    if (![pgdisp encodeCurrentFrameToCommandBuffer:cb texture:tex region:MTLRegionMake2D(0, 0, width, height)]) return;
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    [blit copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+               sourceSize:MTLSizeMake(width, height, 1) toTexture:drawable.texture destinationSlice:0
+         destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [blit endEncoding];
+    [cb presentDrawable:drawable];
+    [cb commit];
+}
+
 static void new_frame(void) {
     atomic_fetch_add(&frames, 1);
+    if (window_layer) show_frame();
     double now = [NSDate timeIntervalSinceReferenceDate];
     if (!shot_path || now - last_shot < 3.0) return;
     last_shot = now;
@@ -218,4 +248,184 @@ int hv_pvg_attach(HvVmapple *b, const char *screenshot) {
     swap_handlers("gfx", gfx_read, gfx_write);
     swap_handlers("iosurface", iosfc_read, iosfc_write);
     return 0;
+}
+
+/* ---- --window: a Mac window showing the display, with keyboard and mouse ---- */
+
+/* macOS virtual key codes (kVK_*) to Linux input key codes. */
+static const uint16_t keymap[128] = {
+    [0x00] = 30,  [0x01] = 31,  [0x02] = 32,  [0x03] = 33,  [0x04] = 35,  [0x05] = 34,  [0x06] = 44,  [0x07] = 45,
+    [0x08] = 46,  [0x09] = 47,  [0x0a] = 86,  [0x0b] = 48,  [0x0c] = 16,  [0x0d] = 17,  [0x0e] = 18,  [0x0f] = 19,
+    [0x10] = 21,  [0x11] = 20,  [0x12] = 2,   [0x13] = 3,   [0x14] = 4,   [0x15] = 5,   [0x16] = 7,   [0x17] = 6,
+    [0x18] = 13,  [0x19] = 10,  [0x1a] = 8,   [0x1b] = 12,  [0x1c] = 9,   [0x1d] = 11,  [0x1e] = 27,  [0x1f] = 24,
+    [0x20] = 22,  [0x21] = 26,  [0x22] = 23,  [0x23] = 25,  [0x24] = 28,  [0x25] = 38,  [0x26] = 36,  [0x27] = 40,
+    [0x28] = 37,  [0x29] = 39,  [0x2a] = 43,  [0x2b] = 51,  [0x2c] = 53,  [0x2d] = 49,  [0x2e] = 50,  [0x2f] = 52,
+    [0x30] = 15,  [0x31] = 57,  [0x32] = 41,  [0x33] = 14,  [0x35] = 1,   [0x36] = 126, [0x37] = 125, [0x38] = 42,
+    [0x39] = 58,  [0x3a] = 56,  [0x3b] = 29,  [0x3c] = 54,  [0x3d] = 100, [0x3e] = 97,  [0x40] = 187, [0x41] = 83,
+    [0x43] = 55,  [0x45] = 78,  [0x47] = 69,  [0x48] = 115, [0x49] = 114, [0x4a] = 113, [0x4b] = 98,  [0x4c] = 96,
+    [0x4e] = 74,  [0x4f] = 188, [0x50] = 189, [0x51] = 117, [0x52] = 82,  [0x53] = 79,  [0x54] = 80,  [0x55] = 81,
+    [0x56] = 75,  [0x57] = 76,  [0x58] = 77,  [0x59] = 71,  [0x5b] = 72,  [0x5c] = 73,  [0x60] = 63,  [0x61] = 64,
+    [0x62] = 65,  [0x63] = 61,  [0x64] = 66,  [0x65] = 67,  [0x67] = 87,  [0x69] = 183, [0x6a] = 186, [0x6b] = 184,
+    [0x6d] = 68,  [0x6f] = 88,  [0x71] = 185, [0x72] = 110, [0x73] = 102, [0x74] = 104, [0x75] = 111, [0x76] = 62,
+    [0x77] = 107, [0x78] = 60,  [0x79] = 109, [0x7a] = 59,  [0x7b] = 105, [0x7c] = 106, [0x7d] = 108, [0x7e] = 103,
+};
+
+static void key(uint16_t mac, int down) {
+    if (mac >= 128 || !keymap[mac]) return;
+    hv_virtio_input_send(board->keyboard, HV_EV_KEY, keymap[mac], down);
+    hv_virtio_input_send(board->keyboard, HV_EV_SYN, 0, 0);
+}
+
+@interface HVView : NSView
+@property BOOL captured;
+@end
+
+@implementation HVView {
+    NSUInteger held_modifiers; /* bit per modifier key code, to tell presses from releases */
+}
+- (BOOL)acceptsFirstResponder { return YES; }
+- (BOOL)wantsUpdateLayer { return YES; }
+- (CALayer *)makeBackingLayer { return window_layer; }
+
+- (void)setCapture:(BOOL)on {
+    if (on == self.captured) return;
+    self.captured = on;
+    CGAssociateMouseAndMouseCursorPosition(!on);
+    if (on) {
+        [NSCursor hide];
+        /* Keep the (frozen) host pointer over the window so clicks stay ours. */
+        NSRect r = [self.window convertRectToScreen:[self convertRect:self.bounds toView:nil]];
+        CGFloat top = NSScreen.screens.firstObject.frame.size.height;
+        CGWarpMouseCursorPosition(CGPointMake(NSMidX(r), top - NSMidY(r)));
+    } else {
+        [NSCursor unhide];
+    }
+    self.window.title = on ? @"HengeVM — press Control+Option to release the mouse" : @"HengeVM — click to use the mouse";
+}
+
+- (void)keyDown:(NSEvent *)e {
+    if (!e.isARepeat) key(e.keyCode, 1);
+}
+- (void)keyUp:(NSEvent *)e { key(e.keyCode, 0); }
+- (void)flagsChanged:(NSEvent *)e {
+    uint16_t k = e.keyCode;
+    if (k == 0x39) { /* Caps Lock reports each toggle: tap it */
+        key(k, 1);
+        key(k, 0);
+    } else if (k < 64) {
+        NSUInteger bit = (NSUInteger)1 << k;
+        int down = !(held_modifiers & bit);
+        held_modifiers ^= bit;
+        key(k, down);
+    }
+    NSEventModifierFlags f = e.modifierFlags;
+    if (self.captured && (f & NSEventModifierFlagControl) && (f & NSEventModifierFlagOption)) {
+        /* Release the guest's Control and Option too, so they do not stay down there. */
+        for (uint16_t mk = 0x3a; mk <= 0x3e; mk++)
+            if (held_modifiers & ((NSUInteger)1 << mk)) {
+                held_modifiers &= ~((NSUInteger)1 << mk);
+                key(mk, 0);
+            }
+        [self setCapture:NO];
+    }
+}
+
+- (void)moved:(NSEvent *)e {
+    if (!self.captured) return;
+    int dx = (int)lround(e.deltaX), dy = (int)lround(e.deltaY);
+    if (!dx && !dy) return;
+    if (dx) hv_virtio_input_send(board->mouse, HV_EV_REL, HV_REL_X, dx);
+    if (dy) hv_virtio_input_send(board->mouse, HV_EV_REL, HV_REL_Y, dy);
+    hv_virtio_input_send(board->mouse, HV_EV_SYN, 0, 0);
+}
+- (void)button:(uint16_t)code down:(int)down {
+    hv_virtio_input_send(board->mouse, HV_EV_KEY, code, down);
+    hv_virtio_input_send(board->mouse, HV_EV_SYN, 0, 0);
+}
+- (void)mouseMoved:(NSEvent *)e { [self moved:e]; }
+- (void)mouseDragged:(NSEvent *)e { [self moved:e]; }
+- (void)rightMouseDragged:(NSEvent *)e { [self moved:e]; }
+- (void)otherMouseDragged:(NSEvent *)e { [self moved:e]; }
+- (void)mouseDown:(NSEvent *)e {
+    if (!self.captured) { /* the first click only takes the mouse */
+        [self setCapture:YES];
+        return;
+    }
+    [self button:HV_BTN_LEFT down:1];
+}
+- (void)mouseUp:(NSEvent *)e {
+    if (self.captured) [self button:HV_BTN_LEFT down:0];
+}
+- (void)rightMouseDown:(NSEvent *)e {
+    if (self.captured) [self button:HV_BTN_RIGHT down:1];
+}
+- (void)rightMouseUp:(NSEvent *)e {
+    if (self.captured) [self button:HV_BTN_RIGHT down:0];
+}
+- (void)otherMouseDown:(NSEvent *)e {
+    if (self.captured) [self button:HV_BTN_MIDDLE down:1];
+}
+- (void)otherMouseUp:(NSEvent *)e {
+    if (self.captured) [self button:HV_BTN_MIDDLE down:0];
+}
+- (void)scrollWheel:(NSEvent *)e {
+    if (!self.captured) return;
+    /* Wheel clicks; trackpads give fine deltas, so gather them into whole steps. */
+    static double acc_y, acc_x;
+    acc_y += e.hasPreciseScrollingDeltas ? e.scrollingDeltaY / 10.0 : e.scrollingDeltaY;
+    acc_x += e.hasPreciseScrollingDeltas ? e.scrollingDeltaX / 10.0 : e.scrollingDeltaX;
+    int sy = (int)acc_y, sx = (int)acc_x;
+    acc_y -= sy;
+    acc_x -= sx;
+    if (sy) hv_virtio_input_send(board->mouse, HV_EV_REL, HV_REL_WHEEL, sy);
+    if (sx) hv_virtio_input_send(board->mouse, HV_EV_REL, HV_REL_HWHEEL, -sx);
+    if (sy || sx) hv_virtio_input_send(board->mouse, HV_EV_SYN, 0, 0);
+}
+@end
+
+@interface HVWindowDelegate : NSObject <NSWindowDelegate>
+@end
+@implementation HVWindowDelegate
+- (void)windowDidResignKey:(NSNotification *)n {
+    HVView *v = (HVView *)((NSWindow *)n.object).contentView;
+    [v setCapture:NO];
+}
+- (void)windowWillClose:(NSNotification *)n {
+    (void)n;
+    exit(0);
+}
+@end
+
+void hv_pvg_window_run(void) {
+    @autoreleasepool {
+        NSApplication *app = NSApplication.sharedApplication;
+        app.activationPolicy = NSApplicationActivationPolicyRegular;
+        window_layer = [CAMetalLayer layer];
+        window_layer.device = mtl;
+        window_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        window_layer.framebufferOnly = NO;
+        window_layer.drawableSize = CGSizeMake(width, height);
+        window_layer.contentsGravity = kCAGravityResizeAspect;
+        /* Half the guest's pixels in points: 1:1 on a Retina screen. */
+        NSRect frame = NSMakeRect(0, 0, width / 2.0, height / 2.0);
+        NSWindow *w = [[NSWindow alloc] initWithContentRect:frame
+                                                  styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                                                            NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
+                                                    backing:NSBackingStoreBuffered
+                                                      defer:NO];
+        HVView *v = [[HVView alloc] initWithFrame:frame];
+        v.wantsLayer = YES;
+        w.contentView = v;
+        w.contentAspectRatio = NSMakeSize(width, height);
+        w.acceptsMouseMovedEvents = YES;
+        static HVWindowDelegate *delegate;
+        delegate = [HVWindowDelegate new];
+        w.delegate = delegate;
+        w.title = @"HengeVM — click to use the mouse";
+        [w center];
+        [w makeKeyAndOrderFront:nil];
+        [w makeFirstResponder:v];
+        [app activateIgnoringOtherApps:YES];
+        [app run];
+    }
 }

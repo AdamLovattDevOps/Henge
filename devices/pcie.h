@@ -29,7 +29,7 @@ typedef struct HvPcie {
     HvMachine *m;
     HvGic *gic;
     int intx_base;            /* INTID of INTx line 0 */
-    int line_count[4];
+    int line_count[HV_PCI_SLOTS];
     HvPciDev *dev[HV_PCI_SLOTS];
     HvPciDev bridge;
     uint64_t mmio_base, mmio_size;

@@ -57,8 +57,10 @@ void hv_pci_set_intx(HvPciDev *d, int level) {
     put16(d->config + PCI_STATUS, level ? status | STATUS_INTX : status & ~STATUS_INTX);
     if (eff == d->intx) return;
     d->intx = eff;
-    /* gpex swizzle: INTA of slot s is line s % 4 */
-    int line = d->slot % 4;
+    /* Apple's pcie,vmapple1 has no interrupt-map: the kernel takes slot s's INTx
+       as interrupt-base + s (QEMU's gpex would swizzle to s % 4; the two agree
+       only for slots 0-3). */
+    int line = d->slot;
     p->line_count[line] += eff ? 1 : -1;
     update_line(p, line);
 }

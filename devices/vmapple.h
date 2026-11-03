@@ -12,6 +12,7 @@
 #include "pl061.h"
 #include "pl031.h"
 #include "virtio_blk.h"
+#include "virtio_input.h"
 #include "virtio_net.h"
 
 /* The virtual Mac: QEMU's vmapple memory map and interrupt numbers (hw/vmapple/vmapple.c). */
@@ -56,6 +57,7 @@ typedef struct HvVmapple {
     HvAes *aes;
     HvVirtioBlk *aux_blk, *root_blk;
     HvVirtioNet *net;
+    HvVirtioInput *keyboard, *mouse;
     uint8_t *cfg, *rom, *ram;
     uint64_t ram_size;
     uint64_t panic_events;   /* last pvpanic event the guest reported */

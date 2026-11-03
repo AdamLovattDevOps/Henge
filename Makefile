@@ -7,7 +7,7 @@ CORE = $(B)/classify.o $(B)/operands.o $(B)/translate.o $(B)/dispatch.o $(B)/mmu
        $(B)/exception.o $(B)/sysreg.o $(B)/machine.o
 HOST = $(B)/jit_region.o $(B)/enter.o $(B)/disk.o
 DEV = $(B)/gicv3.o $(B)/timer.o $(B)/pl011.o $(B)/pl031.o $(B)/cfg.o $(B)/bdif.o $(B)/pcie.o \
-      $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_net.o $(B)/vmapple.o $(B)/aes.o $(B)/pl061.o
+      $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_net.o $(B)/virtio_input.o $(B)/vmapple.o $(B)/aes.o $(B)/pl061.o
 ENGINE = $(CORE) $(HOST)
 
 TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
@@ -28,7 +28,8 @@ $(B)/pvg_mac.o: devices/pvg_mac.m devices/*.h core/*.h | $(B)
 
 $(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o
 	$(CC) $(CFLAGS) host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o -framework ParavirtualizedGraphics -framework Metal \
-	    -framework Foundation -framework CoreGraphics -framework ImageIO -framework CoreFoundation -o $@
+	    -framework Foundation -framework CoreGraphics -framework ImageIO -framework CoreFoundation \
+	    -framework AppKit -framework QuartzCore -o $@
 
 $(B)/%.o: core/%.c core/*.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@

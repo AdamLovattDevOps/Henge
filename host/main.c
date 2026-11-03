@@ -69,6 +69,33 @@ static void *kicker_thread(void *unused) {
     return NULL;
 }
 
+/* Debugging: HV_TYPE_AT=seconds types "abc" then, to check input end to end without a window. */
+static void *type_thread(void *unused) {
+    (void)unused;
+    sleep((unsigned)atoi(getenv("HV_TYPE_AT")));
+    for (int i = 0; i < 40; i++) { /* the pointer: up and to the left, so it shows */
+        hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_X, -10);
+        hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_Y, -6);
+        hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+        usleep(20000);
+    }
+    static const uint16_t keys[3] = {30, 48, 46}; /* a, b, c */
+    for (int i = 0; i < 3; i++) {
+        hv_virtio_input_send(board.keyboard, HV_EV_KEY, keys[i], 1);
+        hv_virtio_input_send(board.keyboard, HV_EV_SYN, 0, 0);
+        usleep(100000);
+        hv_virtio_input_send(board.keyboard, HV_EV_KEY, keys[i], 0);
+        hv_virtio_input_send(board.keyboard, HV_EV_SYN, 0, 0);
+        usleep(700000);
+    }
+    for (int i = 0; i < 10; i++) {
+        sleep(2);
+        fprintf(stderr, "hengevm: typed abc: keyboard delivered %llu of 12 events, mouse %llu\n",
+                (unsigned long long)board.keyboard->delivered, (unsigned long long)board.mouse->delivered);
+    }
+    return NULL;
+}
+
 static void *cpu_thread(void *unused) {
     (void)unused;
     RunArgs *a = &run_args;
@@ -130,7 +157,7 @@ static void *cpu_thread(void *unused) {
 }
 
 static void usage(void) {
-    fprintf(stderr, "usage: hengevm --rom FILE --disk FILE --aux FILE --ecid N [--seed N] [--ram MB] [--log N] [--trace 1] [--screenshot PNG] [--watch VA] [--stats SECONDS [--profile 1]] [--no-pvg] [--no-chain] [--break PC [--break-hits N]] [--dump PA LEN FILE] [--aux-offset BYTES]\n");
+    fprintf(stderr, "usage: hengevm --rom FILE --disk FILE --aux FILE --ecid N [--seed N] [--ram MB] [--log N] [--trace 1] [--screenshot PNG] [--watch VA] [--stats SECONDS [--profile 1]] [--window] [--no-pvg] [--no-chain] [--break PC [--break-hits N]] [--dump PA LEN FILE] [--aux-offset BYTES]\n");
     exit(2);
 }
 
@@ -140,10 +167,14 @@ int main(int argc, char **argv) {
     int log = 1, trace = 0, use_pvg = 1, no_chain = 0;
     const char *screenshot = NULL;
     uint64_t watch = 0, watch_pa = 0;
-    int stats = 0, profile = 0;
+    int stats = 0, profile = 0, window = 0;
     uint64_t brk = ~0ull, brk_hits = 1, dump_pa = 0, dump_len = 0;
     const char *dump_path = NULL;
     for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--window")) {
+            window = 1;
+            continue;
+        }
         if (!strcmp(argv[i], "--no-pvg")) {
             use_pvg = 0;
             continue;
@@ -225,6 +256,11 @@ int main(int argc, char **argv) {
     pthread_create(&t, &attr, cpu_thread, NULL);
     pthread_t k;
     pthread_create(&k, NULL, kicker_thread, NULL);
+    if (getenv("HV_TYPE_AT")) {
+        pthread_t ty;
+        pthread_create(&ty, NULL, type_thread, NULL);
+    }
+    if (window && use_pvg) hv_pvg_window_run();
     CFRunLoopRun();
     return 0;
 }

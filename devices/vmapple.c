@@ -107,6 +107,8 @@ static uint64_t tick(HvMachine *m, HvCpu *cpu) {
     if (b->poll) b->poll();
     hv_virtio_blk_poll(b->root_blk);
     hv_virtio_blk_poll(b->aux_blk);
+    hv_virtio_input_poll(b->keyboard);
+    hv_virtio_input_poll(b->mouse);
     return deadline; /* every GIC state change already updated the CPU's lines */
 }
 
@@ -144,6 +146,8 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
     if (aux) b->aux_blk = hv_virtio_blk_create(m, b->pcie, aux, HV_VBLK_AUX);
     if (root) b->root_blk = hv_virtio_blk_create(m, b->pcie, root, HV_VBLK_ROOT);
     if (mac) b->net = hv_virtio_net_create(m, b->pcie, mac);
+    b->keyboard = hv_virtio_input_create(m, b->pcie, HV_VINPUT_KEYBOARD);
+    b->mouse = hv_virtio_input_create(m, b->pcie, HV_VINPUT_MOUSE);
 
     m->tick = tick;
     m->tick_opaque = b;

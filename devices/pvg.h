@@ -13,6 +13,10 @@
    Returns 0 on success. */
 int hv_pvg_attach(HvVmapple *b, const char *screenshot);
 
+/* Main thread, instead of its run loop: a window showing the display, with the
+   host keyboard and mouse going to the guest's virtio-input devices. Does not return. */
+void hv_pvg_window_run(void);
+
 /* Called from the CPU thread: delivers interrupts the framework raised. */
 void hv_pvg_poll(void);
 
