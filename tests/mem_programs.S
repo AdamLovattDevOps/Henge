@@ -299,6 +299,24 @@ PROGRAM dczva
     ldr x4, [x0, #128]
 END dczva
 
+// The end of a 16 KB page: accesses in its last bytes (the fast TLB check sends
+// them out of line to be rechecked exactly) and ones that run into the next page.
+PROGRAM pageend
+    add x1, x0, #3, lsl #12
+    add x1, x1, #4032
+    ldr x2, [x1, #56]
+    ldr w3, [x1, #60]
+    ldrb w4, [x1, #63]
+    ldp x5, x8, [x1, #48]
+    ldp x9, x10, [x1, #56]
+    ldur x11, [x1, #60]
+    stur x2, [x1, #61]
+    str w3, [x1, #60]
+    stp x4, x5, [x1, #56]
+    ldr x12, [x1, #56]
+    ldr x13, [x1, #64]
+END pageend
+
 PROGRAM mmio
     str w1, [x0]
     ldr w2, [x0, #4]

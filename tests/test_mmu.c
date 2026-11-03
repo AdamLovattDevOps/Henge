@@ -140,7 +140,7 @@ int main(void) {
     hv_mmu_access(&cpu, 0x100004000, HV_ACC_READ, 1, &pa);
     checks++;
     /* 0x40008000 is not RAM here, so nothing may be filled */
-    if (cpu.tlb[1][(0x100004000 >> 14) & (HV_TLB_SIZE - 1)].read_tag != ~0ull) {
+    if (cpu.tlb[1][(0x100004000 >> 14) & (HV_TLB_SIZE - 1)].read_tag != HV_TLB_INVALID) {
         printf("  FAIL TLB filled for non-RAM\n");
         failures++;
     }
@@ -159,7 +159,7 @@ int main(void) {
     hv_tlb_flush(&cpu);
     hv_mmu_access(&cpu, 0x12345678, HV_ACC_READ, 1, &pa);
     checks++;
-    if (cpu.tlb[1][(0x12345678 >> 14) & (HV_TLB_SIZE - 1)].read_tag != ~0ull) {
+    if (cpu.tlb[1][(0x12345678 >> 14) & (HV_TLB_SIZE - 1)].read_tag != HV_TLB_INVALID) {
         printf("  FAIL a 4K mapping went into the 16K TLB\n");
         failures++;
     }

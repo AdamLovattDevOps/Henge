@@ -123,7 +123,7 @@ void hv_tlb_flush(HvCpu *cpu) {
     if (cpu->m) cpu->m->stats.tlb_flushes++;
     hv_ijc_reset(cpu, 0); /* mappings changed: branch targets cached by VA are no longer trusted */
     hv_ijc_reset(cpu, 1);
-    memset(cpu->tlb, 0xff, sizeof cpu->tlb);
+    memset(cpu->tlb, 0x80, sizeof cpu->tlb);
     cpu->nuser_fills = 0;
 }
 
@@ -145,16 +145,16 @@ void hv_tlb_flush_user(HvCpu *cpu) {
     if (n <= HV_USER_FILLS) {
         for (uint32_t k = 0; k < n; k++) {
             HvTlbEntry *e = &cpu->tlb[0][0] + cpu->user_fills[k];
-            uint64_t tag = e->read_tag != ~0ull ? e->read_tag : e->exec_tag != ~0ull ? e->exec_tag : e->write_tag;
-            if (tag != ~0ull && !((tag >> 55) & 1)) memset(e, 0xff, sizeof *e); /* the slot may hold a kernel page by now */
+            uint64_t tag = e->read_tag != HV_TLB_INVALID ? e->read_tag + HV_TLB_ADJ : e->exec_tag != HV_TLB_INVALID ? e->exec_tag : e->write_tag + HV_TLB_ADJ;
+            if (e->read_tag != HV_TLB_INVALID || e->exec_tag != HV_TLB_INVALID || e->write_tag != HV_TLB_INVALID) if (!((tag >> 55) & 1)) memset(e, 0x80, sizeof *e); /* the slot may hold a kernel page by now */
         }
         return;
     }
     for (int t = 0; t < 3; t++)
         for (uint32_t i = 0; i < HV_TLB_SIZE; i++) {
             HvTlbEntry *e = &cpu->tlb[t][i];
-            uint64_t tag = e->read_tag != ~0ull ? e->read_tag : e->exec_tag != ~0ull ? e->exec_tag : e->write_tag;
-            if (tag != ~0ull && !((tag >> 55) & 1)) memset(e, 0xff, sizeof *e);
+            uint64_t tag = e->read_tag != HV_TLB_INVALID ? e->read_tag + HV_TLB_ADJ : e->exec_tag != HV_TLB_INVALID ? e->exec_tag : e->write_tag + HV_TLB_ADJ;
+            if (e->read_tag != HV_TLB_INVALID || e->exec_tag != HV_TLB_INVALID || e->write_tag != HV_TLB_INVALID) if (!((tag >> 55) & 1)) memset(e, 0x80, sizeof *e);
         }
 }
 
@@ -164,8 +164,8 @@ void hv_tlb_protect_code(HvCpu *cpu, const uint8_t *host_page) {
     for (int t = 0; t < 3; t++)
         for (uint32_t i = 0; i < HV_TLB_SIZE; i++) {
             HvTlbEntry *e = &cpu->tlb[t][i];
-            if (e->write_tag != ~0ull && (const uint8_t *)(uintptr_t)(e->write_tag + e->addend) == host_page)
-                e->write_tag = ~0ull;
+            if (e->write_tag != HV_TLB_INVALID && (const uint8_t *)(uintptr_t)(e->write_tag + HV_TLB_ADJ + e->addend) == host_page)
+                e->write_tag = HV_TLB_INVALID;
         }
 }
 
@@ -178,7 +178,7 @@ void hv_tlb_flush_va(HvCpu *cpu, uint64_t va) {
     if (cpu->m && (cpu->m->ijc_pages[kernel][h >> 6] >> (h & 63) & 1)) hv_ijc_reset(cpu, kernel);
     for (int el = 0; el < 3; el++) {
         HvTlbEntry *e = &cpu->tlb[el][idx];
-        memset(e, 0xff, sizeof *e);
+        memset(e, 0x80, sizeof *e);
     }
 }
 
@@ -198,14 +198,14 @@ static void tlb_fill(HvCpu *cpu, uint64_t va, int el, const HvWalk *w) {
         if (cpu->nuser_fills <= HV_USER_FILLS) cpu->nuser_fills++;
     }
     e->addend = (int64_t)((uint64_t)(uintptr_t)(ram->host + (page_pa - ram->pa)) - page_va);
-    e->read_tag = w->r ? page_va : ~0ull;
+    e->read_tag = w->r ? page_va - HV_TLB_ADJ : HV_TLB_INVALID;
     /* Writes to ROM or to pages we translated from take the slow path. */
-    e->write_tag = w->w && !ram->readonly && !ram->code_pages[pg] ? page_va : ~0ull;
+    e->write_tag = w->w && !ram->readonly && !ram->code_pages[pg] ? page_va - HV_TLB_ADJ : HV_TLB_INVALID;
     /* A watched page takes the slow path for every write. */
     if (cpu->m->watch_va && (cpu->m->watch_va & ~PAGE_MASK & 0x00ffffffffffffffull) == (page_va & 0x00ffffffffffffffull))
-        e->write_tag = ~0ull;
-    if (cpu->m->watch_pa && (cpu->m->watch_pa & ~PAGE_MASK) == page_pa) e->write_tag = ~0ull;
-    e->exec_tag = w->x ? page_va : ~0ull;
+        e->write_tag = HV_TLB_INVALID;
+    if (cpu->m->watch_pa && (cpu->m->watch_pa & ~PAGE_MASK) == page_pa) e->write_tag = HV_TLB_INVALID;
+    e->exec_tag = w->x ? page_va : HV_TLB_INVALID;
 }
 
 uint32_t hv_mmu_access(HvCpu *cpu, uint64_t va, HvAccess acc, int el, uint64_t *pa) {

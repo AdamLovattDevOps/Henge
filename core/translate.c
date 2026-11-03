@@ -32,6 +32,10 @@ typedef struct {
     uint8_t kind;
     uint8_t nrestore;
     uint8_t restore[4]; /* scratch registers to reload from cpu->spill first */
+    /* Loads and stores: redo the TLB check exactly (the fast one rejects an
+       access in a page's last HV_TLB_ADJ bytes) and go back if it passes. */
+    uint8_t recheck, addr, t, u, bytes;
+    uint32_t tag_off;
 } Ool;
 
 typedef struct {
@@ -478,8 +482,11 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
     int A = s[0], T = s[1], U = s[2];
     spill(e, s, 3);
 
-    /* Effective address into A. */
+    /* Effective address into A, or used where it is: a guest base register with nothing added. */
     int base_stolen = !literal && (op.rn == 31 || is_stolen(op.rn));
+    int direct = !literal && !base_stolen &&
+                 (op.mode == HV_ADDR_POST || ((op.mode == HV_ADDR_OFFSET || op.mode == HV_ADDR_PRE) && op.imm == 0));
+    int addr = direct ? op.rn : A;
     int base = op.rn;
     if (literal) {
         put_lit(e, A, pc + op.imm);
@@ -491,7 +498,7 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
         switch (op.mode) {
         case HV_ADDR_OFFSET:
         case HV_ADDR_PRE:
-            put_add_imm(e, A, base, op.imm);
+            if (!direct) put_add_imm(e, A, base, op.imm);
             break;
         case HV_ADDR_REG: {
             int rm = op.rm;
@@ -503,34 +510,41 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
             break;
         }
         default:
-            if (base != A) put(e, MOV_X(A, base));
+            if (!direct && base != A) put(e, MOV_X(A, base));
             break;
         }
     }
 
-    /* TLB: index from the first byte, tag check against the last one, so an
-       access that crosses into the next page misses. Uses no flags. */
+    /* TLB: index from the first byte; the tag check (see HvTlbEntry) also
+       makes an access that runs into the next page miss. Uses no flags. */
     int el_idx = op.unpriv || !(e->flags & HV_BLOCK_EL1) ? 0 : (e->flags & HV_BLOCK_PAN) ? 2 : 1;
     uint32_t tlb = HV_CPU_TLB;
-    put(e, UBFM_X(T, A, HV_TLB_PAGE_BITS, HV_TLB_PAGE_BITS + HV_TLB_BITS - 1));
+    put(e, UBFM_X(T, addr, HV_TLB_PAGE_BITS, HV_TLB_PAGE_BITS + HV_TLB_BITS - 1));
     put(e, ADD_LSL(T, 28, T, 5));
     /* EL1's table lies beyond a load's immediate range: step over EL0's. */
     if (el_idx) put(e, 0x91400000u | (uint32_t)((el_idx * HV_CPU_TLB_EL) >> 12) << 10 | T << 5 | T); /* add T, T, #table */
     put(e, LDR_X(U, T, tlb + (op.store ? 8 : 0)));
-    put(e, SUB_X(U, A, U));
+    put(e, SUB_X(U, addr, U));
     if (op.align && op.bytes > 1) {
-        /* and U, U, #~(0x3fff & ~(bytes-1)): zero only if same page and aligned */
+        /* and U, U, #~(0x3fff & ~(bytes-1)) after taking the adjustment back off:
+           zero only if same page and aligned */
         uint32_t k = __builtin_ctz(op.bytes);
+        put(e, 0xd1000000u | HV_TLB_ADJ << 10 | U << 5 | U); /* sub U, U, #ADJ */
         put(e, 0x92400000u | 50u << 16 | (49u + k) << 10 | U << 5 | U);
     } else {
-        if (op.bytes > 1) put_add_imm(e, U, U, op.bytes - 1);
+        if (op.bytes > HV_TLB_ADJ + 1) put_add_imm(e, U, U, op.bytes - 1 - HV_TLB_ADJ);
         put(e, UBFM_X(U, U, HV_TLB_PAGE_BITS, 63));
     }
     put(e, CBNZ_X(U));
-    put_ool(e, (Ool){.kind = OOL_SLOW, .pc = pc, .insn = insn, .nrestore = 3, .restore = {A, T, U}});
+    put_ool(e, (Ool){.kind = OOL_SLOW, .pc = pc, .insn = insn, .nrestore = 3, .restore = {A, T, U},
+                     .recheck = !(op.align && op.bytes > 1) && op.bytes <= HV_TLB_ADJ + 1, .addr = (uint8_t)addr,
+                     .t = (uint8_t)T, .u = (uint8_t)U, .bytes = (uint8_t)op.bytes,
+                     .tag_off = tlb + (op.store ? 8 : 0)});
     uint32_t slow = e->nool - 1;
     put(e, LDR_X(U, T, tlb + 24));
-    put(e, ADD_LSL(A, A, U, 0));
+    /* Single loads and stores take [addr, addend] directly; the rest want the host address in A. */
+    int reg_offset = op.kind == HV_MEM_SINGLE || op.kind == HV_MEM_LITERAL || op.kind == HV_MEM_LDRA;
+    if (!reg_offset) put(e, ADD_LSL(A, addr, U, 0));
 
     /* Stand-ins for x18/x28 operands: Rt (or Rs for RMW) in T, the other in U. */
     int rt = op.rt, rt2 = op.rt2, rs = op.rs;
@@ -567,7 +581,8 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
             size = op.size;
             opc = op.store ? 0 : op.sign == 64 ? 2 : op.sign == 32 ? 3 : 1;
         }
-        out = size << 30 | 0x39000000u | (uint32_t)op.vec << 26 | opc << 22 | A << 5 | rt;
+        /* LDR/STR (register), LSL #0: [addr, U] */
+        out = size << 30 | 0x38206800u | (uint32_t)op.vec << 26 | opc << 22 | (uint32_t)U << 16 | (uint32_t)addr << 5 | rt;
         break;
     }
     case HV_MEM_VEC_MULTI:
@@ -873,6 +888,15 @@ static void emit_ool(Emit *e) {
     for (uint32_t i = 0; i < e->nool; i++) {
         Ool *o = &e->ool[i];
         patch_branch(&e->w[o->at], (int64_t)e->n - o->at);
+        if (o->recheck) {
+            put(e, LDR_X(o->u, o->t, o->tag_off));
+            put(e, SUB_X(o->u, o->addr, o->u));
+            put_add_imm(e, o->u, o->u, (int64_t)o->bytes - 1 - HV_TLB_ADJ);
+            put(e, UBFM_X(o->u, o->u, HV_TLB_PAGE_BITS, 63));
+            put(e, CBNZ_X(o->u) | 2u << 5); /* cbnz u, +2: a real miss */
+            put(e, B_OP);
+            patch_branch(&e->w[e->n - 1], (int64_t)(o->at + 1) - (e->n - 1));
+        }
         unspill(e, o->restore, o->nrestore);
         if (o->kind == OOL_EXIT) {
             put_branch_exit(e, o->pc); /* only branches use OOL exits */

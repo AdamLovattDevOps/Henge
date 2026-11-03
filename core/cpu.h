@@ -6,9 +6,12 @@
 
 struct HvMachine;
 
-/* One software TLB entry. A tag is the guest VA of a 16 KB page, or all ones
-   when invalid (a page address never has its low bits set, so -1 never matches).
-   host = guest VA + addend. */
+/* One software TLB entry. host = guest VA + addend. The exec tag is the guest
+   VA of the 16 KB page. The read and write tags are that minus HV_TLB_ADJ, so
+   translated code checks "same page, and the access ends in it" for any access
+   of up to 16 bytes with one subtract and shift: VA - tag = offset + 15 must
+   be below 16 KB. (An access in a page's last 15 bytes takes the slow path.)
+   Invalid tags are HV_TLB_INVALID, which no address minus it brings near 0. */
 typedef struct HvTlbEntry {
     uint64_t read_tag;
     uint64_t write_tag;
@@ -17,6 +20,8 @@ typedef struct HvTlbEntry {
 } HvTlbEntry;
 
 #define HV_TLB_PAGE_BITS 14
+#define HV_TLB_ADJ 15
+#define HV_TLB_INVALID 0x8080808080808080ull /* what memset(0x80) leaves */
 #define HV_TLB_BITS 12 /* 4096 entries per EL: 64 MB of 16 KB pages */
 #define HV_TLB_SIZE (1u << HV_TLB_BITS)
 
