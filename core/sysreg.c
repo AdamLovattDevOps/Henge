@@ -99,6 +99,9 @@ static int read_reg(HvCpu *cpu, uint32_t reg, uint64_t *v) {
     case R(3, 0, 10, 2, 0): *v = cpu->mair_el1; return 0;
     case R(3, 0, 10, 3, 0): *v = cpu->amair_el1; return 0;
     case R(3, 0, 12, 0, 0): *v = cpu->vbar_el1; return 0;
+    case R(3, 0, 12, 1, 0): /* ISR_EL1: interrupts pending at the CPU, masked or not */
+        *v = (cpu->m && cpu->m->irq_line ? 1u << 7 : 0) | (cpu->m && cpu->m->fiq_line ? 1u << 6 : 0);
+        return 0;
     case R(3, 0, 13, 0, 1): *v = cpu->contextidr_el1; return 0;
     case R(3, 0, 13, 0, 4): *v = cpu->tpidr_el1; return 0;
     case R(3, 3, 13, 0, 2): *v = cpu->tpidr_el0; return 0;

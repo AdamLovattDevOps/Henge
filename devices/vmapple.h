@@ -44,6 +44,7 @@
 #define VMAPPLE_MSI_COUNT 64
 
 typedef struct HvVmapple {
+    uint64_t avp_rtc[8];     /* Apple virtual RTC control registers +0x00..+0x38 (only +0x18, +0x20, +0x38 are written) */
     HvMachine *m;
     HvCpu *cpu;
     HvGic *gic;

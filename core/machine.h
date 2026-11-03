@@ -1,6 +1,7 @@
 #ifndef HENGEVM_MACHINE_H
 #define HENGEVM_MACHINE_H
 
+#include <pthread.h>
 #include <stdint.h>
 
 #include "cpu.h"
@@ -100,6 +101,10 @@ typedef struct HvMachine {
     uint64_t *ijc;           /* indirect-branch cache tables (cpu->ijc points here) */
     uint64_t ijc_pages[2][1024]; /* hashed bitmap of the pages cached targets are in, so most TLBIs can leave the cache alone */
     int stats_interval;  /* seconds between --stats lines, 0 = off */
+    /* Device threads (disk I/O, graphics) wake the CPU out of WFI with hv_machine_wake. */
+    pthread_mutex_t wake_mu;
+    pthread_cond_t wake_cv;
+    int wake_pending;
     /* --profile: host PCs of the CPU thread sampled every millisecond, drained by the stats line. */
     uint64_t *prof;
     uint32_t prof_head, prof_tail;
@@ -124,5 +129,9 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len);
 int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len);
 
 void hv_cpu_reset(HvCpu *cpu, HvMachine *m);
+
+/* From any thread: device work is waiting for the CPU thread's tick. Makes a
+   running block leave and ends a WFI sleep. */
+void hv_machine_wake(HvMachine *m);
 
 #endif

@@ -124,6 +124,7 @@ void hv_tlb_flush(HvCpu *cpu) {
     hv_ijc_reset(cpu, 0); /* mappings changed: branch targets cached by VA are no longer trusted */
     hv_ijc_reset(cpu, 1);
     memset(cpu->tlb, 0xff, sizeof cpu->tlb);
+    cpu->nuser_fills = 0;
 }
 
 void hv_ijc_reset(HvCpu *cpu, int kernel) {
@@ -139,6 +140,16 @@ void hv_ijc_reset(HvCpu *cpu, int kernel) {
 void hv_tlb_flush_user(HvCpu *cpu) {
     if (cpu->m) cpu->m->stats.tlb_flushes++;
     hv_ijc_reset(cpu, 0); /* user VAs now name another process's code; the kernel's entries stay */
+    uint32_t n = cpu->nuser_fills;
+    cpu->nuser_fills = 0;
+    if (n <= HV_USER_FILLS) {
+        for (uint32_t k = 0; k < n; k++) {
+            HvTlbEntry *e = &cpu->tlb[0][0] + cpu->user_fills[k];
+            uint64_t tag = e->read_tag != ~0ull ? e->read_tag : e->exec_tag != ~0ull ? e->exec_tag : e->write_tag;
+            if (tag != ~0ull && !((tag >> 55) & 1)) memset(e, 0xff, sizeof *e); /* the slot may hold a kernel page by now */
+        }
+        return;
+    }
     for (int t = 0; t < 3; t++)
         for (uint32_t i = 0; i < HV_TLB_SIZE; i++) {
             HvTlbEntry *e = &cpu->tlb[t][i];
@@ -179,7 +190,13 @@ static void tlb_fill(HvCpu *cpu, uint64_t va, int el, const HvWalk *w) {
     if (page_pa < ram->pa || page_pa + PAGE_MASK + 1 - ram->pa > ram->size) return;
     uint64_t pg = (page_pa - ram->pa) >> HV_TLB_PAGE_BITS;
     uint64_t page_va = va & ~PAGE_MASK;
-    HvTlbEntry *e = &cpu->tlb[hv_tlb_table(cpu, el)][(va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1)];
+    int table = hv_tlb_table(cpu, el);
+    uint32_t slot = (uint32_t)(va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1);
+    HvTlbEntry *e = &cpu->tlb[table][slot];
+    if (!((page_va >> 55) & 1)) {
+        if (cpu->nuser_fills < HV_USER_FILLS) cpu->user_fills[cpu->nuser_fills] = (uint16_t)(table << HV_TLB_BITS | slot);
+        if (cpu->nuser_fills <= HV_USER_FILLS) cpu->nuser_fills++;
+    }
     e->addend = (int64_t)((uint64_t)(uintptr_t)(ram->host + (page_pa - ram->pa)) - page_va);
     e->read_tag = w->r ? page_va : ~0ull;
     /* Writes to ROM or to pages we translated from take the slow path. */

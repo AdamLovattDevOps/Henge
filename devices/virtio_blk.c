@@ -2,6 +2,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define F_SEG_MAX (1ull << 2)
 #define F_RO (1ull << 5)
@@ -18,8 +19,38 @@
 #define S_IOERR 1
 #define S_UNSUPP 2
 
-#define CHUNK (1u << 20)
+/* Disk I/O straight between the file and the guest's buffers: the
+   segments of one direction, skipping `off` bytes of them, `len` bytes in all.
+   Returns 0, or -1 on a host error or a buffer outside guest RAM. */
+static int seg_io(HvVirtioBlk *b, const HvVirtqElem *e, int writable, uint32_t off, uint64_t disk_off, uint32_t len) {
+    for (int s = 0; s < e->nseg && len; s++) {
+        const HvVirtqSeg *g = &e->seg[s];
+        if (g->write != writable) continue;
+        if (off >= g->len) {
+            off -= g->len;
+            continue;
+        }
+        uint32_t n = g->len - off;
+        if (n > len) n = len;
+        void *p = hv_phys_ptr(b->vio.m, g->addr + off, n);
+        if (!p) return -1;
+        int r = writable ? hv_disk_read(b->disk, disk_off, p, n) : hv_disk_write(b->disk, disk_off, p, n);
+        if (r != 0) return -1;
+        disk_off += n;
+        len -= n;
+        off = 0;
+    }
+    return len ? -1 : 0;
+}
 
+static uint32_t readable(const HvVirtqElem *e) {
+    uint32_t n = 0;
+    for (int s = 0; s < e->nseg; s++)
+        if (!e->seg[s].write) n += e->seg[s].len;
+    return n;
+}
+
+/* Worker thread. */
 static int handle(HvVirtioBlk *b, HvVirtqElem *e, uint32_t *written) {
     HvVirtio *v = &b->vio;
     struct { uint32_t type, reserved; uint64_t sector; } hdr;
@@ -28,28 +59,15 @@ static int handle(HvVirtioBlk *b, HvVirtqElem *e, uint32_t *written) {
     if (wlen < 1 || hv_virtq_read(v, e, 0, &hdr, sizeof hdr) != sizeof hdr) return -1;
     uint32_t data = wlen - 1; /* the status byte is the last writable one */
     uint8_t status = S_OK;
-    static uint8_t buf[CHUNK];
     switch (hdr.type) {
     case T_IN:
-        for (uint32_t done = 0; done < data && status == S_OK;) {
-            uint32_t n = data - done < CHUNK ? data - done : CHUNK;
-            if (hv_disk_read(b->disk, hdr.sector * 512 + done, buf, n) != 0) status = S_IOERR;
-            else hv_virtq_write(v, e, done, buf, n);
-            done += n;
-        }
-        if (status == S_OK) *written = data;
+        if (seg_io(b, e, 1, 0, hdr.sector * 512, data) != 0) status = S_IOERR;
+        else *written = data;
         break;
     case T_OUT: {
-        uint32_t off = sizeof hdr;
-        for (;;) {
-            uint32_t n = hv_virtq_read(v, e, off, buf, CHUNK);
-            if (!n) break;
-            if (hv_disk_write(b->disk, hdr.sector * 512 + (off - sizeof hdr), buf, n) != 0) {
-                status = S_IOERR;
-                break;
-            }
-            off += n;
-        }
+        uint32_t rlen = readable(e);
+        if (rlen < sizeof hdr || seg_io(b, e, 0, sizeof hdr, hdr.sector * 512, rlen - (uint32_t)sizeof hdr) != 0)
+            status = S_IOERR;
         break;
     }
     case T_FLUSH:
@@ -68,24 +86,60 @@ static int handle(HvVirtioBlk *b, HvVirtqElem *e, uint32_t *written) {
         status = S_UNSUPP;
         break;
     }
-    if (status != S_OK) b->errors++;
+    if (status != S_OK) __atomic_fetch_add(&b->errors, 1, __ATOMIC_RELAXED);
     hv_virtq_write(v, e, data, &status, 1);
     *written += 1;
     return 0;
 }
 
+static void *worker(void *opaque) {
+    HvVirtioBlk *b = opaque;
+    for (;;) {
+        pthread_mutex_lock(&b->mu);
+        while (b->completed == __atomic_load_n(&b->submitted, __ATOMIC_ACQUIRE)) pthread_cond_wait(&b->cv, &b->mu);
+        pthread_mutex_unlock(&b->mu);
+        HvVblkReq *r = &b->ring[b->completed % HV_VBLK_RING];
+        if (handle(b, &r->e, &r->written) != 0) r->written = 0;
+        __atomic_store_n(&b->completed, b->completed + 1, __ATOMIC_RELEASE); /* in order: a single worker */
+        hv_machine_wake(b->vio.m);
+    }
+    return NULL;
+}
+
+/* CPU thread: hand everything the driver made available to the worker, while the ring has room. */
 static void notify(HvVirtio *v, int q) {
     HvVirtioBlk *b = v->dev;
-    static HvVirtqElem e;
     int any = 0;
-    while (hv_virtq_pop(v, q, &e) > 0) {
-        uint32_t written;
-        if (handle(b, &e, &written) != 0) written = 0;
-        hv_virtq_push(v, q, &e, written);
-        b->requests++;
+    while (b->submitted - b->published < HV_VBLK_RING) {
+        HvVblkReq *r = &b->ring[b->submitted % HV_VBLK_RING];
+        if (hv_virtq_pop(v, q, &r->e) <= 0) break;
+        r->q = q;
+        pthread_mutex_lock(&b->mu);
+        __atomic_store_n(&b->submitted, b->submitted + 1, __ATOMIC_RELEASE);
+        pthread_mutex_unlock(&b->mu);
         any = 1;
     }
-    if (any) hv_virtio_interrupt(v);
+    if (any) pthread_cond_signal(&b->cv);
+}
+
+void hv_virtio_blk_drain(HvVirtioBlk *b) {
+    while (__atomic_load_n(&b->completed, __ATOMIC_ACQUIRE) != b->submitted) usleep(100);
+    hv_virtio_blk_poll(b);
+}
+
+void hv_virtio_blk_poll(HvVirtioBlk *b) {
+    if (!b) return;
+    uint32_t done = __atomic_load_n(&b->completed, __ATOMIC_ACQUIRE);
+    if (done == b->published) return;
+    int q = 0;
+    for (; b->published != done; b->published++) {
+        HvVblkReq *r = &b->ring[b->published % HV_VBLK_RING];
+        hv_virtq_push(&b->vio, r->q, &r->e, r->written);
+        q = r->q;
+        b->requests++;
+    }
+    hv_virtio_interrupt(&b->vio);
+    notify(&b->vio, q); /* requests that waited for room in the ring */
 }
 
 HvVirtioBlk *hv_virtio_blk_create(HvMachine *m, HvPcie *bus, HvDisk *disk, int apple_variant) {
@@ -95,6 +149,10 @@ HvVirtioBlk *hv_virtio_blk_create(HvMachine *m, HvPcie *bus, HvDisk *disk, int a
     v->dev = b;
     v->notify = notify;
     b->disk = disk;
+    b->ring = calloc(HV_VBLK_RING, sizeof *b->ring);
+    pthread_mutex_init(&b->mu, NULL);
+    pthread_cond_init(&b->cv, NULL);
+    pthread_create(&b->worker, NULL, worker, b);
     uint64_t capacity = disk->size / 512;
     uint32_t seg_max = HV_VIRTQ_MAX_SEGS - 2, blk_size = 512, apple_type = (uint32_t)apple_variant;
     uint16_t num_queues = 1;

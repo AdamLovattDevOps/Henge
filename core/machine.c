@@ -18,7 +18,17 @@ int hv_machine_init(HvMachine *m, size_t jit_bytes) {
     m->chain = 1;
     m->ijc = calloc(HV_IJC_TABLES * HV_IJC_TABLE_BYTES / 8, 8);
     m->slots = calloc(HV_MAX_SLOTS, sizeof *m->slots);
+    pthread_mutex_init(&m->wake_mu, NULL);
+    pthread_cond_init(&m->wake_cv, NULL);
     return m->ijc && m->slots ? 0 : -1;
+}
+
+void hv_machine_wake(HvMachine *m) {
+    if (m->cpu) __atomic_store_n(&m->cpu->exit_req, 1, __ATOMIC_RELAXED);
+    pthread_mutex_lock(&m->wake_mu);
+    m->wake_pending = 1;
+    pthread_cond_signal(&m->wake_cv);
+    pthread_mutex_unlock(&m->wake_mu);
 }
 
 void hv_machine_free(HvMachine *m) {

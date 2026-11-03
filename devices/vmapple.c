@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 
 #include "timer.h"
 
@@ -27,10 +28,22 @@ static void pvpanic_write(void *opaque, uint64_t off, uint64_t v, unsigned size)
 /* Not in QEMU's vmapple, which targets macOS 12 guests. iBootStage2 (Sequoia)
    reads 0x30240040 and uses its PL031 driver ("pl031-rtc") if the value is
    0xf001, or an Apple virtual RTC ("avp-rtc") otherwise. HengeVM has a PL031,
-   so it answers 0xf001; everything else here is logged so unknown use shows up. */
+   so it answers 0xf001. The kernel's AppleVirtualPlatformRTC uses the same
+   window: +0 is a 64-bit microsecond counter, and wall time is the counter
+   plus an offset the driver keeps in NVRAM ("AvpRtc", absent until the guest
+   sets the clock), so the counter is Unix time in microseconds. +0x18 bit 0
+   enables it, +0x20 is the interrupt control and +0x38 the alarm; they are
+   plain storage here (the driver arms no alarm). Anything else is logged. */
 static uint64_t rtc_select_read(void *opaque, uint64_t off, unsigned size) {
     HvVmapple *b = opaque;
     if (off == 0x40) return 0xf001;
+    if (off < 0x40 && !(off & 7) && off) return b->avp_rtc[off / 8];
+    if (off == 0 || off == 4) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        uint64_t us = (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000;
+        return off ? us >> 32 : size == 4 ? (uint32_t)us : us;
+    }
     if (b->m->log) fprintf(stderr, "hengevm: read of unknown register 0x%llx+%llx (size %u)\n",
                            (unsigned long long)VMAPPLE_RTC_SELECT, (unsigned long long)off, size);
     return 0;
@@ -38,6 +51,10 @@ static uint64_t rtc_select_read(void *opaque, uint64_t off, unsigned size) {
 
 static void rtc_select_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
     HvVmapple *b = opaque;
+    if (off && off < 0x40 && !(off & 7)) {
+        b->avp_rtc[off / 8] = v;
+        return;
+    }
     if (b->m->log) fprintf(stderr, "hengevm: write of unknown register 0x%llx+%llx = %llx (size %u)\n",
                            (unsigned long long)VMAPPLE_RTC_SELECT, (unsigned long long)off, (unsigned long long)v, size);
 }
@@ -88,6 +105,8 @@ static uint64_t tick(HvMachine *m, HvCpu *cpu) {
     uint64_t deadline = hv_timer_update(b->gic, cpu);
     hv_pl031_tick(b->rtc);
     if (b->poll) b->poll();
+    hv_virtio_blk_poll(b->root_blk);
+    hv_virtio_blk_poll(b->aux_blk);
     return deadline; /* every GIC state change already updated the CPU's lines */
 }
 

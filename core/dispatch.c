@@ -97,12 +97,12 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
 }
 
 /* Blocks call this through hv_helper_entry. Returns 1 to leave the block. */
-static uint32_t reg_hist[65536]; /* --stats: MRS/MSR/SYS by op0:op1:CRn:CRm:op2 */
+static uint64_t reg_hist[65536]; /* --stats: MRS/MSR/SYS by op0:op1:CRn:CRm:op2; reads low, writes high 32 bits */
 
 uint32_t hv_helper(HvCpu *cpu, const HvHelperInfo *info) {
     if (info->op < 12) cpu->m->stats.helper[info->op]++;
     if (cpu->m->stats_interval && (info->op == HV_OP_MRS || info->op == HV_OP_MSR || info->op == HV_OP_SYS))
-        reg_hist[(info->insn >> 5) & 0xffff] += info->op == HV_OP_MRS ? 1 : 0x10000;
+        reg_hist[(info->insn >> 5) & 0xffff] += info->op == HV_OP_MRS ? 1 : 1ull << 32;
     switch (info->op) {
     case HV_OP_MEM:
         cpu->m->stat_slow_mem++;
@@ -147,7 +147,14 @@ static int wait_for_interrupt(HvCpu *cpu) {
     uint64_t wait_ticks = deadline && deadline > now ? deadline - now : 240000; /* the counter runs at 24 MHz */
     if (wait_ticks > 240000) wait_ticks = 240000;
     uint64_t t0 = mach_absolute_time();
-    usleep((useconds_t)(wait_ticks / 24));
+    /* Sleep until the next timer event or until a device thread has work for us. */
+    pthread_mutex_lock(&m->wake_mu);
+    if (!m->wake_pending) {
+        struct timespec ts = {(time_t)(wait_ticks / 24000000), (long)(wait_ticks % 24000000) * 1000 / 24};
+        pthread_cond_timedwait_relative_np(&m->wake_cv, &m->wake_mu, &ts);
+    }
+    m->wake_pending = 0;
+    pthread_mutex_unlock(&m->wake_mu);
     m->stats.wfi++;
     m->stats.wfi_ticks += mach_absolute_time() - t0;
     m->tick(m, cpu);
@@ -266,14 +273,15 @@ static void print_stats(HvCpu *cpu, int force) {
     if (m->prof) print_profile(m);
     /* The five busiest system registers or SYS operations (reads + writes) this interval. */
     for (int k = 0; k < 5; k++) {
-        uint32_t best = 0, bi = 0;
+        uint64_t best = 0;
+        uint32_t bi = 0;
         for (uint32_t r = 0; r < 65536; r++) {
-            uint32_t n = (reg_hist[r] & 0xffff) + (reg_hist[r] >> 16);
+            uint64_t n = (reg_hist[r] & 0xffffffff) + (reg_hist[r] >> 32);
             if (n > best) best = n, bi = r;
         }
         if (!best) break;
-        fprintf(stderr, "   S%u_%u_C%u_C%u_%u: %u reads %u writes/sys\n", bi >> 14, (bi >> 11) & 7, (bi >> 7) & 15,
-                (bi >> 3) & 15, bi & 7, reg_hist[bi] & 0xffff, reg_hist[bi] >> 16);
+        fprintf(stderr, "   S%u_%u_C%u_C%u_%u: %.0f reads %.0f writes/sys per s\n", bi >> 14, (bi >> 11) & 7, (bi >> 7) & 15,
+                (bi >> 3) & 15, bi & 7, (double)(reg_hist[bi] & 0xffffffff) / dt, (double)(reg_hist[bi] >> 32) / dt);
         reg_hist[bi] = 0;
     }
     memset(reg_hist, 0, sizeof reg_hist);

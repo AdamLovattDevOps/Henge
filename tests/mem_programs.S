@@ -285,6 +285,20 @@ PROGRAM epilogue
 END epilogue
 
 // JIT only: x0 is a fake device. Every access must reach it, at its own size.
+// DC ZVA: an unaligned address (zeroes the 64-byte block around it), and Xt in x6/x15, which live in the HvCpu.
+PROGRAM dczva
+    add x1, x0, #100
+    dc zva, x1
+    add x6, x0, #4096
+    add x6, x6, #7
+    dc zva, x6
+    add x15, x0, #8192
+    dc zva, x15
+    ldr x2, [x0, #64]
+    ldr x3, [x0, #120]
+    ldr x4, [x0, #128]
+END dczva
+
 PROGRAM mmio
     str w1, [x0]
     ldr w2, [x0, #4]

@@ -22,7 +22,7 @@ typedef struct {
     uint32_t at, kind, idx;
 } LitFix;
 
-enum { OOL_EXIT, OOL_SLOW };
+enum { OOL_EXIT, OOL_SLOW, OOL_SYS };
 
 typedef struct {
     uint32_t at;        /* the branch that jumps here */
@@ -613,6 +613,47 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
     e->ool[slow].join = e->n;
 }
 
+/* DC ZVA: zero the 64-byte block holding Xt, on the host's own copy when the
+   TLB maps it writable (xnu's bzero does this a million times a second).
+   The host's DC ZVA block is 64 bytes too (checked at translation time);
+   a miss, a code page or a device takes the SYS helper. */
+static int host_zva_is_64(void) {
+    static int known = -1;
+    if (known < 0) {
+        uint64_t dczid;
+        __asm__ volatile("mrs %0, dczid_el0" : "=r"(dczid));
+        known = (dczid & 0x1f) == 4;
+    }
+    return known;
+}
+
+static void translate_dc_zva(Emit *e, uint32_t insn, uint64_t pc) {
+    int rt = insn & 0x1f;
+    uint32_t used = 1u << rt;
+    uint8_t s[3];
+    for (int i = 0; i < 3; i++) s[i] = pick(&used);
+    int A = s[0], T = s[1], U = s[2];
+    spill(e, s, 3);
+    if (is_stolen(rt)) put(e, LDR_X(A, 28, slot_of(rt)));
+    else put(e, MOV_X(A, rt)); /* rt 31 is XZR here */
+    put(e, 0x92400000u | 58u << 16 | 57u << 10 | A << 5 | A); /* and A, A, #~63 */
+    int el_idx = !(e->flags & HV_BLOCK_EL1) ? 0 : (e->flags & HV_BLOCK_PAN) ? 2 : 1;
+    put(e, UBFM_X(T, A, HV_TLB_PAGE_BITS, HV_TLB_PAGE_BITS + HV_TLB_BITS - 1));
+    put(e, ADD_LSL(T, 28, T, 5));
+    if (el_idx) put(e, 0x91400000u | (uint32_t)((el_idx * HV_CPU_TLB_EL) >> 12) << 10 | T << 5 | T);
+    put(e, LDR_X(U, T, HV_CPU_TLB + 8)); /* write tag */
+    put(e, SUB_X(U, A, U));
+    put(e, UBFM_X(U, U, HV_TLB_PAGE_BITS, 63));
+    put(e, CBNZ_X(U));
+    put_ool(e, (Ool){.kind = OOL_SYS, .pc = pc, .insn = insn, .nrestore = 3, .restore = {A, T, U}});
+    uint32_t slow = e->nool - 1;
+    put(e, LDR_X(U, T, HV_CPU_TLB + 24));
+    put(e, ADD_LSL(A, A, U, 0));
+    put(e, 0xd50b7420u | A); /* dc zva, A */
+    unspill(e, s, 3);
+    e->ool[slow].join = e->n;
+}
+
 /* System registers that are plain storage, or host registers that already
    hold the guest's value: MRS/MSR to these need no helper and do not end the
    block. Anything with side effects (DAIF, SPSel writes, the MMU, timers, GIC)
@@ -779,6 +820,10 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
         int dc_zva = op1 == 3 && crm == 4 && op2 == 1;
         int at = crm == 8 || crm == 9;
         if (crn == 7 && crm != 1 && crm != 5 && !dc_zva && !at) return 0;
+        if (dc_zva && !e->slow_mem && host_zva_is_64()) {
+            translate_dc_zva(e, insn, pc);
+            return 0;
+        }
         put_helper(e, pc, insn, HV_OP_SYS);
         if (crn == 7 && crm != 1 && crm != 5) return 0; /* DC and AT continue; IC and TLBI leave */
         put_exit(e, pc + 4);
@@ -832,7 +877,7 @@ static void emit_ool(Emit *e) {
         if (o->kind == OOL_EXIT) {
             put_branch_exit(e, o->pc); /* only branches use OOL exits */
         } else {
-            put_helper(e, o->pc, o->insn, HV_OP_MEM);
+            put_helper(e, o->pc, o->insn, o->kind == OOL_SYS ? HV_OP_SYS : HV_OP_MEM);
             put(e, B_OP);
             patch_branch(&e->w[e->n - 1], (int64_t)o->join - (e->n - 1));
         }

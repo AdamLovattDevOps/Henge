@@ -285,6 +285,7 @@ static void test_virtio_blk(HvDisk *aux) {
     ram(status)[0] = 0xff;
     offer(ring, 0);
     wr16(bar + 0x3000, 0);
+    hv_virtio_blk_drain(board.aux_blk); /* requests complete on the worker thread */
     static uint8_t want[1024];
     hv_disk_read(aux, 5 * 512, want, 1024);
     check("blk read completed", used_idx(ring), 1);
@@ -305,6 +306,7 @@ static void test_virtio_blk(HvDisk *aux) {
     put_desc(ring, 5, status, 1, 2, 0);
     offer(ring, 3);
     wr16(bar + 0x3000, 0);
+    hv_virtio_blk_drain(board.aux_blk); /* requests complete on the worker thread */
     uint8_t back[512];
     hv_disk_read(aux, 9 * 512, back, 512);
     check("blk write status", ram(status)[0], 0);
@@ -317,11 +319,13 @@ static void test_virtio_blk(HvDisk *aux) {
     put_desc(ring, 7, status, 1, 2, 0);
     offer(ring, 6);
     wr16(bar + 0x3000, 0);
+    hv_virtio_blk_drain(board.aux_blk); /* requests complete on the worker thread */
     check("Apple barrier OK", ram(status)[0], 0);
     h[0] = 77;
     memcpy(ram(hdr), h, 16);
     offer(ring, 6);
     wr16(bar + 0x3000, 0);
+    hv_virtio_blk_drain(board.aux_blk); /* requests complete on the worker thread */
     check("unknown request UNSUPP", ram(status)[0], 2);
     check("four requests used", used_idx(ring), 4);
     rd8(bar + 0x1000);
