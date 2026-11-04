@@ -1,18 +1,26 @@
 import SwiftUI
 
-/// The guest's boot framebuffer: what iBoot and the kernel draw before a GPU
-/// driver takes over (the Apple logo and the progress bar), refreshed a few
-/// times a second. iOS has no paravirtualized GPU, so this is all of the
-/// Mac's screen Henge can show for now.
+/// The Mac's screen, refreshed a few times a second: what its GPU draws once
+/// macOS is up. Before that, the boot framebuffer, which only ever holds the
+/// progress bar (a virtual Mac's firmware draws no logo into it), so the logo
+/// over it is the app's own.
 struct BootDisplay: View {
     @State private var image: CGImage?
 
     var body: some View {
-        Group {
+        ZStack {
+            Color.black
             if let image {
                 Image(decorative: image, scale: 1).resizable().interpolation(.medium).aspectRatio(contentMode: .fit)
+                if image.height > image.width {
+                    Image(systemName: "apple.logo")
+                        .font(.system(size: 44))
+                        .foregroundStyle(.white)
+                }
             } else {
-                Color.black
+                Image(systemName: "apple.logo")
+                    .font(.system(size: 44))
+                    .foregroundStyle(.white)
             }
         }
         .task {

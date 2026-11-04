@@ -68,6 +68,8 @@ targets:
           # On-device pairing for Built-in StikJIT (from Husk's src/rppairing-ios).
           - "-lhusk_rppairing"
           - "-framework"
+          - "Metal"
+          - "-framework"
           - "AudioToolbox"
           - "-framework"
           - "AVFAudio"

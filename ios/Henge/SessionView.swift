@@ -1,8 +1,6 @@
 import SwiftUI
 
-/// A running Mac. There is no screen yet: iOS has no ParavirtualizedGraphics,
-/// so the guest's display is still to come; this shows the machine's progress
-/// and the log instead.
+/// A running Mac: its screen, how it is doing, and the log. No keyboard or mouse yet.
 struct SessionView: View {
     let mac: VirtualMac
     let close: () -> Void
@@ -23,7 +21,6 @@ struct SessionView: View {
             List {
                 Section(phase) {
                     BootDisplay().aspectRatio(16.0 / 10.0, contentMode: .fit)
-                    Text("Only the boot screen shows so far.").font(.caption).foregroundStyle(.secondary)
                     if let error { Text(error).foregroundStyle(.red) }
                 }
                 Section("Status") { status }

@@ -51,6 +51,16 @@ struct HvPvgLite {
     int root_pending, iosfc_pending;
     uint64_t display_pa;
     uint64_t swaps;
+    uint32_t task_root[512]; /* page of each task's root, by the id in commands */
+    uint64_t task_objects[512], task_placement[512]; /* task offsets of its object lists */
+    uint8_t obj_seen[512][8192];
+    int tally;
+    uint64_t counts[6][256];
+    uint64_t execs, bad;
+    double last_tally;
+    HvPvgMetal *metal;
+    int metal_tried;
+    uint32_t stamps_pending; /* channels Metal finished, for the next poll */
 };
 
 /* What the guest's GetDeviceInfo asks for: key, value pairs, as the framework
@@ -85,6 +95,10 @@ static void do_root(HvPvgLite *p) {
             break;
         }
         if (p->log) fprintf(stderr, "hengevm: pvg-lite: root op %x len %x stamp %x\n", hdr[0], hdr[1], hdr[2]);
+        if ((hdr[0] & 0xffff) == 0x38 && hdr[1] >= 28) {
+            uint32_t *id = guest32(p, buf + off + (at + 12) % ring), *page = guest32(p, buf + off + (at + 24) % ring);
+            if (id && page && *id >> 1 < 512) p->task_root[*id >> 1] = *page;
+        }
         if ((hdr[0] & 0xffff) == 0x3a && hdr[1] >= 24) {
             uint32_t *count = guest32(p, buf + off + (at + 12) % ring), *page = guest32(p, buf + off + (at + 20) % ring);
             uint32_t *dst = page ? hv_phys_ptr(p->m, (uint64_t)*page << 14, sizeof device_info) : NULL;
@@ -161,17 +175,216 @@ static void display_swap(HvPvgLite *p, uint64_t mapping, const uint32_t *args) {
     if (p->log) fprintf(stderr, "hengevm: pvg-lite: swap %llu: mapping %llu\n", (unsigned long long)p->swaps, (unsigned long long)mapping);
 }
 
+/* Task memory: the root page holds {table page, depth}; each level has 4096
+   32-bit page numbers, so one level maps 64 MB. Returns a host pointer valid
+   to the end of the guest's 16 KB page. */
+static uint8_t *task_ptr(HvPvgLite *p, uint32_t task, uint64_t off, uint32_t *avail) {
+    if (task >= 512 || !p->task_root[task]) return NULL;
+    uint32_t *root = hv_phys_ptr(p->m, (uint64_t)p->task_root[task] << 14, 0x4000);
+    if (!root) return NULL;
+    uint32_t page = root[0], depth = root[1];
+    if (depth < 1 || depth > 3) return NULL;
+    uint64_t vpn = off >> 14;
+    for (int level = (int)depth - 1; level >= 0; level--) {
+        uint32_t *t = page ? hv_phys_ptr(p->m, (uint64_t)page << 14, 0x4000) : NULL;
+        if (!t) return NULL;
+        page = t[(vpn >> (12 * level)) & 0xfff] & 0x7fffffff; /* bit 31 is a flag */
+    }
+    if (!page) return NULL;
+    uint32_t in = (uint32_t)(off & 0x3fff);
+    if (avail) *avail = 0x4000 - in;
+    return hv_phys_ptr(p->m, ((uint64_t)page << 14) + in, 0x4000 - in);
+}
+
+static int task_read(HvPvgLite *p, uint32_t task, uint64_t off, void *to, uint32_t n) {
+    uint8_t *d = to;
+    while (n) {
+        uint32_t avail = 0;
+        uint8_t *q = task_ptr(p, task, off, &avail);
+        if (!q) return -1;
+        uint32_t c = n < avail ? n : avail;
+        memcpy(d, q, c);
+        d += c, off += c, n -= c;
+    }
+    return 0;
+}
+
+int hv_pvg_lite_task_read(HvPvgLite *p, uint32_t task, uint64_t offset, void *to, uint32_t length) {
+    return task_read(p, task, offset, to, length);
+}
+
+uint32_t hv_pvg_lite_task_page(HvPvgLite *p, uint32_t task, uint64_t offset) {
+    if (task >= 512 || !p->task_root[task]) return 0;
+    uint32_t *root = hv_phys_ptr(p->m, (uint64_t)p->task_root[task] << 14, 0x4000);
+    if (!root) return 0;
+    uint32_t page = root[0], depth = root[1];
+    if (depth < 1 || depth > 3) return 0;
+    uint64_t vpn = offset >> 14;
+    for (int level = (int)depth - 1; level >= 0; level--) {
+        uint32_t *t = page ? hv_phys_ptr(p->m, (uint64_t)page << 14, 0x4000) : NULL;
+        if (!t) return 0;
+        page = t[(vpn >> (12 * level)) & 0xfff] & 0x7fffffff;
+    }
+    return page;
+}
+
+uint8_t *hv_pvg_lite_page(HvPvgLite *p, uint32_t guest_page) {
+    return hv_phys_ptr(p->m, (uint64_t)guest_page << 14, 0x4000);
+}
+
+uint64_t hv_pvg_lite_task_objects(HvPvgLite *p, uint32_t task) {
+    return task < 512 ? p->task_objects[task] : 0;
+}
+
+/* A stamp Metal finished: the guest sees it and the next poll raises the interrupt. */
+void hv_pvg_lite_complete(HvPvgLite *p, uint32_t ch, uint32_t stamp) {
+    uint64_t buf = (uint64_t)reg(p, 0x1030) << 14;
+    uint32_t *s = buf ? guest32(p, buf + 4 * ch) : NULL;
+    if (s) __atomic_store_n(s, stamp, __ATOMIC_RELEASE);
+    __atomic_fetch_or(&p->stamps_pending, 1u << ch, __ATOMIC_RELEASE);
+    hv_machine_kick_all(p->m);
+}
+
+int hv_pvg_lite_frame(HvPvgLite *p, const uint8_t **pixels, uint32_t *width, uint32_t *height) {
+    return p && p->metal ? hv_pvg_metal_frame(p->metal, pixels, width, height) : -1;
+}
+
+static void tally_object(HvPvgLite *p, uint32_t task, uint32_t ref, const char *why) {
+    if (task >= 512 || ref >= 8192 || !ref || p->obj_seen[task][ref]) return;
+    p->obj_seen[task][ref] = 1;
+    uint32_t e[3] = {0}, pl[6] = {0};
+    if (task_read(p, task, p->task_objects[task] + ref * 12ull, e, 12)) return;
+    task_read(p, task, p->task_placement[task] + ref * 24ull, pl, 24);
+    uint64_t off = (uint64_t)e[2] << 32 | e[1];
+    uint32_t d[36] = {0};
+    int have = task_read(p, task, off, d, sizeof d) == 0;
+    fprintf(stderr, "pvgobj %s task %u ref %u entry %08x %08x %08x placement %08x %08x %08x %08x %08x %08x data(%d)", why, task, ref, e[0], e[1], e[2], pl[0], pl[1], pl[2], pl[3], pl[4], pl[5], have);
+    if (have) for (int i = 0; i < 36; i++) fprintf(stderr, " %08x", d[i]);
+    fprintf(stderr, "\n");
+}
+
+/* HV_PVG_TALLY: which serialized commands the guest uses. Encoder types: 0
+   render, 1 compute, 2 blit, 4 info. */
+static void tally_buffer(HvPvgLite *p, uint32_t task, uint64_t off, uint64_t len) {
+    uint32_t hdr[2];
+    uint64_t at = off, end = off + len;
+    if (task_read(p, task, at, hdr, 8)) {
+        if (p->bad++ < 6) {
+            uint32_t *root = task < 512 && p->task_root[task] ? hv_phys_ptr(p->m, (uint64_t)p->task_root[task] << 14, 0x4000) : NULL;
+            uint32_t *t0 = root ? hv_phys_ptr(p->m, (uint64_t)root[0] << 14, 0x4000) : NULL;
+            if (t0) {
+                fprintf(stderr, "pvgtally top:");
+                for (int i = 0; i < 8; i++) fprintf(stderr, " %x", t0[i]);
+                uint32_t *t1 = t0[0] ? hv_phys_ptr(p->m, (uint64_t)(t0[0] & 0x7fffffff) << 14, 0x4000) : NULL;
+                if (t1) {
+                    fprintf(stderr, " leaf[%llx]:", (unsigned long long)(off >> 14));
+                    for (int i = -2; i < 4; i++) fprintf(stderr, " %x", t1[(off >> 14) + i]);
+                }
+                fprintf(stderr, "\n");
+            }
+            fprintf(stderr, "pvgtally read failed: task %u off %llx len %llx root page %x root %x %x %x %x %x %x\n", task, (unsigned long long)off, (unsigned long long)len,
+                    task < 512 ? p->task_root[task] : 0, root ? root[0] : 0, root ? root[1] : 0, root ? root[2] : 0, root ? root[3] : 0, root ? root[4] : 0, root ? root[5] : 0);
+        }
+        return;
+    }
+    at += 8;
+    uint32_t type = hdr[1] & 0xff, cont = (hdr[1] >> 8) & 0xff;
+    if (type == 5) { /* protection options, then the real header */
+        at += 8;
+        if (task_read(p, task, at, hdr, 8)) { p->bad++; return; }
+        at += 8;
+        type = hdr[1] & 0xff, cont = (hdr[1] >> 8) & 0xff;
+    }
+    if (type > 5) { p->bad++; return; }
+    uint64_t seg_end = at + hdr[0];
+    if (seg_end > end) seg_end = end;
+    if (type == 0 && !cont) { /* a render pass description comes first: {tag, size} records until tag 0xffffffff? */
+        uint32_t r[2];
+        if (task_read(p, task, at, r, 8)) { p->bad++; return; }
+        p->counts[5][r[0] & 0xff]++; /* its first word, to learn its shape */
+        static int shown;
+        if (shown++ < 3) {
+            uint32_t w[72] = {0};
+            task_read(p, task, at, w, sizeof w);
+            fprintf(stderr, "pvgpass");
+            for (int i = 0; i < 72; i++) fprintf(stderr, " %08x", w[i]);
+            fprintf(stderr, "\n");
+        }
+    }
+    while (at + 8 <= seg_end) {
+        uint32_t r[2];
+        if (task_read(p, task, at, r, 8)) { p->bad++; return; }
+        if (r[1] < 8 || at + r[1] > seg_end) { p->bad++; break; }
+        if (r[0] < 256) p->counts[type][r[0]]++;
+        if (type == 0) { /* the objects it names */
+            uint32_t a[32] = {0}, c = r[1] - 8 > sizeof a ? sizeof a : r[1] - 8;
+            task_read(p, task, at + 8, a, c);
+            if (r[0] == 116) tally_object(p, task, a[0], "pipeline");
+            if (r[0] == 114 || r[0] == 161) for (uint32_t i = 0; i < a[1] && i < 16; i++) tally_object(p, task, a[2 + i], "texture");
+            if (r[0] == 112) for (uint32_t i = 0; i < a[1] && i < 16; i++) tally_object(p, task, a[2 + i], "sampler");
+            if (r[0] == 125 || r[0] == 110 || r[0] == 157)
+                for (uint32_t i = 0; i < a[1] && i < 6; i++) tally_object(p, task, *(uint32_t *)((uint8_t *)a + 8 + i * 12), "buffer");
+            if (r[0] == 7) tally_object(p, task, a[1], "indexbuf");
+        }
+        at += r[1];
+    }
+}
+
+static void tally_exec(HvPvgLite *p, const uint32_t *table, uint32_t size, uint32_t rd, uint32_t len, uint32_t skip) {
+    uint32_t a[3];
+    ring_read(p, table, size, rd + 12 + skip, a, 12);
+    uint32_t task = a[0], resources = a[1], buffers = a[2];
+    if (buffers > 64 || 12 + skip + 12 + resources * 8 + buffers * 16 > len) { p->bad++; return; }
+    for (uint32_t i = 0; i < buffers; i++) {
+        uint64_t b[2];
+        ring_read(p, table, size, rd + 12 + skip + 12 + resources * 8 + i * 16, b, 16);
+        tally_buffer(p, task, b[0], b[1]);
+    }
+    p->execs++;
+    if (p->execs % 2000 == 0) {
+        fprintf(stderr, "pvgtally execs %llu bad %llu\n", (unsigned long long)p->execs, (unsigned long long)p->bad);
+        for (int t = 0; t < 6; t++)
+            for (int i = 0; i < 256; i++)
+                if (p->counts[t][i]) fprintf(stderr, "pvgtally %d %d %llu\n", t, i, (unsigned long long)p->counts[t][i]);
+    }
+}
+
 /* Commands that do something even without a GPU to run them. */
 static void channel_command(HvPvgLite *p, const uint32_t *table, uint32_t size, uint32_t rd, const uint32_t *hdr) {
     uint32_t op = hdr[0] & 0xffff, args[32], skip = hdr[0] >> 16 ? 8 : 0; /* a barrier comes first */
     uint32_t n = hdr[1] > 12 + skip ? hdr[1] - 12 - skip : 0;
     if (n > sizeof args) n = sizeof args;
+    if (op == 0x38) {
+        ring_read(p, table, size, rd + 12 + skip, args, 16);
+        if (args[0] >> 1 < 512) p->task_root[args[0] >> 1] = args[3];
+        return;
+    }
+    if (op == 0x44) {
+        ring_read(p, table, size, rd + 12 + skip, args, 28);
+        if (args[0] < 512) {
+            p->task_objects[args[0]] = (uint64_t)args[2] << 32 | args[1];
+            p->task_placement[args[0]] = (uint64_t)args[4] << 32 | args[3];
+            if (p->tally) fprintf(stderr, "pvgobj list task %u objects %llx len %x placement %llx len %x\n", args[0], (unsigned long long)p->task_objects[args[0]], args[5], (unsigned long long)p->task_placement[args[0]], args[6]);
+        }
+        return;
+    }
+    if (op == 0x43 && p->tally) tally_exec(p, table, size, rd, hdr[1], skip);
+    if (p->metal) return; /* in order, on its worker */
     if (op != 1 && op != 2 && op != 8) return;
     memset(args, 0, sizeof args);
     ring_read(p, table, size, rd + 12 + skip, args, n);
     if (op == 1) display_set_page(p, (uint64_t)args[1] << 14);
     else if (op == 2) display_ack(p, args[1]);
     else display_swap(p, (uint64_t)args[3] << 32 | args[2], args);
+}
+
+void hv_pvg_lite_command(HvPvgLite *p, const uint32_t *cmd, uint32_t len) {
+    uint32_t op = cmd[0] & 0xffff, skip = cmd[0] >> 16 ? 8 : 0;
+    uint32_t n = len > 12 + skip ? len - 12 - skip : 0;
+    const uint32_t *args = (const uint32_t *)((const uint8_t *)cmd + 12 + skip);
+    if (op == 1 && n >= 8) display_set_page(p, (uint64_t)args[1] << 14);
+    else if (op == 2 && n >= 8) display_ack(p, args[1]);
+    else if (op == 8 && n >= 16) display_swap(p, (uint64_t)args[3] << 32 | args[2], args);
 }
 
 static void do_channel(HvPvgLite *p, uint32_t ch) {
@@ -199,8 +412,18 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
             break;
         }
         if (p->log) fprintf(stderr, "hengevm: pvg-lite: ch %u op %x len %x stamp %x\n", ch, hdr[0], hdr[1], hdr[2]);
+        if (!p->metal_tried) {
+            p->metal_tried = 1;
+            if (!getenv("HV_PVG_NO_METAL")) p->metal = hv_pvg_metal_create(p);
+        }
         channel_command(p, table, size, rd, hdr);
-        last = hdr[2], any = 1;
+        if (p->metal) {
+            uint32_t *copy = malloc(hdr[1]);
+            ring_read(p, table, size, rd, copy, hdr[1]);
+            hv_pvg_metal_submit(p->metal, p, ch, copy, hdr[1]);
+        } else {
+            last = hdr[2], any = 1;
+        }
         rd += hdr[1];
     }
     __atomic_store_n(&rec[1], rd, __ATOMIC_RELEASE);
@@ -224,6 +447,11 @@ void hv_pvg_lite_poll(HvPvgLite *p) {
         p->chan_pending = 0;
         for (uint32_t ch = 1; ch < MAX_CHANNELS; ch++)
             if (chans & (1u << ch)) do_channel(p, ch);
+        irq = 1;
+    }
+    uint32_t done = __atomic_exchange_n(&p->stamps_pending, 0, __ATOMIC_ACQ_REL);
+    if (done) {
+        p->status |= done;
         irq = 1;
     }
     if (irq) hv_gicv3_pend(p->gic, p->gfx_irq);
@@ -289,6 +517,7 @@ HvPvgLite *hv_pvg_lite_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint64_
     p->gfx_irq = gfx_irq;
     p->iosfc_irq = iosfc_irq;
     p->log = getenv("HV_PVG_LITE_LOG") != NULL;
+    p->tally = getenv("HV_PVG_TALLY") != NULL;
     hv_machine_add_mmio(m, gfx_pa, 0x10000, p, gfx_read, gfx_write, "gfx");
     hv_machine_add_mmio(m, iosfc_pa, 0x10000, p, iosfc_read, iosfc_write, "iosurface");
     return p;

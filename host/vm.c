@@ -1,4 +1,5 @@
 #include "vm.h"
+#include "pvg_lite.h"
 
 #include <TargetConditionals.h>
 #include <pthread.h>
@@ -34,6 +35,14 @@ int hv_vm_ncpus(void) { return ncpus; }
    topOfKernelData, Video {baseAddr, display, rowBytes, width, height, depth}, ...}.
    Found by scanning page starts for one whose physBase is the RAM base. */
 int hv_vm_boot_display(HvBootDisplay *d) {
+    /* What the guest's GPU has drawn, once it has drawn anything. */
+    const uint8_t *frame;
+    uint32_t fw, fh;
+    if (board.pvg && hv_pvg_lite_frame(board.pvg, &frame, &fw, &fh) == 0) {
+        d->pixels = (uint8_t *)frame;
+        d->width = fw, d->height = fh, d->stride = fw * 4;
+        return 0;
+    }
     static uint64_t found; /* RAM offset of boot_args */
     uint8_t *ram = board.ram;
     uint64_t size = board.ram_size;
