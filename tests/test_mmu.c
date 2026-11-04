@@ -214,18 +214,12 @@ int main(void) {
         uint64_t salt = cpu.ijc_salt[0];
         static const uint64_t vas[3] = {0x100004010ull, 0x100007ffcull, 0x100008010ull}; /* page P twice, then page Q */
         uint64_t *ents[3];
+        static HvBlock fake[3];
         for (int i = 0; i < 3; i++) {
-            uint64_t *ent = m.percpu[0].ijc + (size_t)hv_ijc_index(vas[i] ^ salt) * 2;
-            ent[0] = vas[i] ^ salt;
-            ent[1] = 0x1234;
-            ents[i] = ent;
-            uint32_t k = hv_ijc_key(vas[i], salt);
-            m.percpu[0].ijc_keyed[k >> 6] |= 1ull << (k & 63);
-            uint32_t h = (uint32_t)(vas[i] >> 14) & 0xffff;
-            m.percpu[0].ijc_pages[0][h >> 6] |= 1ull << (h & 63);
-            hv_ucode_add(&cpu, vas[i]);
+            fake[i] = (HvBlock){.va = vas[i], .flags = 0, .code = (uint32_t *)(uintptr_t)0x1234};
+            hv_ijc_fill(&cpu, &fake[i]);
+            ents[i] = m.percpu[0].ijc + (size_t)hv_ijc_index(vas[i] ^ salt) * 2;
         }
-        m.percpu[0].ijc_tables_used |= 1;
         hv_tlb_flush_va_asid(&cpu, 0x100004000ull, 7);
         int want[3] = {0, 0, 1};
         for (int i = 0; i < 3; i++) {

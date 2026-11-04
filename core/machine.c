@@ -413,6 +413,7 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
     memset(p->ijc_keyed, 0, sizeof p->ijc_keyed);
     p->ijc_keyed_count = 0;
     memset(p->ijc_pages, 0, sizeof p->ijc_pages);
+    memset(p->ijc_hint, 0, sizeof p->ijc_hint);
     memset(p->jc, 0, sizeof p->jc);
     cpu->ijc = (uint64_t)(uintptr_t)p->ijc;
     cpu->lines_ptr = (uint64_t)(uintptr_t)&p->irq_line;

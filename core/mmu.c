@@ -148,8 +148,13 @@ void hv_tlb_flush(HvCpu *cpu) {
 }
 
 /* Clear the tables of one half (user tables are the even flags values, kernel ones odd). */
+static uint32_t hint_slot(uint64_t key) {
+    return (uint32_t)((key * 0x9e3779b97f4a7c15ull) >> 52);
+}
+
 static void ijc_clear(HvCpu *cpu, int kernel) {
     if (!cpu->pc_state) return;
+    memset(cpu->pc_state->ijc_hint[kernel], 0, sizeof cpu->pc_state->ijc_hint[kernel]);
     for (int t = kernel; t < HV_IJC_TABLES; t += 2)
         memset(cpu->pc_state->ijc + (size_t)t * (HV_IJC_TABLE_BYTES / 8), 0, HV_IJC_TABLE_BYTES);
 }
@@ -238,6 +243,8 @@ void hv_ijc_drop_asid(HvCpu *cpu, uint16_t asid) {
 
 void hv_ijc_reset(HvCpu *cpu, int kernel) {
     if (cpu->pc_state) cpu->pc_state->last_fill[0] = cpu->pc_state->last_fill[1] = 0;
+    /* Every entry of the half is dead now (new ids or kernel generation): so are their hints. */
+    if (cpu->pc_state) memset(cpu->pc_state->ijc_hint[kernel], 0, sizeof cpu->pc_state->ijc_hint[kernel]);
     if (cpu->m) {
         cpu->m->stats.ijc_resets++;
         memset(cpu->pc_state->ijc_pages[kernel], 0, sizeof cpu->pc_state->ijc_pages[kernel]);
@@ -334,18 +341,29 @@ void hv_tlb_protect_code(HvCpu *cpu, const uint8_t *host_page) {
 
 /* Forget one salt's cached targets in one 16 KB page. A page's 4096 possible
    targets have 4096 known slots in each table, so only those are looked at. */
-static void ijc_clear_page(HvCpu *cpu, uint64_t page, int kernel, uint64_t salt) {
+/* local: cpu itself (it may empty the page's hint slot afterwards). */
+static void ijc_clear_page(HvCpu *cpu, uint64_t page, int kernel, uint64_t salt, int local) {
     HvPerCpu *m = cpu->pc_state;
+    uint64_t key = (page ^ salt) | 1;
+    __typeof__(m->ijc_hint[0][0]) *h = &m->ijc_hint[kernel][hint_slot(key)];
+    uint64_t hk = __atomic_load_n(&h->key, __ATOMIC_RELAXED);
+    /* Another key's slot means this one has filled nothing since its own drop or the last reset. */
+    uint64_t bits = hk == key ? __atomic_load_n(&h->bits, __ATOMIC_RELAXED) : hk == ~0ull ? ~0ull : 0;
+    if (!bits) return;
     for (int t = kernel; t < HV_IJC_TABLES; t += 2) {
         if (!(m->ijc_tables_used >> t & 1)) continue;
         uint64_t *tab = m->ijc + (size_t)t * (HV_IJC_TABLE_BYTES / 8);
-        for (uint32_t o = 0; o < (1u << HV_TLB_PAGE_BITS) / 4; o++) {
-            uint64_t tag = (page | (uint64_t)o << 2) ^ salt;
-            uint64_t *ent = tab + (size_t)hv_ijc_index(tag) * 2;
-            if (ent[0] == tag) ent[0] = 0;
-            if (ent[2] == tag) ent[2] = 0;
+        for (uint32_t piece = 0; piece < 64; piece++) {
+            if (!(bits >> piece & 1)) continue;
+            for (uint32_t o = piece * 64; o < piece * 64 + 64; o++) {
+                uint64_t tag = (page | (uint64_t)o << 2) ^ salt;
+                uint64_t *ent = tab + (size_t)hv_ijc_index(tag) * 2;
+                if (ent[0] == tag) ent[0] = 0;
+                if (ent[2] == tag) ent[2] = 0;
+            }
         }
     }
+    if (local && hk == key) h->key = 0, h->bits = 0;
 }
 
 /* The page may hold cached branch targets even if its TLB entry is gone: forget
@@ -372,9 +390,9 @@ static int ijc_drop_va(HvCpu *cpu, uint64_t va, int asid, int remote) {
             if (remote && !kernel && asid < 0) return 0;
             m->stats.reset_why[kernel ? 3 : 2]++;
             uint64_t page = va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
-            if (kernel) ijc_clear_page(cpu, page, 1, cpu->ijc_salt[1]);
+            if (kernel) ijc_clear_page(cpu, page, 1, cpu->ijc_salt[1], !remote);
             else if (asid < 0) m->stats.reset_why[5]++, hv_ijc_reset(cpu, 0); /* every address space: their slots differ, so start the user half over */
-            else ijc_clear_page(cpu, page, 0, current_asid(cpu) < 0 ? cpu->ijc_salt[0] : (uint64_t)cpu->asid_cid[asid] << 48);
+            else ijc_clear_page(cpu, page, 0, current_asid(cpu) < 0 ? cpu->ijc_salt[0] : (uint64_t)cpu->asid_cid[asid] << 48, !remote);
         }
     }
     return 1;
@@ -427,7 +445,7 @@ void hv_ijc_drop_range(HvCpu *cpu, uint64_t va, uint64_t len, int asid) {
         for (uint64_t p = first; p <= last; p++)
             if (ucode_has(cpu->pc_state, cid, p << HV_TLB_PAGE_BITS)) {
                 m->stats.reset_why[2]++;
-                ijc_clear_page(cpu, p << HV_TLB_PAGE_BITS, 0, salt);
+                ijc_clear_page(cpu, p << HV_TLB_PAGE_BITS, 0, salt, 1);
             }
         return;
     }
@@ -437,7 +455,7 @@ void hv_ijc_drop_range(HvCpu *cpu, uint64_t va, uint64_t len, int asid) {
         uint64_t p = (k - 1) & 0xffffffffffull;
         if (p >= (first & 0xffffffffffull) && p <= (last & 0xffffffffffull)) {
             m->stats.reset_why[2]++;
-            ijc_clear_page(cpu, p << HV_TLB_PAGE_BITS, 0, salt);
+            ijc_clear_page(cpu, p << HV_TLB_PAGE_BITS, 0, salt, 1);
         }
     }
 }
@@ -632,6 +650,13 @@ void hv_ijc_fill(HvCpu *cpu, HvBlock *b) {
     ent[0] = tag;
     ent[1] = (uint64_t)(uintptr_t)b->code;
     pcs->ijc_tables_used |= 1u << (b->flags & (HV_IJC_TABLES - 1));
+    {   /* the page's hint: which piece has a target now */
+        uint64_t key = ((b->va & ~(uint64_t)PAGE_MASK) ^ cpu->ijc_salt[kernel]) | 1, bit = 1ull << ((b->va >> 8) & 63);
+        __typeof__(pcs->ijc_hint[0][0]) *h = &pcs->ijc_hint[kernel][hint_slot(key)];
+        if (h->key == key) h->bits |= bit;
+        else if (!h->key) h->bits = bit, __atomic_store_n(&h->key, key, __ATOMIC_RELEASE);
+        else if (h->key != ~0ull) h->bits = ~0ull, __atomic_store_n(&h->key, ~0ull, __ATOMIC_RELEASE);
+    }
     /* The filters below are per page: the next fill is mostly in the same one. */
     uint64_t pkey = (b->va & ~(uint64_t)PAGE_MASK) ^ cpu->ijc_salt[kernel] ^ 1;
     if (pcs->last_fill[kernel] == pkey) return;

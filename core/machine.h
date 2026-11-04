@@ -145,7 +145,12 @@ typedef struct HvPerCpu {
     /* Per user id: which 32 MB chunks of its VA (hashed into 256) have cached
        targets, so a TLBI for a big range elsewhere (data, nearly always) drops nothing. */
     uint64_t (*cid_chunks)[4];
-    uint64_t last_fill[2];   /* page ^ salt of the last fill in each half: its filter bits are set already */
+    uint64_t last_fill[2];
+    /* Per half, hashed by (page ^ salt): which 256-byte pieces of the page have
+       cached targets, so dropping a page clears 64 entries per piece instead of
+       all 4096. A slot two keys wanted is spoiled (key ~0: scan it all); only
+       this CPU empties one again, after clearing its page. */
+    struct { uint64_t key, bits; } ijc_hint[2][4096];   /* page ^ salt of the last fill in each half: its filter bits are set already */
     /* Direct-mapped cache in front of the hash, with the VA beside the block so
        a slot holding another block is passed over without reading it. */
     struct { uint64_t va; struct HvBlock *b; } jc[1 << HV_JC_BITS];
