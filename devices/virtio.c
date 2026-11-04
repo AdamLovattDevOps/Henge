@@ -262,12 +262,8 @@ static uint32_t copy(HvVirtio *v, const HvVirtqElem *e, int writable, uint32_t o
         if (n > len - done) n = len - done;
         uint8_t *p = hv_phys_ptr(v->m, g->addr + off, n);
         if (!p) break;
-        if (writable) {
-            memcpy(p, buf + done, n);
-            hv_dma_written(v->m, g->addr + off, n);
-        } else {
-            memcpy(buf + done, p, n);
-        }
+        if (writable) memcpy(p, buf + done, n);
+        else memcpy(buf + done, p, n);
         done += n;
         off = 0;
     }

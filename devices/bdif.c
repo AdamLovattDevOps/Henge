@@ -165,10 +165,7 @@ static void command(HvBdif *b, HvDisk *disk, uint64_t req_pa) {
         if (hv_phys_read(b->m, req[0].addr, sector, sizeof sector) == 0 && req[1].len <= MAX_LEN &&
             req[1].flags == DATA_FLAGS_READ) {
             void *dst = hv_phys_ptr(b->m, req[1].addr, req[1].len);
-            if (dst && hv_disk_read(disk, (uint64_t)sector[2] * 512, dst, req[1].len) == 0) {
-                ret = 0;
-                hv_dma_written(b->m, req[1].addr, req[1].len);
-            }
+            if (dst && hv_disk_read(disk, (uint64_t)sector[2] * 512, dst, req[1].len) == 0) ret = 0;
         }
     }
     if (b->m->log >= 2) {

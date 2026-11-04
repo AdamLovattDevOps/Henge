@@ -38,7 +38,6 @@ static int seg_io(HvVirtioBlk *b, const HvVirtqElem *e, int writable, uint32_t o
         if (!p) return -1;
         int r = writable ? hv_disk_read(b->disk, disk_off, p, n) : hv_disk_write(b->disk, disk_off, p, n);
         if (r != 0) return -1;
-        if (writable) hv_dma_written(b->vio.m, g->addr + off, n);
         disk_off += n;
         len -= n;
         off = 0;

@@ -272,15 +272,6 @@ HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa) {
     return NULL;
 }
 
-void hv_dma_written(HvMachine *m, uint64_t pa, uint64_t len) {
-    if (!len) return;
-    HvRam *r = hv_ram_lookup(m, pa);
-    if (!r) return;
-    uint64_t first = (pa - r->pa) >> HV_TLB_PAGE_BITS, last = (pa + len - 1 - r->pa) >> HV_TLB_PAGE_BITS;
-    for (uint64_t pg = first; pg <= last && (pg << HV_TLB_PAGE_BITS) < r->size; pg++)
-        if (__atomic_load_n(&r->code_pages[pg], __ATOMIC_RELAXED)) hv_invalidate_code(m, r->pa + (pg << HV_TLB_PAGE_BITS));
-}
-
 void hv_invalidate_code(HvMachine *m, uint64_t pa) {
     HvRam *r = hv_ram_lookup(m, pa);
     if (!r) return;

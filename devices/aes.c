@@ -96,10 +96,7 @@ static int cmd_data(HvAes *a) {
     CCCryptorStatus st = CCCrypt(a->encrypt ? kCCEncrypt : kCCDecrypt, kCCAlgorithmAES, a->cbc ? 0 : kCCOptionECBMode,
                                  k->key, k->len, a->cbc ? (const void *)a->iv[iv_ctx] : NULL, in, len, tmp, len,
                                  &moved);
-    if (st == kCCSuccess) {
-        memcpy(out, tmp, len);
-        hv_dma_written(a->m, dst, len);
-    }
+    if (st == kCCSuccess) memcpy(out, tmp, len);
     else if (a->m->log) fprintf(stderr, "hengevm: aes: cipher failed (%d), length %u\n", (int)st, len);
     free(tmp);
     return 1;
