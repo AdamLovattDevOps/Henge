@@ -140,6 +140,7 @@ static int test_mmio(HvMachine *m) {
 }
 
 int main(void) {
+    setenv("HV_GROUPS", "1", 0); /* grouped accesses are off by default: test them here */
     setvbuf(stdout, NULL, _IONBF, 0);
     static HvMachine m;
     if (hv_machine_init(&m, 8 << 20) != 0) return 1;

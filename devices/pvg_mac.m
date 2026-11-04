@@ -1,5 +1,6 @@
 #include "pvg.h"
 
+#include <sys/resource.h>
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
 #import <QuartzCore/QuartzCore.h>
@@ -90,6 +91,11 @@ static void save_png(id<MTLTexture> tex) {
     if (minute != last_minute) {
         last_minute = minute;
         [paths addObject:[[latest stringByDeletingPathExtension] stringByAppendingFormat:@"-%04lds.png", (long)(minute * shot_every)]];
+        /* The CPU time spent so far, for timing a boot by work done rather than by the clock. */
+        struct rusage ru;
+        getrusage(RUSAGE_SELF, &ru);
+        fprintf(stderr, "shot %04lds cpu %.2f s\n", (long)(minute * shot_every),
+                ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6);
     }
     for (NSString *path in paths) {
         CGImageDestinationRef dst =

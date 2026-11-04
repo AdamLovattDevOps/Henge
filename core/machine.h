@@ -60,6 +60,7 @@ typedef struct HvStats {
     uint64_t blocks, translations, block_flushes;
     uint64_t flush_smc, flush_ic, flush_full;  /* why translations were dropped */
     uint64_t chained, ijc_fills, ijc_resets;
+    uint64_t xchained;        /* of them, exits to another page (TLB-checked) */
     uint64_t syncs, sync_ticks;        /* TLBI acks waited for, and host ticks spent waiting */
     uint64_t dev_waits, dev_wait_ticks; /* device lock taken while another CPU held it */
     uint64_t tr_waits, tr_wait_ticks;   /* translation lock likewise */
@@ -71,6 +72,7 @@ typedef struct HvStats {
     uint64_t tlb_miss_kind[4]; /* TLB misses: EL0 empty, EL0 other page there, EL1 empty, EL1 other page there */
     uint64_t slow_why[6];     /* slow accesses by cause: MMIO, code-page write, page end, TLB miss, other, TLB entry there but mismatched */
     uint64_t slow_kind[12];   /* hv_mem_emulate calls by HV_MEM_* kind */
+    uint64_t light_kind[4];   /* the same for hv_ijc_resolve's fills */
     uint64_t fill_kind[4];    /* ijc fills into an empty slot, over another live salt, over the same salt, over a dead salt */
     uint64_t reset_why[8];    /* cache drops: full flush, TLBI by ASID, TLBI user VA, TLBI kernel VA, code change, user VA in every ASID (whole user half), keyed filter full, big user range */
     uint64_t why[6];          /* dispatcher entries by cause: chain fill, kick, exception/sysreg, interrupt, cached target, cache miss */
@@ -187,6 +189,12 @@ typedef struct HvMachine {
     int chain;               /* block chaining and the indirect-branch cache are enabled */
     uint64_t *slots;         /* chainable exits' targets (0: not chained) */
     uint32_t **slot_site;    /* the B in each exit's stub that chaining rewrites to jump to the target */
+    /* Exits to another page (see put_branch_exit): the host addend the target
+       page's TLB entry must hold for the exit to go straight to the chained
+       block (0: a same-page exit), and once chained, the target's physical page
+       (| 1) so that invalidating its code can unchain it. xchained lists them. */
+    uint64_t *slot_xa, *slot_xpa;
+    uint32_t *xchained, nxchained;
     uint32_t nslots;
     HvCpu *cpu;              /* CPU 0: the one that polls devices */
     HvCpu *cpus[HV_MAX_CPUS]; /* every CPU, so device and invalidation code can ask them to leave */

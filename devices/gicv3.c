@@ -393,6 +393,11 @@ void hv_gicv3_set_irq(HvGic *g, int intid, int level) {
 }
 
 void hv_gicv3_set_ppi(HvGic *g, int c, int intid, int level) {
+    /* The timer re-asserts its level at every tick, and only CPU c sets its own
+       PPIs: an unchanged level needs no lock (the GIC's is shared by all). */
+    if (intid >= 16 && intid < 32 && c < HV_MAX_CPUS &&
+        __atomic_load_n(&g->cpu[c].level[intid], __ATOMIC_RELAXED) == (level != 0))
+        return;
     pthread_mutex_lock(&g->mu);
     hv_gicv3_set_ppi_body(g, c, intid, level);
     pthread_mutex_unlock(&g->mu);

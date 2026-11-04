@@ -1,5 +1,6 @@
 #include "mmu.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "exception.h"
@@ -597,10 +598,27 @@ void *hv_ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
     if (!ram) return 0;
     uint64_t pa = ram->pa + (uint64_t)(host - ram->host);
     uint32_t gen = __atomic_load_n(&ram->page_gen[(pa - ram->pa) >> HV_TLB_PAGE_BITS], __ATOMIC_ACQUIRE);
-    HvBlock *b = hv_block_find(m, hv_block_hash(va, pa, flags), va, pa, flags, gen);
-    if (!b) return 0;
+    /* This CPU's small cache in front of the block hash first (as the dispatcher's lookup). */
+    uint32_t j = (uint32_t)((va >> 2) ^ (va >> 18) ^ ((uint64_t)flags << 13)) & ((1u << HV_JC_BITS) - 1);
+    HvBlock *b = pcs->jc[j];
+    if (!(b && b->va == va && b->pa == pa && b->flags == flags && b->gen == gen)) {
+        b = hv_block_find(m, hv_block_hash(va, pa, flags), va, pa, flags, gen);
+        if (!b) return 0;
+        pcs->jc[j] = b;
+    }
+    if (m->stats_interval) { /* what the fill replaces, as the dispatcher counts it */
+        uint64_t *t = pcs->ijc + (size_t)(b->flags & (HV_IJC_TABLES - 1)) * (HV_IJC_TABLE_BYTES / 8);
+        uint64_t tag = b->va ^ cpu->ijc_salt[kernel];
+        uint64_t old = t[(size_t)hv_ijc_index(tag) * 2];
+        int k = !old ? 0 : (old >> 48) != (tag >> 48) ? 1 : 2;
+        if (k == 1) {
+            uint32_t c = (uint32_t)(old >> 48);
+            if (!(kernel ? (c ^ 0xffff) == cpu->kernel_gen : cpu->asid_cid[cpu->cid_asid[c]] == c)) k = 3;
+        }
+        m->stats.light_kind[k]++;
+        m->stats.ijc_light++;
+    }
     hv_ijc_fill(cpu, b);
-    if (m->stats_interval) m->stats.ijc_light++;
     return b->code;
 }
 
@@ -640,7 +658,9 @@ void hv_tlb_switch_user(HvCpu *cpu, uint64_t old, uint64_t now) {
     HvPerCpu *p = cpu->pc_state;
     HvMachine *m = cpu->m;
     if (old == now) return; /* the same address space: a TLB tagged by ASID would keep everything too */
-    if (!p || current_asid(cpu) < 0 || m->watch_va || m->watch_pa) {
+    static int no_stash = -1; /* HV_NO_STASH: a switch just drops the user entries */
+    if (no_stash < 0) no_stash = getenv("HV_NO_STASH") != NULL;
+    if (!p || current_asid(cpu) < 0 || m->watch_va || m->watch_pa || no_stash) {
         hv_tlb_flush_user(cpu);
         return;
     }

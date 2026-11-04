@@ -28,6 +28,10 @@
 #define CPU_EXIT_REQ 0x3c0
 #define CPU_LAST_STUB 0x3c8
 #define CPU_REFILL_RET 0x438
+#define CPU_IJC_SALT 0x3d8
+#define CPU_IJC_TAB 0x440
+#define CPU_MISS_SITE 0x3e8
+#define IJC_BITS 18
 
     .text
     .p2align 2
@@ -37,6 +41,7 @@
     .globl _hv_helper_thunk
     .globl _hv_chain_thunk
     .globl _hv_ijc_thunk
+    .globl _hv_xjump_thunk
     .globl _hv_fp_enter
     .globl _hv_fp_leave
 
@@ -313,6 +318,79 @@ _hv_ijc_thunk:
 1:  ldr x15, [x28, #CPU_REFILL_RET]
     add x15, x15, #4
     br x15
+
+// hv_xjump_thunk: a direct branch to another page that is not chained, looked
+// up in the indirect-branch cache here instead of in the block (one copy of the
+// lookup for all of them). x30 = the site's data: .word flags (bit 31: check
+// exit_req first), .word 0, .quad the target VA; guest x30 already saved. A
+// cache miss tries hv_ijc_resolve, then leaves for the dispatcher.
+_hv_xjump_thunk:
+    ldr w7, [x30]
+    tbz w7, #31, 2f
+    ldr w6, [x28, #CPU_EXIT_REQ]
+    cbnz w6, 3f
+2:  ldr x15, [x30, #8]
+    and x6, x7, #1
+    add x6, x28, x6, lsl #3
+    ldr x6, [x6, #CPU_IJC_SALT]
+    eor x15, x15, x6              // the tag
+    and x7, x7, #15
+    add x7, x28, x7, lsl #3
+    ldr x7, [x7, #CPU_IJC_TAB]    // this flags value's table
+    eor x6, x15, x15, lsr #16
+    eor x6, x6, x15, lsr #46
+    ubfx x6, x6, #2, #IJC_BITS
+    add x7, x7, x6, lsl #4
+    ldp x6, x7, [x7]
+    eor x6, x6, x15
+    cbnz x6, 1f
+    ldr x30, [x28, #240]
+    br x7
+1:  // a miss: as hv_ijc_thunk, then leave if the block is not made yet
+    str x30, [x28, #CPU_REFILL_RET]
+    stp x0, x1, [x28, #0]
+    stp x2, x3, [x28, #16]
+    stp x4, x5, [x28, #32]
+    stp x8, x9, [x28, #64]
+    stp x10, x11, [x28, #80]
+    stp x12, x13, [x28, #96]
+    str x14, [x28, #112]
+    stp x16, x17, [x28, #128]
+    mrs x15, nzcv
+    str x15, [x28, #CPU_NZCV]
+    mov x15, sp
+    str x15, [x28, #CPU_SP]
+    ldr x15, [x28, #CPU_HOST_SP]
+    mov sp, x15
+    mov x0, x28
+    ldr x1, [x30, #8]
+    ldr w2, [x30]
+    and w2, w2, #0x7fffffff
+    bl _hv_ijc_resolve
+    mov x6, x0
+    ldr x0, [x28, #CPU_SP]
+    mov sp, x0
+    ldr x0, [x28, #CPU_NZCV]
+    msr nzcv, x0
+    ldp x0, x1, [x28, #0]
+    ldp x2, x3, [x28, #16]
+    ldp x4, x5, [x28, #32]
+    ldp x8, x9, [x28, #64]
+    ldp x10, x11, [x28, #80]
+    ldp x12, x13, [x28, #96]
+    ldr x14, [x28, #112]
+    ldp x16, x17, [x28, #128]
+    ldr x30, [x28, #CPU_REFILL_RET]
+    cbz x6, 3f
+    ldr x30, [x28, #240]
+    br x6
+3:  stp x0, x1, [x28]             // leave with pc = the target (and the guest's x30: hv_exit saves it)
+    ldr x0, [x30, #8]
+    ldr x30, [x28, #240]
+    str x0, [x28, #CPU_PC]
+    str xzr, [x28, #CPU_MISS_SITE]
+    ldr x1, [x28, #CPU_EXIT]
+    br x1
 
 // hv_fp_enter(cpu): the guest's FPCR and FPSR into the host registers.
 _hv_fp_enter:

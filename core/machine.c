@@ -14,6 +14,7 @@ extern void hv_helper_entry(void);
 extern void hv_helper_thunk(void);
 extern void hv_chain_thunk(void);
 extern void hv_ijc_thunk(void);
+extern void hv_xjump_thunk(void);
 
 static int init_rest(HvMachine *m);
 
@@ -42,7 +43,10 @@ static int init_rest(HvMachine *m) {
     m->chain = 1;
     m->slots = calloc(m->max_slots, sizeof *m->slots);
     m->slot_site = calloc(m->max_slots, sizeof *m->slot_site);
-    if (!m->slots || !m->slot_site) return -1;
+    m->slot_xa = calloc(m->max_slots, sizeof *m->slot_xa);
+    m->slot_xpa = calloc(m->max_slots, sizeof *m->slot_xpa);
+    m->xchained = calloc(m->max_slots, sizeof *m->xchained);
+    if (!m->slots || !m->slot_site || !m->slot_xa || !m->slot_xpa || !m->xchained) return -1;
     pthread_mutex_init(&m->big_mu, NULL);
     pthread_cond_init(&m->big_cv, NULL);
     pthread_mutexattr_t ra;
@@ -215,6 +219,9 @@ void hv_machine_free(HvMachine *m) {
     }
     free(m->slots);
     free(m->slot_site);
+    free(m->slot_xa);
+    free(m->slot_xpa);
+    free(m->xchained);
 }
 
 int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int readonly) {
@@ -262,6 +269,28 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
     r->code_pages[pg] = 0;
     __atomic_add_fetch(&r->page_gen[pg], 1, __ATOMIC_SEQ_CST);
     m->stats.flush_smc++;
+    /* Exits from other pages chained into the stale blocks go back to their stub
+       (whose next chain finds the new translation). Under the translation lock,
+       as chaining them is: one that saw the old generation is done by now. */
+    pthread_mutex_lock(&m->tr_mu);
+    uint64_t tpa = (r->pa + (pg << HV_TLB_PAGE_BITS)) | 1;
+    for (uint32_t k = 0; k < m->nxchained;) {
+        uint32_t idx = m->xchained[k];
+        if (m->slot_xpa[idx] != tpa) {
+            k++;
+            continue;
+        }
+        m->slot_xpa[idx] = 0;
+        __atomic_store_n(&m->slots[idx], 0, __ATOMIC_RELEASE);
+        uint32_t *site = m->slot_site[idx];
+        if (site) {
+            uint32_t insn = 0x14000001u; /* b next: the stub */
+            hv_jit_write(&m->jit, site, &insn, 4);
+            hv_jit_finish(&m->jit, site, 1);
+        }
+        m->xchained[k] = m->xchained[--m->nxchained];
+    }
+    pthread_mutex_unlock(&m->tr_mu);
     /* The indirect-branch cache may lead into the stale blocks: start it over,
        here at once and on the other CPUs before they next leave a block (their
        cache lookups and chained exits check exit_req first). */
@@ -377,6 +406,7 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
     cpu->helper_thunk = (uint64_t)hv_helper_thunk;
     cpu->chain_thunk = (uint64_t)hv_chain_thunk;
     cpu->ijc_thunk = (uint64_t)hv_ijc_thunk;
+    cpu->xjump_thunk = (uint64_t)hv_xjump_thunk;
     cpu->el = 1;
     cpu->spsel = 1;
     cpu->daif = HV_PSTATE_DAIF;

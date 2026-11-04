@@ -26,6 +26,7 @@ void hv_flush_blocks(HvMachine *m) {
     memset(m->hash, 0, sizeof m->hash);
     m->nblocks = 0;
     m->nslots = 0;
+    m->nxchained = 0;
     hv_jit_reset(&m->jit);
 }
 
@@ -60,18 +61,20 @@ static uint32_t block_flags(HvCpu *cpu) {
    (m->flush_pending is set: the dispatcher does that, then tries again). */
 #define hash_of hv_block_hash
 #define find hv_block_find
-/* HV_BLOCK_DUMP=file: every 64th translated block (guest and host words) for
+/* HV_BLOCK_DUMP=file: every 64th (HV_BLOCK_DUMP_EVERY) translated block (guest and host words) for
    bench/hvdis.py, to see what the translator makes of real code. */
 static void block_dump(const HvBlock *b, const uint32_t *code) {
     static FILE *f;
     static int on = -1;
-    static uint32_t count;
+    static uint32_t count, every = 64; /* HV_BLOCK_DUMP_EVERY: the sampling */
     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     if (on < 0) {
         const char *path = getenv("HV_BLOCK_DUMP");
         on = path && (f = fopen(path, "wb")) != NULL;
+        if (getenv("HV_BLOCK_DUMP_EVERY")) every = (uint32_t)atoi(getenv("HV_BLOCK_DUMP_EVERY"));
+        if (!every) every = 1;
     }
-    if (!on || __atomic_add_fetch(&count, 1, __ATOMIC_RELAXED) % 64) return;
+    if (!on || __atomic_add_fetch(&count, 1, __ATOMIC_RELAXED) % every) return;
     uint64_t head[3] = {b->va, b->ninsns, 0};
     const uint32_t *w = b->code;
     uint32_t n = hv_translate_last_words();
@@ -98,6 +101,17 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
     if (b) return jc[j] = b;
 
     if (m->flush_pending) goto flush_unlocked;
+    /* Writes to this page must take the slow path from now on so we notice them:
+       before its code is read (so a write after that, or the IC IVAU after it,
+       invalidates what we make), and without the lock (it may scan every CPU's
+       TLB; two CPUs doing it at once is harmless). */
+    if (!__atomic_load_n(&ram->code_pages[pg], __ATOMIC_RELAXED)) {
+        __atomic_store_n(&ram->code_pages[pg], 1, __ATOMIC_SEQ_CST); /* before the TLBs: see the end of tlb_fill */
+        m->stats.code_protects++;
+        for (int i = 0; i < m->ncpus; i++) /* in every CPU's TLB, or a write from another CPU goes unnoticed */
+            if (m->cpus[i]) hv_tlb_protect_code_page(m->cpus[i], ram, pg);
+        gen = __atomic_load_n(&ram->page_gen[pg], __ATOMIC_ACQUIRE);
+    }
     /* Translate without the lock, into this thread's buffer... */
     HvBlock nb = {.va = va, .pa = pa, .flags = flags, .gen = gen, .ram = ram, .pg = pg};
     uint64_t t0 = m->stats_interval ? mach_absolute_time() : 0;
@@ -148,13 +162,6 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
     m->nblocks++;
     b->next = m->hash[h];
     __atomic_store_n(&m->hash[h], b, __ATOMIC_RELEASE);
-    /* Writes to this page must now take the slow path so we notice them. */
-    if (!ram->code_pages[pg]) {
-        __atomic_store_n(&ram->code_pages[pg], 1, __ATOMIC_SEQ_CST); /* before the TLBs: see the end of tlb_fill */
-        m->stats.code_protects++;
-        for (int i = 0; i < m->ncpus; i++) /* in every CPU's TLB, or a write from another CPU goes unnoticed */
-            if (m->cpus[i]) hv_tlb_protect_code_page(m->cpus[i], ram, pg);
-    }
     pthread_mutex_unlock(&m->tr_mu);
     return b;
 flush_unlocked:
@@ -438,7 +445,8 @@ static void print_stats(HvCpu *cpu, int force) {
         fprintf(stderr, "  new code pages %.0f/s; waits: tlbi acks %.0f/s %.1f%%, device lock %.0f/s %.1f%%, translation lock %.0f/s %.1f%% (of one CPU)\n",
                 RATE(code_protects), RATE(syncs), RATE(sync_ticks) / 240000.0, RATE(dev_waits), RATE(dev_wait_ticks) / 240000.0,
                 RATE(tr_waits), RATE(tr_wait_ticks) / 240000.0);
-        fprintf(stderr, "  light refills %.0fK/s, light branch-cache fills %.0fK/s\n", RATE(refills) / 1e3, RATE(ijc_light) / 1e3);
+        fprintf(stderr, "  light refills %.0fK/s, light branch-cache fills %.0fK/s, chained to other pages %.0f/s\n", RATE(refills) / 1e3,
+                RATE(ijc_light) / 1e3, RATE(xchained));
         fprintf(stderr, "  process switches: %.0f/s saved, %.0f/s restored (%.0f entries each)\n", RATE(stash_saves), RATE(stash_hits),
                 s->stash_hits - last.stash_hits ? (double)(s->stash_entries - last.stash_entries) / (s->stash_hits - last.stash_hits) : 0.0);
         fprintf(stderr, "  tlb misses K/s: el0 empty %.0f el0 conflict %.0f el1 empty %.0f el1 conflict %.0f\n",
@@ -452,6 +460,8 @@ static void print_stats(HvCpu *cpu, int force) {
                 RATE(slow_kind[8]) / 1e3, RATE(slow_kind[9]) / 1e3, RATE(slow_kind[10]) / 1e3);
         fprintf(stderr, "  ijc fills into: empty %.0fK/s, live other salt %.0fK/s, dead salt %.0fK/s, same salt %.0fK/s\n",
                 RATE(fill_kind[0]) / 1e3, RATE(fill_kind[1]) / 1e3, RATE(fill_kind[3]) / 1e3, RATE(fill_kind[2]) / 1e3);
+        fprintf(stderr, "  light fills into: empty %.0fK/s, live other salt %.0fK/s, dead salt %.0fK/s, same salt %.0fK/s\n",
+                RATE(light_kind[0]) / 1e3, RATE(light_kind[1]) / 1e3, RATE(light_kind[3]) / 1e3, RATE(light_kind[2]) / 1e3);
         fprintf(stderr, "  misses at: RET %.0fK/s, BR/BLR %.0fK/s, B/BL %.0fK/s, conditional %.0fK/s, MSR %.0fK/s, other %.0fK/s, unknown %.0fK/s\n",
                 RATE(miss_kind[0]) / 1e3, RATE(miss_kind[1]) / 1e3, RATE(miss_kind[2]) / 1e3, RATE(miss_kind[3]) / 1e3,
                 RATE(miss_kind[4]) / 1e3, RATE(miss_kind[5]) / 1e3, RATE(miss_kind[6]) / 1e3);
@@ -486,6 +496,34 @@ static void print_stats(HvCpu *cpu, int force) {
    only reachable from each other, and the exit_req check before every chained
    jump gets a block that just wrote its own page back to the dispatcher. */
 static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
+    uint32_t idx = (uint32_t)(slot - m->slots);
+    uint64_t xa = m->slot_xa[idx];
+    if (xa) {
+        /* From another page: only to the block in the physical page the exit's
+           check names, and not a stale one (see hv_invalidate_code). */
+        uint64_t page_pa = b->pa & ~((1ull << HV_TLB_PAGE_BITS) - 1);
+        uint64_t host = (uint64_t)(uintptr_t)(b->ram->host + (page_pa - b->ram->pa));
+        if (host - (b->va & ~((1ull << HV_TLB_PAGE_BITS) - 1)) != xa) return;
+        pthread_mutex_lock(&m->tr_mu);
+        if (__atomic_load_n(&b->ram->page_gen[b->pg], __ATOMIC_ACQUIRE) != b->gen || m->slot_xpa[idx]) {
+            pthread_mutex_unlock(&m->tr_mu);
+            return;
+        }
+        m->slot_xpa[idx] = page_pa | 1;
+        m->xchained[m->nxchained++] = idx;
+        __atomic_store_n(slot, (uint64_t)(uintptr_t)b->code, __ATOMIC_RELEASE);
+        uint32_t *site = m->slot_site[idx];
+        int64_t off = site ? b->code - site : 0;
+        if (site && off >= -(1 << 25) && off < (1 << 25)) {
+            uint32_t insn = 0x14000000u | (uint32_t)(off & 0x3ffffff);
+            hv_jit_write(&m->jit, site, &insn, 4);
+            hv_jit_finish(&m->jit, site, 1);
+        }
+        m->stats.chained++;
+        m->stats.xchained++;
+        pthread_mutex_unlock(&m->tr_mu);
+        return;
+    }
     __atomic_store_n(slot, (uint64_t)(uintptr_t)b->code, __ATOMIC_RELEASE);
     /* And the stub's B, when the target is in its range: a direct branch, no load. */
     uint32_t *site = m->slot_site[slot - m->slots];
@@ -677,7 +715,9 @@ static int run_loop(HvCpu *cpu, int one) {
            and new blocks may have it now: chaining it would rewrite one of theirs. */
         if (m->stats.block_flushes != flushes) pending_chain = NULL;
         if (!b) {
-            if (m->flush_pending) continue; /* everything is about to be dropped: try again after */
+            /* Everything is about to be dropped, or just was (another CPU may have
+               done the flush this lookup asked for): try again after. */
+            if (m->flush_pending || __atomic_load_n(&m->stw_active, __ATOMIC_SEQ_CST) || m->stats.block_flushes != flushes) continue;
             fprintf(stderr, "hengevm: cannot translate block at %llx\n", (unsigned long long)cpu->pc);
             park(cpu);
             return HV_EXIT_UNSUPPORTED;
