@@ -265,6 +265,32 @@ static void *fast_resume(HvCpu *cpu) {
 /* Blocks call this through hv_helper_entry. Returns 1 to leave the block. */
 static uint64_t reg_hist[65536]; /* --stats: MRS/MSR/SYS by op0:op1:CRn:CRm:op2; reads low, writes high 32 bits */
 
+/* Could this TLBI (just done) change the mapping of pc's page? A page or range
+   containing it, anything wider than one address space, or one address space's
+   all when pc is a user address. */
+static int tlbi_may_hit(HvCpu *cpu, uint32_t insn, uint64_t pc) {
+    uint32_t op1 = (insn >> 16) & 7, crm = (insn >> 8) & 0xf, op2 = (insn >> 5) & 7;
+    int rt = insn & 0x1f;
+    uint64_t xt = rt == 31 ? 0 : cpu->x[rt];
+    uint64_t page = pc & 0x00ffffffffffc000ull;
+    if (op1 != 0) return 1;
+    if ((crm == 1 || crm == 3 || crm == 7) && (op2 & 1)) { /* one page */
+        uint64_t va = (uint64_t)((int64_t)((xt & 0xfffffffffffull) << 20) >> 8);
+        return (va & 0x00ffffffffffc000ull) == page;
+    }
+    if ((crm == 2 || crm == 5 || crm == 6) && (op2 & 1)) { /* a range */
+        uint32_t tg = (xt >> 46) & 3;
+        int shift = tg == 1 ? 12 : tg == 2 ? 14 : tg == 3 ? 16 : 0;
+        if (!shift) return 1;
+        uint64_t pages = (((xt >> 39) & 31) + 1) << (5 * ((xt >> 44) & 3) + 1);
+        uint64_t va = (uint64_t)((int64_t)((xt & 0x1fffffffffull) << (64 - 37)) >> (64 - 37 - shift)) & 0x00ffffffffffffffull;
+        uint64_t len = pages << shift;
+        return page + (1ull << HV_TLB_PAGE_BITS) > va && page < va + len;
+    }
+    if ((crm == 1 || crm == 3 || crm == 7) && op2 == 2) return !((pc >> 55) & 1); /* ASIDE1: user pages */
+    return 1; /* VMALLE1 and the rest */
+}
+
 static uint32_t helper(HvCpu *cpu, const HvHelperInfo *info_in);
 
 uint32_t hv_helper(HvCpu *cpu, const HvHelperInfo *info_in) {
@@ -300,8 +326,14 @@ static uint32_t helper(HvCpu *cpu, const HvHelperInfo *info_in) {
         return hv_sysreg_mrs(cpu, info->insn, info->pc);
     case HV_OP_MSR:
         return hv_sysreg_msr(cpu, info->insn, info->pc);
-    case HV_OP_SYS:
-        return hv_sysreg_sys(cpu, info->insn, info->pc);
+    case HV_OP_SYS: {
+        uint32_t r = hv_sysreg_sys(cpu, info->insn, info->pc);
+        if (!r && ((info->insn >> 12) & 0xf) == 8 && tlbi_may_hit(cpu, info->insn, info->pc)) {
+            cpu->pc = info->pc + 4; /* the block carries on otherwise: leave, to fetch the rest anew */
+            return 1;
+        }
+        return r;
+    }
     case HV_OP_EXCEPTION: {
         return hv_exception_insn(cpu, info->insn, info->pc); /* SVC: see hv_helper */
     }
@@ -948,8 +980,8 @@ static int run_loop(HvCpu *cpu, int one) {
                 else kind = 5;
             }
             m->stats.miss_kind[kind]++;
-            cpu->miss_site = 0;
         }
+        cpu->miss_site = 0; /* only the next lookup miss sets it again */
         cpu->exit_reason = HV_EXIT_BRANCH;
         cpu->last_stub = 0;
         cpu->icount++;

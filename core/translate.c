@@ -1439,8 +1439,11 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
         }
         put_helper(e, pc, insn, HV_OP_SYS);
         /* DC and AT continue, and so does IC IVAU: invalidating code sets exit_req,
-           so the block leaves at its next exit if it mattered. IC IALLU and TLBI leave. */
+           so the block leaves at its next exit if it mattered. So do TLBIs: the
+           helper leaves itself when one may cover the page this block runs from
+           (see hv_helper). IC IALLU leaves. */
         if (crn == 7 && ((crm != 1 && crm != 5) || (op1 == 3 && crm == 5 && op2 == 1))) return 0;
+        if (crn == 8 && !e->no_ijc) return 0;
         put_exit(e, pc + 4);
         return 1;
     }
