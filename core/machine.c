@@ -348,6 +348,7 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
     memset(p->ijc_pages, 0, sizeof p->ijc_pages);
     memset(p->jc, 0, sizeof p->jc);
     cpu->ijc = (uint64_t)(uintptr_t)p->ijc;
+    cpu->lines_ptr = (uint64_t)(uintptr_t)&p->irq_line;
     for (int t = 0; t < HV_IJC_TABLES; t++) cpu->ijc_tab[t] = (uint64_t)(uintptr_t)(p->ijc + (size_t)t * (HV_IJC_TABLE_BYTES / 8));
     cpu->next_cid = 1;
     cpu->kernel_gen = 1;

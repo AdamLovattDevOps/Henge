@@ -65,10 +65,11 @@ typedef struct HvCpu {
     uint64_t miss_site;      /* 0x3e8: --stats: guest PC of the branch whose cache lookup just missed */
     uint64_t excl_addr;      /* 0x3f0: exclusive monitor: guest VA, or ~0 when clear */
     uint32_t excl_size;      /* 0x3f8: bytes the LDXR read */
-    uint32_t pad0;
+    uint32_t spsel;          /* 0x3fc: SPSel (translated MSR SPSel writes it) */
     uint64_t excl_val[2];    /* 0x400: what it read (a pair's two halves) */
     uint64_t host_sp;        /* 0x410: the host's stack while blocks run: they keep the guest SP in the SP register */
-    uint64_t pad2[5];
+    uint64_t lines_ptr;      /* 0x418: &pc_state->irq_line (irq, then fiq: one 8-byte load sees both) */
+    uint64_t pad2[4];
     uint64_t ijc_tab[16];    /* 0x440: each flags value's branch-cache table (ijc + flags * table size) */
     /* 0x4c0: [0] EL0 and unprivileged accesses, [1] EL1, [2] EL1 with PSTATE.PAN set,
        so toggling PAN (the kernel does it around every user copy) flushes nothing. */
@@ -77,7 +78,6 @@ typedef struct HvCpu {
     /* The rest is only touched by C. */
     struct HvMachine *m;
     uint32_t el;
-    uint32_t spsel;
 
     /* The exclusive monitor is excl_addr, excl_size and excl_val above: STXR is a
        compare-and-swap against the value the LDXR saw, the way QEMU does it, so
@@ -161,6 +161,9 @@ typedef struct HvCpu {
 #define HV_CPU_EXCL_SIZE   0x3f8
 #define HV_CPU_EXCL_VAL    0x400
 #define HV_CPU_HOST_SP     0x410
+#define HV_CPU_LINES_PTR   0x418
+#define HV_CPU_SPSEL       0x3fc
+#define HV_CPU_SP_EL1      0x398
 #define HV_CPU_IJC_TAB     0x440
 #define HV_CPU_TLB         0x4c0
 
@@ -195,6 +198,9 @@ _Static_assert(offsetof(HvCpu, el0_cnt) == HV_CPU_EL0_CNT, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, excl_size) == HV_CPU_EXCL_SIZE, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, excl_val) == HV_CPU_EXCL_VAL, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, host_sp) == HV_CPU_HOST_SP, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, lines_ptr) == HV_CPU_LINES_PTR, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, spsel) == HV_CPU_SPSEL, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, sp_el1) == HV_CPU_SP_EL1, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, ijc_tab) == HV_CPU_IJC_TAB, "HvCpu layout");
 _Static_assert(HV_IJC_TABLES == 16, "ijc_tab has one pointer per table");
 _Static_assert(sizeof(HvTlbEntry) == 32, "TLB entries are indexed with lsl #5");

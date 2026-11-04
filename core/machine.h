@@ -89,6 +89,9 @@ typedef struct HvStats {
    the filters for dropping entries from it, the front cache of blocks, its
    interrupt lines and its wakeup. */
 typedef struct HvPerCpu {
+    /* Interrupt lines into this CPU, driven by the GIC. First and together:
+       translated code reads both with one load (HvCpu.lines_ptr). */
+    int irq_line, fiq_line;
     uint64_t *ijc;           /* indirect-branch cache tables (cpu->ijc points here) */
     uint64_t ijc_pages[2][1024]; /* hashed bitmap of the user pages any process cached targets in (for all-ASID TLBIs) */
     /* Hashed bitmap of (page, salt) pairs with cached targets: a TLBI for one
@@ -104,8 +107,6 @@ typedef struct HvPerCpu {
     uint64_t *ucode;
     uint32_t ucode_count;
     struct HvBlock *jc[1 << HV_JC_BITS]; /* direct-mapped cache in front of the hash */
-    /* Interrupt lines into this CPU, driven by the GIC. */
-    int irq_line, fiq_line;
     /* WFI sleeps on this; device threads, the GIC and other CPUs signal it. */
     pthread_mutex_t wake_mu;
     pthread_cond_t wake_cv;

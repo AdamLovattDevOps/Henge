@@ -849,6 +849,64 @@ static void put_pstate_bit(Emit *e, int rt, int bit, int read) {
     unspill(e, s, 3);
 }
 
+/* The commonest PSTATE writes, at EL1, without the helper. DAIF: a masked
+   interrupt let through is taken before the next instruction (leave if either
+   line is up; the dispatcher sorts out masking). SPSel: the guest SP is the
+   host SP, so the switch swaps it with the banked one, then continues through
+   the new flags' branch cache. PAN: the bit, then likewise. Returns 0 if not
+   handled, 1 if the block carries on, 2 if it ended. */
+static int translate_msr_inline(Emit *e, uint32_t insn, uint64_t pc) {
+    if (!(e->flags & HV_BLOCK_EL1) || e->no_ijc) return 0;
+    int imm_form = ((insn >> 19) & 3) == 0;
+    uint32_t field = ((insn >> 16) & 7) << 3 | ((insn >> 5) & 7), imm = (insn >> 8) & 0xf;
+    uint32_t reg = (insn >> 5) & 0xffff;
+    int daif_reg = !imm_form && reg == (3u << 14 | 3u << 11 | 4u << 7 | 2u << 3 | 1u); /* MSR DAIF, Xt */
+    if ((imm_form && (field == 036 || field == 037)) || daif_reg) {
+        if (daif_reg) {
+            int rt = insn & 0x1f;
+            if (rt == 31) put(e, 0xd2800006u);                                        /* movz x6, #0 */
+            else if (is_stolen(rt)) put(e, LDR_X(6, 28, slot_of(rt)));
+            else put(e, MOV_X(6, rt));
+            put(e, 0x92400000u | 58u << 16 | 3u << 10 | 6 << 5 | 6);                 /* and x6, x6, #0x3c0 */
+        } else {
+            put(e, LDR_X(6, 28, HV_CPU_DAIF));
+            put(e, 0xd2800007u | (imm << 6) << 5);                                   /* movz x7, #imm << 6 */
+            put(e, (field == 036 ? 0xaa000000u : 0x8a200000u) | 7 << 16 | 6 << 5 | 6); /* orr / bic x6, x6, x7 */
+        }
+        put(e, STR_X(6, 28, HV_CPU_DAIF));
+        if (field != 036 || daif_reg) { /* it may have unmasked something */
+            put(e, LDR_X(7, 28, HV_CPU_LINES_PTR));
+            put(e, LDR_X(7, 7, 0));                                                  /* irq and fiq lines */
+            put(e, CBNZ_X(7));
+            put_ool(e, (Ool){.kind = OOL_EXIT, .pc = pc + 4});
+        }
+        return 1;
+    }
+    if (imm_form && (field == 005 || field == 004)) { /* SPSel, PAN */
+        uint32_t flags = e->flags, bit = field == 005 ? HV_BLOCK_SPX : HV_BLOCK_PAN, on = imm & 1;
+        if (!!(flags & bit) == on) return 1; /* already so: nothing changes */
+        if (field == 005) {
+            put(e, ADD_SP_TO(6));                                                    /* mov x6, sp */
+            put(e, STR_X(6, 28, on ? HV_CPU_SP_EL0 : HV_CPU_SP_EL1));                /* the one in use goes to its bank */
+            put(e, LDR_X(6, 28, on ? HV_CPU_SP_EL1 : HV_CPU_SP_EL0));
+            put(e, 0x910000dfu);                                                     /* mov sp, x6 */
+            put(e, on ? 0x52800026u : 0x52800006u);                                  /* movz w6, #on */
+            put(e, 0xb9000000u | (HV_CPU_SPSEL / 4) << 10 | 28 << 5 | 6);            /* str w6, [x28, #spsel] */
+        } else {
+            put(e, LDR_X(6, 28, HV_CPU_PSTATE_EXTRA));
+            put(e, 0xd2a00807u);                                                     /* movz x7, #0x40, lsl #16: PAN */
+            put(e, (on ? 0xaa000000u : 0x8a200000u) | 7 << 16 | 6 << 5 | 6);
+            put(e, STR_X(6, 28, HV_CPU_PSTATE_EXTRA));
+        }
+        put_lit(e, 15, pc + 4);
+        e->flags = on ? flags | bit : flags & ~bit;
+        put_ijc_jump(e);
+        e->flags = flags;
+        return 2;
+    }
+    return 0;
+}
+
 /* The guest's counter is the host's mach_absolute_time (CNTVOFF is 0): the
    counter register the commpage names plus the commpage's offset, read the way
    libsystem does. EL0 reads check CNTKCTL_EL1's enables and trap through the
@@ -993,6 +1051,10 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
         if (((insn >> 21) & 1) && ((insn >> 19) & 3)) { /* MRS */
             put_helper(e, pc, insn, HV_OP_MRS);
             return 0;
+        }
+        {
+            int r = translate_msr_inline(e, insn, pc);
+            if (r) return r - 1; /* 1: carries on, 2: the block ended */
         }
         put_helper(e, pc, insn, HV_OP_MSR); /* state blocks depend on may change */
         if (((insn >> 19) & 3) == 0 && (e->flags & HV_BLOCK_EL1)) {
