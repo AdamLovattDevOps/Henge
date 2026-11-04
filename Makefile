@@ -23,13 +23,13 @@ $(B)/hengevm-ref: host/hvf_ref.c host/hvf_ref.entitlements $(ENGINE) $(DEV)
 # Mac-only graphics device (ParavirtualizedGraphics.framework, as QEMU uses it).
 # Built for an older deployment target: the framework's memory callbacks are
 # marked obsolete in macOS 27 without a documented replacement.
-$(B)/pvg_mac.o: devices/pvg_mac.m devices/*.h core/*.h | $(B)
+$(B)/pvg_mac.o: devices/pvg_mac.m devices/*.h core/*.h host/*.h | $(B)
 	$(CC) -fobjc-arc -O2 -g -Wall -mmacosx-version-min=15.2 -Icore -Ihost -Idevices -c $< -o $@
 
 # User-mode NAT for the NIC: Homebrew's libslirp (brew install libslirp).
 SLIRP_CFLAGS = $(shell pkg-config --cflags slirp)
 SLIRP_LIBS = $(shell pkg-config --libs slirp)
-$(B)/net_slirp.o: host/net_slirp.c host/net_slirp.h devices/virtio_net.h | $(B)
+$(B)/net_slirp.o: host/net_slirp.c host/*.h devices/*.h core/*.h | $(B)
 	$(CC) $(CFLAGS) $(SLIRP_CFLAGS) -c $< -o $@
 
 $(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/audio_mac.o $(B)/vm.o
@@ -37,9 +37,9 @@ $(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/
 	    -framework Foundation -framework CoreGraphics -framework ImageIO -framework CoreFoundation \
 	    -framework AppKit -framework QuartzCore -o $@
 
-$(B)/%.o: core/%.c core/*.h | $(B)
+$(B)/%.o: core/%.c core/*.h host/*.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
-$(B)/%.o: host/%.c host/*.h | $(B)
+$(B)/%.o: host/%.c host/*.h core/*.h devices/*.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(B)/%.o: host/%.S | $(B)
 	$(CC) -c $< -o $@
