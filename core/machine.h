@@ -76,6 +76,7 @@ typedef struct HvStats {
     uint64_t light_kind[4];
     uint64_t light_fail[4];
     uint64_t light_walks;
+    uint64_t chained_early;   /* exits chained as their block was placed */
     uint64_t wfe_waits;       /* WFEs that waited on the monitored word in place */
     uint64_t kind_insns[16], kind_words[16]; /* --stats: inline words by instruction kind (HvInsnKind), as translated */
     uint64_t posted_kind[4];

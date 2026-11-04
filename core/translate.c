@@ -69,7 +69,7 @@ typedef struct {
     uint32_t nfix;
     Ool ool[MAX_OOL];
     uint32_t nool;
-    struct { uint32_t slot, at; } site[MAX_OOL]; /* chainable exits: their slot and the B chaining patches */
+    struct { uint32_t slot, at, flags; uint64_t target; } site[MAX_OOL]; /* chainable exits: their slot, the B chaining patches, where to */
     uint32_t nsite;
     uint32_t pool_at, total; /* the finished block: code words, then the literal pool */
     uint32_t flags;
@@ -333,6 +333,8 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
        target is out of B's range, it falls through to hv_chain_thunk. */
     if (e->nsite < MAX_OOL) {
         e->site[e->nsite].slot = slot_index;
+        e->site[e->nsite].flags = e->flags;
+        e->site[e->nsite].target = target;
         e->site[e->nsite++].at = e->n;
     }
     put(e, B_OP | 1);                                                 /* b next */
@@ -577,25 +579,40 @@ static void translate_pac(Emit *e, uint32_t insn) {
     if (opcode >= 16 || (opcode & 4)) put_strip(e, rd); /* XPAC*, AUT* */
 }
 
-/* Ends the block. */
-static void translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
+/* HV_SUPERBLOCKS=1: a conditional branch does not end its block; the block goes
+   on with the instruction after it (the taken side leaves out of line). */
+static int superblocks(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("HV_SUPERBLOCKS") && atoi(getenv("HV_SUPERBLOCKS"));
+    return v;
+}
+
+/* The block may go on past a conditional branch at pc: the next instruction is
+   in the same page and the block is not long already. */
+static int go_on(Emit *e, uint64_t pc) {
+    return ((pc + 4) & ~((1ull << HV_TLB_PAGE_BITS) - 1)) == e->page && e->cur_i + 1 < 48;
+}
+
+/* Ends the block (returns 1), or 0 for a conditional branch the block goes on past. */
+static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
     if ((insn & 0x7c000000) == 0x14000000) { /* B, BL */
         uint64_t target = pc + (sext(insn & 0x3ffffff, 26) << 2);
         if (insn >> 31) put_const_to(e, 30, pc + 4);
         put_branch_exit(e, target, 1);
-        return;
+        return 1;
     }
     if ((insn & 0xff000000) == 0x54000000) { /* B.cond, BC.cond */
         uint64_t target = pc + (sext((insn >> 5) & 0x7ffff, 19) << 2);
         uint32_t cond = insn & 0xf;
         if (cond >= 14) {
             put_branch_exit(e, target, 1);
-            return;
+            return 1;
         }
         put(e, 0x54000000u | cond);
         put_ool(e, (Ool){.kind = OOL_EXIT, .pc = target, .plain = 1});
+        if (superblocks() && go_on(e, pc)) return 0;
         put_branch_exit(e, pc + 4, 1);
-        return;
+        return 1;
     }
     /* CBZ/CBNZ (imm19) and TBZ/TBNZ (imm14) */
     int tb = (insn & 0x7e000000) == 0x36000000;
@@ -605,8 +622,9 @@ static void translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
     if (!is_stolen(rt)) {
         put(e, bare);
         put_ool(e, (Ool){.kind = OOL_EXIT, .pc = target, .plain = 1});
+        if (superblocks() && go_on(e, pc)) return 0;
         put_branch_exit(e, pc + 4, 1);
-        return;
+        return 1;
     }
     uint8_t s = 15; /* free scratch: the spill below is empty */
     spill(e, &s, 1);
@@ -614,7 +632,9 @@ static void translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
     put(e, (bare & ~0x1fu) | s);
     put_ool(e, (Ool){.kind = OOL_EXIT, .pc = target, .nrestore = 1, .restore = {s}, .plain = 1});
     unspill(e, &s, 1);
+    if (superblocks() && go_on(e, pc)) return 0;
     put_branch_exit(e, pc + 4, 1);
+    return 1;
 }
 
 /* BR, BLR, RET and their PAC forms. Ends the block. The target is looked up
@@ -1312,8 +1332,7 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
         translate_pcrel(e, insn, pc);
         return 0;
     case HV_INSN_BRANCH:
-        translate_branch(e, insn, pc);
-        return 1;
+        return translate_branch(e, insn, pc);
     case HV_INSN_BRANCH_REG:
         translate_branch_reg(e, insn, pc);
         return 1;
@@ -1726,6 +1745,26 @@ int hv_translate_place(HvMachine *m, HvBlock *b) {
     Emit *e = &E;
     uint32_t *dst = hv_jit_reserve(&m->jit, e->total);
     if (!dst) return -1;
+    /* Exits in the page to blocks that exist already (or back to this one's
+       start) are chained now, in the copy about to be written: no trip through
+       the dispatcher to do it. As chain() does for the rest. */
+    for (uint32_t k = 0; k < e->nsite; k++) {
+        uint32_t slot = e->site[k].slot;
+        uint64_t t = e->site[k].target;
+        if (m->slot_xa[slot] || e->site[k].flags != b->flags) continue;
+        const uint32_t *code = NULL;
+        if (t == b->va) code = dst;
+        else {
+            uint64_t pa = (b->pa & ~((1ull << HV_TLB_PAGE_BITS) - 1)) | (t & ((1ull << HV_TLB_PAGE_BITS) - 1));
+            HvBlock *tb = hv_block_find(m, hv_block_hash(t, pa, b->flags), t, pa, b->flags, b->gen);
+            if (tb) code = tb->code;
+        }
+        if (!code) continue;
+        m->slots[slot] = (uint64_t)(uintptr_t)code;
+        int64_t off = code - (dst + e->site[k].at);
+        if (off >= -(1 << 25) && off < (1 << 25)) e->w[e->site[k].at] = 0x14000000u | (uint32_t)(off & 0x3ffffff);
+        m->stats.chained_early++;
+    }
     hv_jit_write(&m->jit, dst, e->w, e->pool_at * 4);
     hv_jit_write(&m->jit, dst + e->pool_at, e->pool, e->npool * 8);
     hv_jit_finish(&m->jit, dst, e->total);

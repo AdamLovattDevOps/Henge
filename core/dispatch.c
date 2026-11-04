@@ -511,7 +511,7 @@ static void print_stats(HvCpu *cpu, int force) {
                 fprintf(stderr, "\n");
             }
         }
-        fprintf(stderr, "  WFE waits in place %.0f/s\n", RATE(wfe_waits));
+        fprintf(stderr, "  WFE waits in place %.0f/s; exits chained as placed %.0f/s\n", RATE(wfe_waits), RATE(chained_early));
         fprintf(stderr, "  exit requests/s: TLBI posts %.0f, wakes %.0f (of them device work %.0f), kick all %.0f, own %.0f\n",
                 RATE(kick_src[0]), RATE(kick_src[1]), RATE(kick_src[3]), RATE(kick_src[2]), RATE(kick_src[4]));
         fprintf(stderr, "  light refills %.0fK/s, light branch-cache fills %.0fK/s, chained to other pages %.0f/s\n", RATE(refills) / 1e3,
