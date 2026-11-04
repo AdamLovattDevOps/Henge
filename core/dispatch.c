@@ -254,6 +254,7 @@ static void *fast_resume(HvCpu *cpu) {
     uint64_t tag = va ^ cpu->ijc_salt[kernel];
     uint64_t *ent = p->ijc + (size_t)(flags & (HV_IJC_TABLES - 1)) * (HV_IJC_TABLE_BYTES / 8) + (size_t)hv_ijc_index(tag) * 2;
     void *code = ent[0] == tag ? (void *)(uintptr_t)ent[1] : ent[2] == tag ? (void *)(uintptr_t)ent[3] : NULL;
+    if (!code) code = hv_ijc_resolve(cpu, va, flags); /* made already but not cached: cache it */
     if (code) {
         cpu->exit_reason = HV_EXIT_BRANCH;
         m->stats.fast_resumes++;
