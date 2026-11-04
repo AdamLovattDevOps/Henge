@@ -20,6 +20,9 @@ int hv_usb_bulk(HvVirtioUsb *d, uint8_t ep, void *data, uint32_t len, int timeou
 /* Wait until the guest is on the bus; returns its session number, or -1. */
 int64_t hv_usb_wait_online(HvVirtioUsb *d, int timeout_ms);
 
+/* host/libusb_shim.c: the device its libusb API drives. */
+void hv_libusb_shim_attach(HvVirtioUsb *d);
+
 /* Debugging (HV_VUSB_PROBE=1): a thread that reads the device's descriptors. */
 void hv_usb_probe_start(HvVirtioUsb *d);
 
