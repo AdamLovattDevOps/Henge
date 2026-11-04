@@ -230,10 +230,12 @@ HvVirtioBlk *hv_virtio_blk_create(HvMachine *m, HvPcie *bus, HvDisk *disk, int a
     /* Apple's driver takes one descriptor per segment from the queue's 256
        and does not use indirect tables: with segments up to 126, two big
        writes used them all and the next failed (kIOReturnNoMemory, ENOMEM in
-       APFS, or its cleanup asserted "Adding invalid index 65535"). 32 lets
-       seven of the biggest requests be in flight. */
-    uint32_t seg_max = getenv("HV_BLK_SEG_MAX") ? (uint32_t)atoi(getenv("HV_BLK_SEG_MAX")) : 32;
-    if (seg_max < 1 || seg_max > HV_VIRTQ_MAX_SEGS - 2) seg_max = 32;
+       APFS, or its cleanup asserted "Adding invalid index 65535"). 32 got a
+       restore through, but a freshly installed Mac's first boot (Spotlight
+       indexing while Setup Assistant starts) still saw page-in ENOMEM; with 8
+       it boots to Setup Assistant cleanly. */
+    uint32_t seg_max = getenv("HV_BLK_SEG_MAX") ? (uint32_t)atoi(getenv("HV_BLK_SEG_MAX")) : 8;
+    if (seg_max < 1 || seg_max > HV_VIRTQ_MAX_SEGS - 2) seg_max = 8;
     uint32_t blk_size = 512, apple_type = (uint32_t)apple_variant;
     uint16_t num_queues = 1;
     memcpy(v->config + 0, &capacity, 8);
