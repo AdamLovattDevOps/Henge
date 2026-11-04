@@ -107,6 +107,7 @@ static void *worker(void *opaque) {
     HvVirtioBlk *b = opaque;
     /* HV_BLK_STATS: requests, bytes, flushes and how busy this worker was, every 10 s. */
     int stats = getenv("HV_BLK_STATS") != NULL;
+    uint64_t every = stats && atoi(getenv("HV_BLK_STATS")) > 0 ? (uint64_t)atoi(getenv("HV_BLK_STATS")) * 1000000 : 10000000;
     uint64_t t_last = now_us(), busy = 0, reqs = 0, bytes = 0, flushes = 0, flush_us = 0;
     for (;;) {
         pthread_mutex_lock(&b->mu);
@@ -129,10 +130,10 @@ static void *worker(void *opaque) {
             uint64_t t1 = now_us();
             busy += t1 - t0, reqs++, bytes += r->written > 1 ? r->written : readable(&r->e);
             if (type == T_FLUSH) flushes++, flush_us += t1 - t0;
-            if (t1 - t_last > 10000000) {
+            if (t1 - t_last > every) {
                 fprintf(stderr, "virtio-blk %s worker: %.0f req/s %.1f MB/s, %.0f flushes/s (%.1f ms each), busy %.0f%%\n",
-                        b->disk->offset ? "aux" : "root", reqs / 10.0, bytes / 10.0 / (1 << 20), flushes / 10.0,
-                        flushes ? flush_us / 1000.0 / flushes : 0.0, busy / 100000.0);
+                        b->disk->offset ? "aux" : "root", reqs * 1e6 / every, bytes * 1e6 / every / (1 << 20), flushes * 1e6 / every,
+                        flushes ? flush_us / 1000.0 / flushes : 0.0, busy * 100.0 / every);
                 t_last = t1, busy = reqs = bytes = flushes = flush_us = 0;
             }
         }
