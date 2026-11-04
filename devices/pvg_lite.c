@@ -18,8 +18,17 @@
    Every command, on every ring, starts {op, length, stamp}. It is complete
    when the device has stored its stamp and moved the read pointer.
 
+   Display: channel 4 op 1 names a shared state page the device fills in
+   (modes, seq at +200, ack pending at +fa9, state at +fc0); the guest reads
+   +100 once it has set its mask at +104, acks with op 2. Swaps are op 8:
+   {port, 0, u64 mapping id, u64 gamma offset, u64 gamma length, count, sum},
+   and the device counts them at +f98 with the mapping id at +fb0.
+
+   A command with bit 16 of its op set first carries a barrier: {channel, stamp}.
+
    iosurface mapper: +1028 queue count, +1030 enable, +1000 ring, +1010
-   completions, +1008 size, +1018 submitted index, +1020 completed index. */
+   descriptor table, +1008 size, +1018 submitted index, +1020 completed index.
+   Ring entries are {op (1 map, 2 unmap, 3 test), mapping id, result, 0}. */
 
 #include "pvg_lite.h"
 
@@ -40,6 +49,19 @@ struct HvPvgLite {
     uint64_t io_regs[0x40 / 8];
     uint32_t root_rp, status, chan_pending;
     int root_pending, iosfc_pending;
+    uint64_t display_pa;
+    uint64_t swaps;
+};
+
+/* What the guest's GetDeviceInfo asks for: key, value pairs, as the framework
+   answers on an Apple GPU. */
+static const uint32_t device_info[][2] = {
+    {0x01, 4},      {0x02, 0},     {0x03, 0x400},  {0x04, 0x400},  {0x05, 0x400},  {0x06, 0x8000}, {0x07, 1},
+    {0x08, 1},      {0x09, 1},     {0x0a, 8},      {0x0b, 0x1ff},  {0x0c, 1},      {0x0d, 0x10},   {0x0e, 1},
+    {0x0f, 0x100},  {0x10, 1},     {0x11, 1},      {0x12, 0x20007}, {0x13, 1},     {0x14, 2},      {0x15, 1},
+    {0x16, 2},      {0x17, 1},     {0x18, 1},      {0x19, 1},      {0x1a, 1},      {0x1b, 1},      {0x1c, 7},
+    {0x21, 0xfff},  {0x24, 0xffffffff}, {0x1d, 0x400}, {0x1e, 0x1f}, {0x1f, 0x10000}, {0x20, 0x10}, {0x22, 5},
+    {0x29, 7},      {0x23, 0x800}, {0x25, 0x3f1},  {0x28, 0x10},
 };
 
 static uint32_t *guest32(HvPvgLite *p, uint64_t pa) { return hv_phys_ptr(p->m, pa, 4); }
@@ -63,10 +85,93 @@ static void do_root(HvPvgLite *p) {
             break;
         }
         if (p->log) fprintf(stderr, "hengevm: pvg-lite: root op %x len %x stamp %x\n", hdr[0], hdr[1], hdr[2]);
+        if ((hdr[0] & 0xffff) == 0x3a && hdr[1] >= 24) {
+            uint32_t *count = guest32(p, buf + off + (at + 12) % ring), *page = guest32(p, buf + off + (at + 20) % ring);
+            uint32_t *dst = page ? hv_phys_ptr(p->m, (uint64_t)*page << 14, sizeof device_info) : NULL;
+            if (dst && count) {
+                uint32_t n = sizeof device_info / sizeof device_info[0];
+                memcpy(dst, device_info, sizeof device_info);
+                if (p->log) fprintf(stderr, "hengevm: pvg-lite: device info: %u keys (asked %u)\n", n, *count);
+            }
+        }
         p->root_rp += hdr[1];
         uint32_t *stamp = guest32(p, buf);
         if (stamp) __atomic_store_n(stamp, hdr[2], __ATOMIC_RELEASE);
     }
+}
+
+/* Reads a command's bytes out of a ring made of scattered pages. */
+static void ring_read(HvPvgLite *p, const uint32_t *table, uint32_t size, uint32_t at, void *to, uint32_t n) {
+    uint8_t *d = to;
+    while (n) {
+        uint32_t o = at % size, c = 0x4000 - (o & 0x3fff);
+        if (c > n) c = n;
+        uint8_t *q = hv_phys_ptr(p->m, ((uint64_t)table[o >> 14] << 14) + (o & 0x3fff), c);
+        if (q) memcpy(d, q, c);
+        else memset(d, 0, c);
+        d += c, at += c, n -= c;
+    }
+}
+
+static void display_set_page(HvPvgLite *p, uint64_t pa) {
+    uint8_t *d = hv_phys_ptr(p->m, pa, 0x4000);
+    if (!d) return;
+    p->display_pa = pa;
+#define PUT32(off, v) (*(uint32_t *)(d + (off)) = (uint32_t)(v))
+#define PUTF(off, v) (*(float *)(d + (off)) = (v))
+    PUT32(0x00, 1);
+    PUT32(0x14, 300u << 16 | 400); /* physical size in mm */
+    PUT32(0x18, 0x01000100);
+    PUT32(0x1c, 0x400);
+    PUT32(0x20, 3);
+    PUTF(0x24, 400.0f);
+    PUTF(0x28, 300.0f);
+    PUT32(0x208, 1); /* one mode: */
+    PUT32(0x210, 1080u << 16 | 1920);
+    PUT32(0x214, 60u << 16);
+    PUTF(0xa10, 1.0f); /* identity colour matrix */
+    PUTF(0xa24, 1.0f);
+    PUTF(0xa38, 1.0f);
+    d[0xa73] = 1;
+    PUT32(0x200, 1); /* the mode list's sequence number, which the guest acks */
+    d[0xfa9] = 1;    /* ack pending */
+    PUT32(0xfc0, 1); /* state: told the guest, waiting for the ack */
+    __atomic_store_n((uint32_t *)(d + 0x100), 4, __ATOMIC_RELEASE); /* mode change: read when the guest sets its mask */
+#undef PUT32
+#undef PUTF
+}
+
+static void display_ack(HvPvgLite *p, uint32_t seq) {
+    uint8_t *d = p->display_pa ? hv_phys_ptr(p->m, p->display_pa, 0x4000) : NULL;
+    if (!d) return;
+    *(uint32_t *)(d + 0xfbc) = seq;
+    d[0xfa9] = 0;
+    *(uint32_t *)(d + 0xfc0) = 2;
+}
+
+static void display_swap(HvPvgLite *p, uint64_t mapping, const uint32_t *args) {
+    uint8_t *d = p->display_pa ? hv_phys_ptr(p->m, p->display_pa, 0x4000) : NULL;
+    if (!d) return;
+    memcpy(d + 0xf80, args + 4, 16); /* gamma table offset, length */
+    memcpy(d + 0xf90, args + 8, 8);  /* gamma entries, sum */
+    p->swaps++;
+    *(uint32_t *)(d + 0xf98) = (uint32_t)p->swaps;
+    *(uint32_t *)(d + 0xfb0) = (uint32_t)mapping;
+    __atomic_fetch_or((uint32_t *)(d + 0x100), 2, __ATOMIC_RELEASE);
+    if (p->log) fprintf(stderr, "hengevm: pvg-lite: swap %llu: mapping %llu\n", (unsigned long long)p->swaps, (unsigned long long)mapping);
+}
+
+/* Commands that do something even without a GPU to run them. */
+static void channel_command(HvPvgLite *p, const uint32_t *table, uint32_t size, uint32_t rd, const uint32_t *hdr) {
+    uint32_t op = hdr[0] & 0xffff, args[32], skip = hdr[0] >> 16 ? 8 : 0; /* a barrier comes first */
+    uint32_t n = hdr[1] > 12 + skip ? hdr[1] - 12 - skip : 0;
+    if (n > sizeof args) n = sizeof args;
+    if (op != 1 && op != 2 && op != 8) return;
+    memset(args, 0, sizeof args);
+    ring_read(p, table, size, rd + 12 + skip, args, n);
+    if (op == 1) display_set_page(p, (uint64_t)args[1] << 14);
+    else if (op == 2) display_ack(p, args[1]);
+    else display_swap(p, (uint64_t)args[3] << 32 | args[2], args);
 }
 
 static void do_channel(HvPvgLite *p, uint32_t ch) {
@@ -94,6 +199,7 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
             break;
         }
         if (p->log) fprintf(stderr, "hengevm: pvg-lite: ch %u op %x len %x stamp %x\n", ch, hdr[0], hdr[1], hdr[2]);
+        channel_command(p, table, size, rd, hdr);
         last = hdr[2], any = 1;
         rd += hdr[1];
     }

@@ -274,6 +274,8 @@ static void dump_hex(const char *what, uint64_t pa, const uint8_t *p, uint32_t n
     fprintf(stderr, "\n");
 }
 
+static uint64_t devinfo_pa;
+static uint32_t devinfo_len;
 /* The display's shared state page (channel 4, op 1 names it): what changes, by whom we can't tell. */
 static uint64_t disp_pa;
 static void trace_display(void) {
@@ -292,6 +294,11 @@ static void trace_display(void) {
 static void trace_data(int write, uint64_t off, uint64_t v) {
     if (pvg_trace < 2) return;
     trace_display();
+    if (write == 2 && devinfo_pa) {
+        uint8_t *q = hv_phys_ptr(board->m, devinfo_pa, devinfo_len ? devinfo_len : 0x400);
+        if (q) dump_hex("devinfo", devinfo_pa, q, devinfo_len ? devinfo_len : 0x400);
+        devinfo_pa = 0;
+    }
     if (write && off == 0x101c) fifo_pa = v << 14;
     if (write && off == 0x1030) shared_pa = v << 14;
     if (write && off == 0x1004) fifo_size = (uint32_t)v;
@@ -357,6 +364,10 @@ static void trace_data(int write, uint64_t off, uint64_t v) {
             uint32_t at = i % ring, n = to - i < ring - at ? to - i : ring - at;
             uint8_t *p = hv_phys_ptr(board->m, shared_pa + 0x4000 + at, n);
             if (p) dump_hex("fifo", shared_pa + 0x4000 + at, p, n);
+            if (p && n >= 24 && ((uint32_t *)p)[0] == 0x3a) { /* GetDeviceInfo: {version, count, page} */
+                devinfo_pa = (uint64_t)((uint32_t *)p)[5] << 14;
+                devinfo_len = ((uint32_t *)p)[4] * 16;
+            }
             i += n;
         }
         fifo_wp = to;
