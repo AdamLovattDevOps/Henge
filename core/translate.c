@@ -22,7 +22,7 @@ typedef struct {
     uint32_t at, kind, idx;
 } LitFix;
 
-enum { OOL_EXIT, OOL_SLOW, OOL_SYS, OOL_MRS };
+enum { OOL_EXIT, OOL_SLOW, OOL_SYS, OOL_MRS, OOL_GROUP };
 
 typedef struct {
     uint32_t at;        /* the branch that jumps here */
@@ -40,6 +40,23 @@ typedef struct {
     uint32_t retry;     /* loads and stores: where their translation starts, to run again after a refill */
     uint32_t rflags;    /* hv_tlb_refill's flags for it (0: no refill, straight to the helper) */
 } Ool;
+
+/* Loads and stores on one base register, close together in a block: the first
+   checks the TLB once for the whole range they touch and leaves the page's
+   host addend in cpu->gaddend[slot]; the rest use it with no check of their
+   own. If that check fails, the block runs a plain translation of the
+   instructions from the first through `end` instead (copy_at) and comes back
+   after them. See plan_groups. */
+#define MAX_GROUPS 8
+#define GROUP_SLOTS 4
+#define GROUP_SPAN 4096   /* bytes one group may cover */
+#define GROUP_INSNS 48    /* and instructions */
+typedef struct {
+    int32_t lo, hi;       /* bytes touched, relative to the base at the first access */
+    uint8_t store, base, slot, live;
+    uint16_t first, last, end;
+    uint32_t copy_at;
+} Group;
 
 typedef struct {
     uint32_t w[MAX_WORDS];
@@ -59,6 +76,16 @@ typedef struct {
     int no_ijc;          /* indirect branches always go to the dispatcher (breakpoints, tests' stop PC) */
     HvMachine *m;
     uint64_t cur_pc;     /* guest PC of the instruction being translated (or whose out-of-line exit is) */
+    /* Grouped accesses (Group). */
+    Group grp[MAX_GROUPS];
+    uint32_t ngrp;
+    int8_t gid[HV_MAX_BLOCK_INSNS];     /* the group an instruction is in, or -1 */
+    uint8_t grole[HV_MAX_BLOCK_INSNS];  /* 1: its first access, 2: a later one */
+    int32_t goff[HV_MAX_BLOCK_INSNS];   /* the access's address minus the base at the group's first */
+    uint32_t after[HV_MAX_BLOCK_INSNS]; /* where each instruction's translation ends */
+    uint32_t cur_i;
+    int nogroup;                        /* translating plain (copies, or the retry when they do not fit) */
+    int overflow;
 } Emit;
 
 static __thread Emit E; /* each CPU translates on its own thread, outside the translation lock */
@@ -600,6 +627,45 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
     uint32_t retry = e->n; /* a refilled TLB miss runs the access again from here */
     spill(e, s, 3);
 
+    /* Grouped (see Group): plan_groups only puts plain single and pair accesses
+       with an immediate offset on SP or an ordinary register here. */
+    int role = 0;
+    Group *grp = NULL;
+    if (!e->nogroup && e->cur_i < HV_MAX_BLOCK_INSNS && e->gid[e->cur_i] >= 0 && e->grp[e->gid[e->cur_i]].live) {
+        role = e->grole[e->cur_i];
+        grp = &e->grp[e->gid[e->cur_i]];
+    }
+    int g_el = op.unpriv || !(e->flags & HV_BLOCK_EL1) ? 0 : (e->flags & HV_BLOCK_PAN) ? 2 : 1;
+    if (role == 1) {
+        /* The whole range: A = base + lo, then the usual check for hi - lo bytes. */
+        int64_t lo = grp->lo, len = grp->hi - grp->lo;
+        if (op.rn == 31) {
+            put(e, ADD_SP_TO(A));
+            put_add_imm(e, A, A, lo);
+        } else if (lo) {
+            put_add_imm(e, A, op.rn, lo);
+        } else {
+            put(e, MOV_X(A, op.rn));
+        }
+        uint32_t gtlb = HV_CPU_TLB + g_el * HV_CPU_TLB_EL;
+        put(e, UBFM_X(T, A, HV_TLB_PAGE_BITS, HV_TLB_PAGE_BITS + HV_TLB_BITS - 1));
+        put(e, ADD_LSL(T, 28, T, 7));
+        put(e, LDR_X(U, T, gtlb + (grp->store ? 8 : 0)));
+        put(e, SUB_X(U, A, U));
+        if (len > HV_TLB_ADJ + 1) put_add_imm(e, U, U, len - 1 - HV_TLB_ADJ);
+        put(e, UBFM_X(U, U, HV_TLB_PAGE_BITS, 63));
+        put(e, CBNZ_X(U));
+        put_ool(e, (Ool){.kind = OOL_GROUP, .pc = (uint64_t)(grp - e->grp), .nrestore = 3, .restore = {A, T, U}});
+        put(e, LDR_X(U, T, gtlb + 24));
+        put(e, STR_X(U, 28, HV_CPU_GADDEND + 8 * grp->slot));
+        put(e, ADD_LSL(A, A, U, 0)); /* host address of base + lo */
+    } else if (role == 2) {
+        put(e, LDR_X(U, 28, HV_CPU_GADDEND + 8 * grp->slot));
+        put(e, op.rn == 31 ? ADD_EXT(A, 31, U, 3, 0) : ADD_LSL(A, op.rn, U, 0)); /* host address of the base */
+    }
+    /* Grouped: A + gimm is the host address (the access encodes gimm when it can). */
+    int64_t gimm = role ? (op.mode == HV_ADDR_POST ? 0 : op.imm) - (role == 1 ? grp->lo : 0) : 0;
+
     /* Effective address into A, or used where it is: a guest base register with nothing added. */
     int sp_base = !literal && op.rn == 31; /* the guest SP, which is the host SP while blocks run */
     int base_stolen = !literal && (sp_base || is_stolen(op.rn));
@@ -607,7 +673,9 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
                  (op.mode == HV_ADDR_POST || ((op.mode == HV_ADDR_OFFSET || op.mode == HV_ADDR_PRE) && op.imm == 0));
     int addr = direct ? op.rn : A;
     int base = op.rn;
-    if (literal) {
+    if (role) {
+        /* the address is in A already */
+    } else if (literal) {
         put_lit(e, A, pc + op.imm);
     } else {
         if (base_stolen) {
@@ -636,12 +704,12 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
 
     /* TLB: index from the first byte; the tag check (see HvTlbEntry) also
        makes an access that runs into the next page miss. Uses no flags. */
-    int el_idx = op.unpriv || !(e->flags & HV_BLOCK_EL1) ? 0 : (e->flags & HV_BLOCK_PAN) ? 2 : 1;
-    uint32_t tlb = HV_CPU_TLB;
+    int el_idx = g_el;
+    uint32_t slow = ~0u;
+    if (!role) {
+    uint32_t tlb = HV_CPU_TLB + el_idx * HV_CPU_TLB_EL;
     put(e, UBFM_X(T, addr, HV_TLB_PAGE_BITS, HV_TLB_PAGE_BITS + HV_TLB_BITS - 1));
-    put(e, ADD_LSL(T, 28, T, 5));
-    /* EL1's table lies beyond a load's immediate range: step over EL0's. */
-    if (el_idx) put(e, 0x91400000u | (uint32_t)((el_idx * HV_CPU_TLB_EL) >> 12) << 10 | T << 5 | T); /* add T, T, #table */
+    put(e, ADD_LSL(T, 28, T, 7));
     put(e, LDR_X(U, T, tlb + (op.store ? 8 : 0)));
     put(e, SUB_X(U, addr, U));
     if (op.align && op.bytes > 1) {
@@ -664,11 +732,21 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
                      .recheck = !(op.align && op.bytes > 1) && op.bytes <= HV_TLB_ADJ + 1, .addr = (uint8_t)addr,
                      .t = (uint8_t)T, .u = (uint8_t)U, .bytes = (uint8_t)op.bytes,
                      .tag_off = tlb + (op.store ? 8 : 0), .retry = retry, .rflags = rflags});
-    uint32_t slow = e->nool - 1;
+    slow = e->nool - 1;
     put(e, LDR_X(U, T, tlb + 24));
+    }
     /* Single loads and stores take [addr, addend] directly; the rest want the host address in A. */
     int reg_offset = op.kind == HV_MEM_SINGLE || op.kind == HV_MEM_LITERAL || op.kind == HV_MEM_LDRA;
-    if (!reg_offset) put(e, ADD_LSL(A, addr, U, 0));
+    if (!reg_offset && !role) put(e, ADD_LSL(A, addr, U, 0));
+    if (role) {
+        int64_t scale = 1ll << op.size;
+        int fits = pair ? gimm % scale == 0 && gimm / scale >= -64 && gimm / scale < 64
+                        : (gimm >= 0 && gimm % scale == 0 && gimm / scale < 4096) || (gimm >= -256 && gimm < 256);
+        if (!fits) {
+            put_add_imm(e, A, A, gimm);
+            gimm = 0;
+        }
+    }
 
     /* Stand-ins for x18/x28 operands: Rt (or Rs for RMW) in T, the other in U. */
     int rt = op.rt, rt2 = op.rt2, rs = op.rs;
@@ -692,6 +770,7 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
     case HV_MEM_PAIR: {
         uint32_t opc = op.vec ? op.size - 2u : (op.sign ? 1u : op.size == 3 ? 2u : 0u);
         out = opc << 30 | 0x29000000u | (uint32_t)op.vec << 26 | (uint32_t)op.load << 22 | rt2 << 10 | A << 5 | rt;
+        if (role) out |= ((uint32_t)(gimm >> op.size) & 0x7f) << 15;
         break;
     }
     case HV_MEM_SINGLE:
@@ -705,8 +784,12 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
             size = op.size;
             opc = op.store ? 0 : op.sign == 64 ? 2 : op.sign == 32 ? 3 : 1;
         }
-        /* LDR/STR (register), LSL #0: [addr, U] */
-        out = size << 30 | 0x38206800u | (uint32_t)op.vec << 26 | opc << 22 | (uint32_t)U << 16 | (uint32_t)addr << 5 | rt;
+        if (role && gimm >= 0 && gimm % (1ll << op.size) == 0 && (gimm >> op.size) < 4096) /* [A, #gimm] */
+            out = size << 30 | 0x39000000u | (uint32_t)op.vec << 26 | opc << 22 | (uint32_t)(gimm >> op.size) << 10 | (uint32_t)A << 5 | rt;
+        else if (role) /* LDUR/STUR [A, #gimm] */
+            out = size << 30 | 0x38000000u | (uint32_t)op.vec << 26 | opc << 22 | ((uint32_t)gimm & 0x1ff) << 12 | (uint32_t)A << 5 | rt;
+        else /* LDR/STR (register), LSL #0: [addr, U] */
+            out = size << 30 | 0x38206800u | (uint32_t)op.vec << 26 | opc << 22 | (uint32_t)U << 16 | (uint32_t)addr << 5 | rt;
         break;
     }
     case HV_MEM_VEC_MULTI:
@@ -749,7 +832,7 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
         if (base_stolen && !sp_base) put(e, STR_X(T, 28, slot_of(op.rn)));
     }
     unspill(e, s, 3);
-    e->ool[slow].join = e->n;
+    if (slow != ~0u) e->ool[slow].join = e->n;
 }
 
 /* DC ZVA: zero the 64-byte block holding Xt, on the host's own copy when the
@@ -782,15 +865,14 @@ static void translate_ic_ivau(Emit *e, uint32_t insn, uint64_t pc) {
     else put(e, MOV_X(A, rt)); /* rt 31 is XZR here */
     int el_idx = (e->flags & HV_BLOCK_PAN) ? 2 : 1;
     put(e, UBFM_X(T, A, HV_TLB_PAGE_BITS, HV_TLB_PAGE_BITS + HV_TLB_BITS - 1));
-    put(e, ADD_LSL(T, 28, T, 5));
-    put(e, 0x91400000u | (uint32_t)((el_idx * HV_CPU_TLB_EL) >> 12) << 10 | T << 5 | T);
-    put(e, LDR_X(U, T, HV_CPU_TLB + 0)); /* read tag */
+    put(e, ADD_LSL(T, 28, T, 7));
+    put(e, LDR_X(U, T, HV_CPU_TLB + el_idx * HV_CPU_TLB_EL + 0)); /* read tag */
     put(e, SUB_X(U, A, U));
     put(e, UBFM_X(U, U, HV_TLB_PAGE_BITS, 63));
     put(e, CBNZ_X(U));
     put_ool(e, (Ool){.kind = OOL_SYS, .pc = pc, .insn = insn, .nrestore = 3, .restore = {A, T, U}});
     uint32_t o1 = e->nool - 1;
-    put(e, LDR_X(U, T, HV_CPU_TLB + 24));
+    put(e, LDR_X(U, T, HV_CPU_TLB + el_idx * HV_CPU_TLB_EL + 24));
     put(e, ADD_LSL(A, A, U, 0));                                   /* host address */
     put_lit(e, U, (uint64_t)(uintptr_t)ram->host);
     put(e, SUB_X(A, A, U));
@@ -820,15 +902,14 @@ static void translate_dc_zva(Emit *e, uint32_t insn, uint64_t pc) {
     put(e, 0x92400000u | 58u << 16 | 57u << 10 | A << 5 | A); /* and A, A, #~63 */
     int el_idx = !(e->flags & HV_BLOCK_EL1) ? 0 : (e->flags & HV_BLOCK_PAN) ? 2 : 1;
     put(e, UBFM_X(T, A, HV_TLB_PAGE_BITS, HV_TLB_PAGE_BITS + HV_TLB_BITS - 1));
-    put(e, ADD_LSL(T, 28, T, 5));
-    if (el_idx) put(e, 0x91400000u | (uint32_t)((el_idx * HV_CPU_TLB_EL) >> 12) << 10 | T << 5 | T);
-    put(e, LDR_X(U, T, HV_CPU_TLB + 8)); /* write tag */
+    put(e, ADD_LSL(T, 28, T, 7));
+    put(e, LDR_X(U, T, HV_CPU_TLB + el_idx * HV_CPU_TLB_EL + 8)); /* write tag */
     put(e, SUB_X(U, A, U));
     put(e, UBFM_X(U, U, HV_TLB_PAGE_BITS, 63));
     put(e, CBNZ_X(U));
     put_ool(e, (Ool){.kind = OOL_SYS, .pc = pc, .insn = insn, .nrestore = 3, .restore = {A, T, U}});
     uint32_t slow = e->nool - 1;
-    put(e, LDR_X(U, T, HV_CPU_TLB + 24));
+    put(e, LDR_X(U, T, HV_CPU_TLB + el_idx * HV_CPU_TLB_EL + 24));
     put(e, ADD_LSL(A, A, U, 0));
     put(e, 0xd50b7420u | A); /* dc zva, A */
     unspill(e, s, 3);
@@ -1298,6 +1379,12 @@ static void emit_ool(Emit *e) {
             put(e, B_OP);
             patch_branch(&e->w[e->n - 1], (int64_t)(o->at + 1) - (e->n - 1));
         }
+        if (o->kind == OOL_GROUP) {
+            unspill(e, o->restore, o->nrestore);
+            put(e, B_OP);
+            patch_branch(&e->w[e->n - 1], (int64_t)e->grp[o->pc].copy_at - (e->n - 1));
+            continue;
+        }
         if (o->kind == OOL_SLOW && o->rflags) {
             /* A TLB miss: hv_helper_thunk tries the light refill first (x7 = the
                address; x7 is never a guest register) and, if it filled the TLB,
@@ -1321,7 +1408,139 @@ static void emit_ool(Emit *e) {
     }
 }
 
+/* Find the groups (see Group) in the instructions a block may hold. Only
+   instructions whose effect on general registers is plain are walked through:
+   ALU and SIMD (writing at most Rd), PC-relative, PAC, prefetches and other
+   loads and stores; anything else ends every group. */
+static int group_op(const HvMemOp *op) {
+    return (op->kind == HV_MEM_SINGLE || op->kind == HV_MEM_PAIR) && !op->align && !op->unpriv &&
+           (op->mode == HV_ADDR_OFFSET || op->mode == HV_ADDR_PRE || op->mode == HV_ADDR_POST) &&
+           (op->rn == 31 || !is_stolen(op->rn)) && op->bytes <= 64;
+}
+
+static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va) {
+    e->ngrp = 0;
+    memset(e->gid, -1, sizeof e->gid);
+    if (e->nogroup || e->slow_mem) return;
+    int cur[32];
+    int64_t delta[32];
+    for (int r = 0; r < 32; r++) cur[r] = -1, delta[r] = 0;
+#define KILL(r) (cur[(r) & 31] = -1)
+    for (uint32_t i = 0; i < max && i < HV_MAX_BLOCK_INSNS; i++) {
+        uint32_t insn = code[i];
+        if (i > 0 && va + 4ull * i == e->m->stop_pc) break;
+        HvInsnKind kind = hv_classify(insn);
+        if ((e->flags & HV_BLOCK_FPOFF) && kind != HV_INSN_UNDEFINED && is_fp_insn(insn)) break;
+        if (kind == HV_INSN_COPY && (insn & 0xfffff01fu) == 0xd503201fu) continue; /* hints (NOP, BTI): no register */
+        if (kind == HV_INSN_COPY || kind == HV_INSN_PCREL || kind == HV_INSN_LOAD_LITERAL) {
+            KILL(insn);
+            continue;
+        }
+        if (kind == HV_INSN_PAC) {
+            KILL(insn), KILL(30), KILL(17), KILL(16);
+            continue;
+        }
+        if (kind == HV_INSN_PREFETCH) continue;
+        if (kind != HV_INSN_MEMORY) break;
+        HvMemOp op;
+        if (hv_mem_decode(insn, &op) != 0) break;
+        if (group_op(&op)) {
+            int b = op.rn;
+            int64_t off = delta[b] + (op.mode == HV_ADDR_POST ? 0 : op.imm);
+            Group *g = cur[b] >= 0 ? &e->grp[cur[b]] : NULL;
+            if (g) {
+                int64_t lo = off < g->lo ? off : g->lo, hi = off + op.bytes > g->hi ? off + op.bytes : g->hi;
+                if (hi - lo > GROUP_SPAN || i - g->first > GROUP_INSNS) g = NULL;
+                else {
+                    g->lo = (int32_t)lo, g->hi = (int32_t)hi, g->last = (uint16_t)i, g->store |= op.store;
+                    e->gid[i] = (int8_t)cur[b], e->grole[i] = 2, e->goff[i] = (int32_t)off;
+                }
+            }
+            if (!g && e->ngrp < MAX_GROUPS) {
+                cur[b] = (int)e->ngrp;
+                delta[b] = 0;
+                off = op.mode == HV_ADDR_POST ? 0 : op.imm;
+                e->grp[e->ngrp++] = (Group){.lo = (int32_t)off, .hi = (int32_t)(off + op.bytes), .store = op.store,
+                                            .base = (uint8_t)b, .first = (uint16_t)i, .last = (uint16_t)i};
+                e->gid[i] = (int8_t)cur[b], e->grole[i] = 1, e->goff[i] = (int32_t)off;
+            } else if (!g) {
+                cur[b] = -1;
+            }
+            if (op.mode == HV_ADDR_PRE || op.mode == HV_ADDR_POST) delta[b] += op.imm;
+            if (op.load && !op.vec) {
+                KILL(op.rt);
+                if (op.kind == HV_MEM_PAIR) KILL(op.rt2);
+            }
+            continue;
+        }
+        /* Another load or store: what it may write. */
+        if (op.load && !op.vec) KILL(op.rt), KILL(op.rt2);
+        KILL(op.rs);
+        if (op.mode == HV_ADDR_PRE || op.mode == HV_ADDR_POST || op.mode == HV_ADDR_REG) KILL(op.rn);
+        if (op.kind == HV_MEM_VEC_MULTI || op.kind == HV_MEM_VEC_SINGLE) KILL(op.rn);
+    }
+#undef KILL
+    /* A group needs a second access; then a slot of its own while it lives. */
+    uint16_t slot_free[GROUP_SLOTS] = {0};
+    for (uint32_t k = 0; k < e->ngrp; k++) {
+        Group *g = &e->grp[k];
+        g->live = 0;
+        if (g->last == g->first) continue;
+        for (int s = 0; s < GROUP_SLOTS; s++)
+            if (slot_free[s] <= g->first) {
+                g->slot = (uint8_t)s, g->live = 1;
+                slot_free[s] = (uint16_t)(g->last + 1);
+                break;
+            }
+    }
+    /* A failed group runs its instructions plain, through its last access and
+       through every later-starting group that runs on past it (whose first
+       access the plain copy then makes too). */
+    for (uint32_t k = 0; k < e->ngrp; k++) {
+        Group *g = &e->grp[k];
+        if (!g->live) continue;
+        uint16_t end = g->last;
+        for (int again = 1; again;) {
+            again = 0;
+            for (uint32_t j = 0; j < e->ngrp; j++) {
+                Group *h = &e->grp[j];
+                if (h->live && h->first > g->first && h->first <= end && h->last > end) end = h->last, again = 1;
+            }
+        }
+        g->end = end;
+    }
+}
+
+/* After the block: each live group's plain copy. Returns -1 if they do not fit. */
+static int emit_group_copies(Emit *e, const uint32_t *code, uint64_t va, uint32_t ntrans) {
+    e->nogroup = 1;
+    for (uint32_t k = 0; k < e->ngrp; k++) {
+        Group *g = &e->grp[k];
+        if (!g->live || g->first >= ntrans) continue;
+        uint32_t end = g->end < ntrans ? g->end : ntrans - 1;
+        g->copy_at = e->n;
+        for (uint32_t i = g->first; i <= end; i++) {
+            if (e->n + WORDS_PER_INSN_MAX * 2 > MAX_WORDS || e->npool + 8 > MAX_LITS || e->nool + 4 > MAX_OOL) return -1;
+            e->cur_pc = va + 4ull * i;
+            e->cur_i = i;
+            if (translate_one(e, code[i], va + 4ull * i)) return -1; /* cannot happen: groups hold no block ends */
+        }
+        put(e, B_OP);
+        patch_branch(&e->w[e->n - 1], (int64_t)e->after[end] - (e->n - 1));
+    }
+    return 0;
+}
+
+static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail, int nogroup);
+
 int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail) {
+    static int off = -1; /* HV_NO_GROUPS: every access checks the TLB itself */
+    if (off < 0) off = getenv("HV_NO_GROUPS") != NULL;
+    if (!off && translate_emit(m, b, code, avail, 0) == 0) return 0;
+    return translate_emit(m, b, code, avail, 1);
+}
+
+static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail, int nogroup) {
     Emit *e = &E;
     e->n = e->npool = e->nfix = e->nool = e->nsite = 0;
     e->flags = b->flags;
@@ -1329,23 +1548,28 @@ int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t a
     e->page = b->va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
     e->no_ijc = !m->chain;
     e->m = m;
+    e->nogroup = nogroup;
 
     /* No prologue: hv_enter, chained exits and the indirect-branch cache all
        enter with guest x0 and x1 live. */
     uint32_t max = avail < HV_MAX_BLOCK_INSNS ? avail : HV_MAX_BLOCK_INSNS;
+    plan_groups(e, code, max, b->va);
     uint32_t i = 0;
     int ended = 0;
     while (i < max && !ended) {
         uint64_t pc = b->va + 4ull * i;
         if (i > 0 && pc == m->stop_pc) break; /* so the dispatcher sees stop_pc at a block start */
         e->cur_pc = pc;
+        e->cur_i = i;
         ended = translate_one(e, code[i], pc);
+        e->after[i] = e->n;
         i++;
         if (e->n + WORDS_PER_INSN_MAX * 2 > MAX_WORDS || e->npool + 8 > MAX_LITS || e->nool + 4 > MAX_OOL) break;
     }
     if (!ended) put_branch_exit(e, b->va + 4ull * i);
     b->ninsns = i;
     uint32_t inline_words = e->n;
+    if (!e->nogroup && e->ngrp && emit_group_copies(e, code, b->va, i) != 0) return -1;
     emit_ool(e);
     if (m->stats_interval) {
         m->stats.words_inline += inline_words;
@@ -1374,6 +1598,8 @@ int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t a
     e->total = total;
     return 0;
 }
+
+uint32_t hv_translate_last_words(void) { return E.pool_at; } /* code words (no pool) of this thread's last block */
 
 int hv_translate_place(HvMachine *m, HvBlock *b) {
     Emit *e = &E;

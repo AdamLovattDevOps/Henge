@@ -60,6 +60,30 @@ static uint32_t block_flags(HvCpu *cpu) {
    (m->flush_pending is set: the dispatcher does that, then tries again). */
 #define hash_of hv_block_hash
 #define find hv_block_find
+/* HV_BLOCK_DUMP=file: every 64th translated block (guest and host words) for
+   bench/hvdis.py, to see what the translator makes of real code. */
+static void block_dump(const HvBlock *b, const uint32_t *code) {
+    static FILE *f;
+    static int on = -1;
+    static uint32_t count;
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    if (on < 0) {
+        const char *path = getenv("HV_BLOCK_DUMP");
+        on = path && (f = fopen(path, "wb")) != NULL;
+    }
+    if (!on || __atomic_add_fetch(&count, 1, __ATOMIC_RELAXED) % 64) return;
+    uint64_t head[3] = {b->va, b->ninsns, 0};
+    const uint32_t *w = b->code;
+    uint32_t n = hv_translate_last_words();
+    head[2] = n;
+    pthread_mutex_lock(&mu);
+    fwrite(head, 8, 3, f);
+    fwrite(code, 4, b->ninsns, f);
+    fwrite(w, 4, n, f);
+    fflush(f);
+    pthread_mutex_unlock(&mu);
+}
+
 static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, const uint32_t *code, uint32_t avail) {
     HvMachine *m = cpu->m;
     uint32_t j = (uint32_t)((va >> 2) ^ (va >> 18) ^ ((uint64_t)flags << 13)) & ((1u << HV_JC_BITS) - 1);
@@ -89,6 +113,7 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
         m->stats.flush_full++;
         goto flush;
     }
+    block_dump(&nb, code);
     /* ...then take the lock only to publish it. */
     if (pthread_mutex_trylock(&m->tr_mu) != 0) {
         uint64_t w0 = m->stats_interval ? mach_absolute_time() : 0;
@@ -414,6 +439,8 @@ static void print_stats(HvCpu *cpu, int force) {
                 RATE(code_protects), RATE(syncs), RATE(sync_ticks) / 240000.0, RATE(dev_waits), RATE(dev_wait_ticks) / 240000.0,
                 RATE(tr_waits), RATE(tr_wait_ticks) / 240000.0);
         fprintf(stderr, "  light refills %.0fK/s, light branch-cache fills %.0fK/s\n", RATE(refills) / 1e3, RATE(ijc_light) / 1e3);
+        fprintf(stderr, "  process switches: %.0f/s saved, %.0f/s restored (%.0f entries each)\n", RATE(stash_saves), RATE(stash_hits),
+                s->stash_hits - last.stash_hits ? (double)(s->stash_entries - last.stash_entries) / (s->stash_hits - last.stash_hits) : 0.0);
         fprintf(stderr, "  tlb misses K/s: el0 empty %.0f el0 conflict %.0f el1 empty %.0f el1 conflict %.0f\n",
                 RATE(tlb_miss_kind[0]) / 1e3, RATE(tlb_miss_kind[1]) / 1e3, RATE(tlb_miss_kind[2]) / 1e3, RATE(tlb_miss_kind[3]) / 1e3);
         fprintf(stderr, "  slow mem causes K/s: mmio %.0f code-page write %.0f page end %.0f tlb miss %.0f other %.0f entry-but-tag %.0f\n",

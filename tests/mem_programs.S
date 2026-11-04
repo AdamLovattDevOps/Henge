@@ -317,6 +317,44 @@ PROGRAM pageend
     ldr x13, [x1, #64]
 END pageend
 
+PROGRAM groups
+    // Accesses grouped on one base (one TLB check for all): SP with writeback,
+    // negative and unscaled offsets, sign-extending, pairs of q registers.
+    // x15 (never a group base) warms the TLB so the group checks pass.
+    mov x15, sp
+    ldr x15, [x15, #-0x60]
+    ldr x15, [x0]
+    ldr x15, [x0, #0x4000]
+    stp x22, x21, [sp, #-0x60]!
+    stp x20, x19, [sp, #0x10]
+    str x1, [sp, #0x20]
+    stur w2, [sp, #0x29]
+    ldrsb x3, [sp, #0x29]
+    ldrsh w4, [sp, #0x2a]
+    ldur x5, [sp, #0x23]
+    stp q0, q1, [sp, #0x30]
+    ldp q2, q3, [sp, #0x30]
+    ldr q4, [sp, #0x40]
+    ldp x22, x21, [sp], #0x60
+    // A plain base, members before and after the first.
+    add x6, x0, #0x800
+    ldr x7, [x6, #8]
+    str x7, [x6, #-8]
+    ldp w8, w9, [x6, #-0x40]
+    strb w8, [x6, #0x7ff]
+    ldrh w10, [x6, #-0x100]
+    add x6, x6, #1
+    ldr x11, [x6, #8]
+    // The same group across a page end: runs the plain copy.
+    add x12, x0, #0x4000
+    ldr x13, [x12, #-8]
+    ldr x14, [x12]
+    str x13, [x12, #8]
+    ldp x16, x17, [x12, #-16]
+    // Base overwritten by a load in the group.
+    ldr x12, [x12, #-8]
+END groups
+
 PROGRAM mmio
     str w1, [x0]
     ldr w2, [x0, #4]

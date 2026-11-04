@@ -195,7 +195,13 @@ static int write_reg(HvCpu *cpu, uint32_t reg, uint64_t v) {
     }
     case R(3, 0, 1, 0, 1): cpu->actlr_el1 = v; return 0;
     case R(3, 0, 1, 0, 2): cpu->cpacr_el1 = v; return 0;
-    case R(3, 0, 2, 0, 0): cpu->ttbr0_el1 = v; hv_tlb_flush_user(cpu); hv_ijc_switch(cpu); return 0; /* a process switch */
+    case R(3, 0, 2, 0, 0): { /* a process switch */
+        uint64_t old = cpu->ttbr0_el1;
+        cpu->ttbr0_el1 = v;
+        hv_tlb_switch_user(cpu, old, v);
+        hv_ijc_switch(cpu);
+        return 0;
+    }
     case R(3, 0, 2, 0, 1): { /* TTBR1: rewritten unchanged on context switches; its ASID field only counts with TCR.A1 */
         uint64_t changed = (cpu->ttbr1_el1 ^ v) & ((cpu->tcr_el1 >> 22) & 1 ? ~0ull : 0x0000ffffffffffffull);
         cpu->ttbr1_el1 = v;
@@ -347,6 +353,7 @@ void hv_tlbi_apply(HvCpu *cpu, uint32_t op1, uint32_t crn, uint32_t crm, uint32_
             if ((va >> 55) & 1 || !shift) hv_tlb_flush(cpu);
             else {
                 hv_tlb_flush_user(cpu);
+                hv_tlb_stash_drop(cpu, all_asids ? -1 : (int)(xt >> 48));
                 cpu->m->stats.reset_why[7]++;
                 hv_ijc_drop_range(cpu, va, len, all_asids ? -1 : (int)(xt >> 48));
             }
@@ -363,6 +370,7 @@ void hv_tlbi_apply(HvCpu *cpu, uint32_t op1, uint32_t crn, uint32_t crm, uint32_
         hv_tlb_flush_va_asid(cpu, va, all_asids ? -1 : (int)(xt >> 48));
     } else if (by_asid) {
         hv_tlb_flush_user(cpu);
+        hv_tlb_stash_drop(cpu, (int)(xt >> 48));
         cpu->m->stats.reset_why[1]++;
         hv_ijc_drop_asid(cpu, (uint16_t)(xt >> 48));
     } else {
@@ -420,7 +428,7 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
                 HvCpu *c = m->cpus[i];
                 if (!c || c == cpu) continue;
                 uint64_t s = hv_cpu_post_tlbi(c, op1, crn, crm, op2, xt);
-                if (!(by_va && hv_tlbi_drop_remote_va(c, va))) seq[i] = s;
+                if (!(by_va && hv_tlbi_drop_remote_va(c, va, op2 == 3 || op2 == 7 ? -1 : (int)(xt >> 48)))) seq[i] = s;
             }
             for (int i = 0; i < m->ncpus; i++)
                 if (seq[i]) hv_cpu_sync(cpu, m->cpus[i], seq[i]);

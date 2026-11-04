@@ -141,7 +141,7 @@ int main(void) {
     hv_mmu_access(&cpu, 0x100004000, HV_ACC_READ, 1, &pa);
     checks++;
     /* 0x40008000 is not RAM here, so nothing may be filled */
-    if (cpu.tlb[1][(0x100004000 >> 14) & (HV_TLB_SIZE - 1)].read_tag != HV_TLB_INVALID) {
+    if (cpu.tlb[(0x100004000 >> 14) & (HV_TLB_SIZE - 1)][1].read_tag != HV_TLB_INVALID) {
         printf("  FAIL TLB filled for non-RAM\n");
         failures++;
     }
@@ -160,7 +160,7 @@ int main(void) {
     hv_tlb_flush(&cpu);
     hv_mmu_access(&cpu, 0x12345678, HV_ACC_READ, 1, &pa);
     checks++;
-    if (cpu.tlb[1][(0x12345678 >> 14) & (HV_TLB_SIZE - 1)].read_tag != HV_TLB_INVALID) {
+    if (cpu.tlb[(0x12345678 >> 14) & (HV_TLB_SIZE - 1)][1].read_tag != HV_TLB_INVALID) {
         printf("  FAIL a 4K mapping went into the 16K TLB\n");
         failures++;
     }
@@ -184,7 +184,7 @@ int main(void) {
             int table = (bases[b] >> 55) & 1 ? 1 : 0;
             for (int k = 0; k < 8; k++) {
                 uint64_t va = bases[b] + ((uint64_t)k << 14);
-                HvTlbEntry *t = &cpu.tlb[table][(va >> 14) & (HV_TLB_SIZE - 1)];
+                HvTlbEntry *t = &cpu.tlb[(va >> 14) & (HV_TLB_SIZE - 1)][table];
                 t->read_tag = va - HV_TLB_ADJ;
                 t->addend = 0;
             }
@@ -193,7 +193,7 @@ int main(void) {
             hv_sysreg_sys(&cpu, 0xd5088221u, 0); /* tlbi rvae1is, x1 */
             for (int k = 0; k < 8; k++) {
                 uint64_t va = bases[b] + ((uint64_t)k << 14);
-                int dropped = cpu.tlb[table][(va >> 14) & (HV_TLB_SIZE - 1)].read_tag == HV_TLB_INVALID;
+                int dropped = cpu.tlb[(va >> 14) & (HV_TLB_SIZE - 1)][table].read_tag == HV_TLB_INVALID;
                 checks++;
                 if (dropped != (k < 6)) {
                     printf("  FAIL range TLBI, base %llx page %d: %s\n", (unsigned long long)bases[b], k,

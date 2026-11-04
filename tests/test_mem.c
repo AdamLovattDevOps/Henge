@@ -15,13 +15,14 @@ DECLARE_PROGRAM(loops);
 DECLARE_PROGRAM(epilogue);
 DECLARE_PROGRAM(dczva);
 DECLARE_PROGRAM(pageend);
+DECLARE_PROGRAM(groups);
 DECLARE_PROGRAM(mmio);
 extern const char mem_programs_begin[], mem_programs_finish[];
 
 static const TestProgram programs[] = {
     TEST_PROGRAM(single), TEST_PROGRAM(stolen_mem), TEST_PROGRAM(pairs),   TEST_PROGRAM(simd_mem),
     TEST_PROGRAM(exclusive), TEST_PROGRAM(atomics),  TEST_PROGRAM(literal), TEST_PROGRAM(loops), TEST_PROGRAM(epilogue),
-    TEST_PROGRAM(dczva), TEST_PROGRAM(pageend),
+    TEST_PROGRAM(dczva), TEST_PROGRAM(pageend), TEST_PROGRAM(groups),
 };
 
 #define DATA_SIZE 65536

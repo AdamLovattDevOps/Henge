@@ -66,6 +66,7 @@ typedef struct HvStats {
     uint64_t words_inline, words_ool, words_pool; /* translated code size by part */
     uint64_t refills;
     uint64_t ijc_light;       /* branch-cache misses resolved without the dispatcher (hv_ijc_resolve) */         /* TLB misses filled by the light path (hv_tlb_refill) */
+    uint64_t stash_saves, stash_hits, stash_entries; /* user TLB entries kept across process switches */
     uint64_t code_protects;   /* pages that became code (every CPU's TLB scanned for writable entries) */
     uint64_t tlb_miss_kind[4]; /* TLB misses: EL0 empty, EL0 other page there, EL1 empty, EL1 other page there */
     uint64_t slow_why[6];     /* slow accesses by cause: MMIO, code-page write, page end, TLB miss, other, TLB entry there but mismatched */
@@ -92,6 +93,22 @@ typedef struct HvStats {
    structs around, so it lives here, by CPU index): its indirect-branch cache and
    the filters for dropping entries from it, the front cache of blocks, its
    interrupt lines and its wakeup. */
+/* A process's user TLB entries, put aside when it is switched out (TTBR0 now
+   names another address space) and put back when it comes back, as a TLB
+   tagged by ASID keeps them. Any TLBI that could touch the address space
+   (here or from another CPU) bumps gen; a stash whose gen moved is dropped. */
+#define HV_STASHES 8
+#define HV_STASH_CAP 1024
+typedef struct HvTlbStash {
+    uint64_t ttbr0;      /* the address space (0: empty); read by other CPUs */
+    uint32_t gen;        /* bumped by TLBIs (atomic) */
+    uint32_t saved_gen;  /* gen when the entries were saved */
+    uint32_t n;
+    uint64_t used;       /* for replacing the least recently saved */
+    uint16_t *slot;      /* slot << 2 | table, as user_fills */
+    HvTlbEntry *ent;
+} HvTlbStash;
+
 typedef struct HvPerCpu {
     /* Interrupt lines into this CPU, driven by the GIC. First and together:
        translated code reads both with one load (HvCpu.lines_ptr). */
@@ -128,6 +145,8 @@ typedef struct HvPerCpu {
        may be using TLB entries right now. */
     int active, tlb_live;
     uint32_t walk_seq;           /* odd while it walks page tables and fills its TLB (see hv_tlbi_drop_remote_va) */
+    HvTlbStash stash[HV_STASHES];
+    uint64_t stash_clock;
 } HvPerCpu;
 
 #define HV_REQ_TLB_ALL 1u   /* drop the whole TLB and branch cache */

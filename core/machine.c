@@ -57,6 +57,11 @@ static int init_rest(HvMachine *m) {
         p->ijc = calloc(HV_IJC_TABLES * HV_IJC_TABLE_BYTES / 8, 8);
         p->ucode = calloc(1u << HV_UCODE_BITS, 8);
         if (!p->ijc || !p->ucode) return -1;
+        for (int k = 0; k < HV_STASHES; k++) {
+            p->stash[k].slot = calloc(HV_STASH_CAP, sizeof *p->stash[k].slot);
+            p->stash[k].ent = calloc(HV_STASH_CAP, sizeof *p->stash[k].ent);
+            if (!p->stash[k].slot || !p->stash[k].ent) return -1;
+        }
         pthread_mutex_init(&p->wake_mu, NULL);
         pthread_cond_init(&p->wake_cv, NULL);
         pthread_mutex_init(&p->req_mu, NULL);

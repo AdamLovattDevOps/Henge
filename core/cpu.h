@@ -74,9 +74,11 @@ typedef struct HvCpu {
     uint64_t ijc_thunk;      /* 0x430: hv_ijc_thunk */
     uint64_t refill_ret;     /* 0x438: where it goes back to */
     uint64_t ijc_tab[16];    /* 0x440: each flags value's branch-cache table (ijc + flags * table size) */
-    /* 0x4c0: [0] EL0 and unprivileged accesses, [1] EL1, [2] EL1 with PSTATE.PAN set,
-       so toggling PAN (the kernel does it around every user copy) flushes nothing. */
-    HvTlbEntry tlb[3][HV_TLB_SIZE];
+    uint64_t gaddend;        /* 0x4c0: host addend of the page a group of accesses on one base register was checked in (translate_mem) */
+    /* 0x500: [0] EL0 and unprivileged accesses, [1] EL1, [2] EL1 with PSTATE.PAN set,
+       so toggling PAN (the kernel does it around every user copy) flushes nothing.
+       [slot][EL0, EL1, EL1 with PAN, unused]: a slot's three in one 128-byte cache line. */
+    HvTlbEntry tlb[HV_TLB_SIZE][4] __attribute__((aligned(128)));
 
     /* The rest is only touched by C. */
     struct HvMachine *m;
@@ -172,7 +174,8 @@ typedef struct HvCpu {
 #define HV_CPU_SPSEL       0x3fc
 #define HV_CPU_SP_EL1      0x398
 #define HV_CPU_IJC_TAB     0x440
-#define HV_CPU_TLB         0x4c0
+#define HV_CPU_TLB         0x500
+#define HV_CPU_GADDEND     0x4c0
 
 /* Indirect-branch cache: one table per block-flags value, 64K entries of 16 bytes,
    indexed by ((va ^ va >> 16) >> 2) so code at the same offset in different pages spreads out. */
@@ -180,7 +183,7 @@ typedef struct HvCpu {
 #define HV_IJC_TABLES 16
 #define HV_UCODE_BITS 18
 #define HV_IJC_TABLE_BYTES ((1u << HV_IJC_BITS) * 16)
-#define HV_CPU_TLB_EL      (HV_TLB_SIZE * 32)
+#define HV_CPU_TLB_EL      32 /* between a slot's tables */
 
 _Static_assert(offsetof(HvCpu, sp) == HV_CPU_SP, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, pc) == HV_CPU_PC, "HvCpu layout");
@@ -194,6 +197,7 @@ _Static_assert(offsetof(HvCpu, fpsr) == HV_CPU_FPSR, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, helper_routine) == HV_CPU_HELPER, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, helper_ret) == HV_CPU_HELPER_RET, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, tlb) == HV_CPU_TLB, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, gaddend) == HV_CPU_GADDEND, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, tpidr_el0) == HV_CPU_TPIDR_EL0, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, daif) == HV_CPU_DAIF, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, far_el1) == HV_CPU_FAR_EL1, "HvCpu layout");

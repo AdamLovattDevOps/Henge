@@ -301,7 +301,7 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
         uint64_t pa;
         int had_entry = 0;
         if (cpu->m->stats_interval) { /* --stats: was the TLB entry there before this access? */
-            HvTlbEntry *t = &cpu->tlb[hv_tlb_table(cpu, el)][(va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1)];
+            HvTlbEntry *t = &cpu->tlb[(va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1)][hv_tlb_table(cpu, el)];
             uint64_t tag = write ? t->write_tag : t->read_tag;
             had_entry = tag != HV_TLB_INVALID && ((va - tag) >> HV_TLB_PAGE_BITS) == 0 ? 1 :
                         tag != HV_TLB_INVALID && ((va - tag - HV_TLB_ADJ) >> HV_TLB_PAGE_BITS) == 0 ? 2 : 0;
