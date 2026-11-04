@@ -156,7 +156,7 @@ typedef struct HvCpu {
 
 /* Indirect-branch cache: one table per block-flags value, 64K entries of 16 bytes,
    indexed by ((va ^ va >> 16) >> 2) so code at the same offset in different pages spreads out. */
-#define HV_IJC_BITS 18
+#define HV_IJC_BITS 16
 #define HV_IJC_TABLES 16
 #define HV_UCODE_BITS 18
 #define HV_IJC_TABLE_BYTES ((1u << HV_IJC_BITS) * 16)
