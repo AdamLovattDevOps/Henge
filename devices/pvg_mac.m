@@ -279,6 +279,17 @@ static void trace_data(int write, uint64_t off, uint64_t v) {
     if (write && off == 0x101c) fifo_pa = v << 14;
     if (write && off == 0x1030) shared_pa = v << 14;
     if (write && off == 0x1004) fifo_size = (uint32_t)v;
+    if (write && off == 0x1008) { /* the first doorbells: what both registered pages hold */
+        static int shown;
+        if (shown++ < 12) {
+            uint64_t pas[2] = {fifo_pa, shared_pa};
+            const char *names[2] = {"page101c", "page1030"};
+            for (int k = 0; k < 2; k++) {
+                uint8_t *p = pas[k] ? hv_phys_ptr(board->m, pas[k], 256) : NULL;
+                if (p) dump_hex(names[k], pas[k], p, 256);
+            }
+        }
+    }
     if (write && off == 0x1008 && fifo_pa && fifo_size) {
         uint32_t from = fifo_wp, to = (uint32_t)v;
         for (uint32_t i = from; i != to && i - from < fifo_size; ) {

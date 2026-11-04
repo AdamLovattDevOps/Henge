@@ -227,7 +227,14 @@ HvVirtioBlk *hv_virtio_blk_create(HvMachine *m, HvPcie *bus, HvDisk *disk, int a
     pthread_cond_init(&b->done_cv, NULL);
     for (int i = 0; i < HV_VBLK_WORKERS; i++) pthread_create(&b->worker[i], NULL, worker, b);
     uint64_t capacity = disk->size / 512;
-    uint32_t seg_max = HV_VIRTQ_MAX_SEGS - 2, blk_size = 512, apple_type = (uint32_t)apple_variant;
+    /* Apple's driver takes one descriptor per segment from the queue's 256
+       and does not use indirect tables: with segments up to 126, two big
+       writes used them all and the next failed (kIOReturnNoMemory, ENOMEM in
+       APFS, or its cleanup asserted "Adding invalid index 65535"). 32 lets
+       seven of the biggest requests be in flight. */
+    uint32_t seg_max = getenv("HV_BLK_SEG_MAX") ? (uint32_t)atoi(getenv("HV_BLK_SEG_MAX")) : 32;
+    if (seg_max < 1 || seg_max > HV_VIRTQ_MAX_SEGS - 2) seg_max = 32;
+    uint32_t blk_size = 512, apple_type = (uint32_t)apple_variant;
     uint16_t num_queues = 1;
     memcpy(v->config + 0, &capacity, 8);
     memcpy(v->config + 12, &seg_max, 4);
