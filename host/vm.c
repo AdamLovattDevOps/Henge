@@ -53,8 +53,8 @@ int hv_vm_boot_display(HvBootDisplay *d) {
             for (uint64_t off = 0; off + 0x1000 <= limit && !found; off += 0x4000) {
                 const uint64_t *q = (const uint64_t *)(ram + off);
                 const uint16_t *h = (const uint16_t *)(ram + off);
-                if (h[0] != 2 || (h[1] != 2 && h[1] != 3)) continue;
-                if (q[2] != VMAPPLE_MEM || q[3] == 0 || q[3] > size) continue;
+                if (h[0] < 2 || h[0] > 3 || h[1] < 1 || h[1] > 3) continue; /* boot_args: revision, version */
+                if (q[1] >> 40 != 0xfffffe || q[2] < VMAPPLE_MEM || q[2] >= VMAPPLE_MEM + size || q[3] == 0 || q[3] > size) continue;
                 uint64_t base = q[5], row = q[7], w = q[8], hh = q[9], depth = q[10];
                 if (w < 320 || w > 8192 || hh < 200 || hh > 8192 || row < w * 4 || (depth & 0xff) != 32) continue;
                 if (base < VMAPPLE_MEM || base - VMAPPLE_MEM + row * hh > size) continue;
@@ -64,7 +64,7 @@ int hv_vm_boot_display(HvBootDisplay *d) {
         if (!found) return -1;
         const uint64_t *q = (const uint64_t *)(ram + found);
         uint64_t base = q[5], row = q[7], w = q[8], hh = q[9];
-        if (q[2] == VMAPPLE_MEM && w >= 320 && w <= 8192 && hh >= 200 && hh <= 8192 && base >= VMAPPLE_MEM &&
+        if (q[1] >> 40 == 0xfffffe && w >= 320 && w <= 8192 && hh >= 200 && hh <= 8192 && base >= VMAPPLE_MEM &&
             base - VMAPPLE_MEM + row * hh <= size) {
             d->pixels = ram + (base - VMAPPLE_MEM);
             d->width = (uint32_t)w, d->height = (uint32_t)hh, d->stride = (uint32_t)row;

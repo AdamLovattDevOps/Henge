@@ -274,8 +274,24 @@ static void dump_hex(const char *what, uint64_t pa, const uint8_t *p, uint32_t n
     fprintf(stderr, "\n");
 }
 
+/* The display's shared state page (channel 4, op 1 names it): what changes, by whom we can't tell. */
+static uint64_t disp_pa;
+static void trace_display(void) {
+    static uint8_t prev[0x4000];
+    uint8_t *p = disp_pa ? hv_phys_ptr(board->m, disp_pa, sizeof prev) : NULL;
+    if (!p) return;
+    for (uint32_t i = 0; i < sizeof prev; i += 4)
+        if (memcmp(p + i, prev + i, 4)) {
+            uint32_t nv;
+            memcpy(&nv, p + i, 4);
+            fprintf(stderr, "pvgdata disp +%04x = %08x\n", i, nv);
+        }
+    memcpy(prev, p, sizeof prev);
+}
+
 static void trace_data(int write, uint64_t off, uint64_t v) {
     if (pvg_trace < 2) return;
+    trace_display();
     if (write && off == 0x101c) fifo_pa = v << 14;
     if (write && off == 0x1030) shared_pa = v << 14;
     if (write && off == 0x1004) fifo_size = (uint32_t)v;
@@ -328,6 +344,7 @@ static void trace_data(int write, uint64_t off, uint64_t v) {
                 uint64_t pa = ((uint64_t)tbl[at >> 14] << 14) + (at & 0x3fff);
                 uint8_t *q = hv_phys_ptr(board->m, pa, n);
                 if (q) dump_hex("chan", pa, q, n);
+                if (q && ch == 4 && n >= 20 && ((uint32_t *)q)[0] == 1) disp_pa = (uint64_t)((uint32_t *)q)[4] << 14;
                 o += n, left -= n;
             }
             seen[ch] = wr;
@@ -395,6 +412,14 @@ static uint64_t iosfc_read(void *opaque, uint64_t off, unsigned size) {
 static void iosfc_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
     (void)opaque;
     trace("iosfc", 1, off, v, size);
+    static uint64_t io_ring, io_done;
+    if (off == 0x1000) io_ring = v;
+    if (off == 0x1010) io_done = v;
+    if (off == 0x1018 && pvg_trace >= 2 && io_ring) {
+        uint8_t *q = hv_phys_ptr(board->m, io_ring + ((v - 1) & 0x3ff) * 0x40, 0x40);
+        if (q) dump_hex("iosfc-cmd", io_ring + ((v - 1) & 0x3ff) * 0x40, q, 0x40);
+    }
+    (void)io_done;
     [iosfc mmioWriteAtOffset:off value:v];
 }
 

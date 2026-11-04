@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 /// A Mac made on the Mac (HengeVM or Henge) and brought over: its boot ROM,
 /// disk and auxiliary storage, and the identity it was installed with.
@@ -44,6 +45,11 @@ final class Machines: ObservableObject {
     }
 
     @Published private(set) var unpacked: Double = 0
+    /// While a Mac is being exported: its name and how far along.
+    @Published private(set) var exporting: String?
+    @Published private(set) var exported: Double = 0
+    /// The last finished export, ready to be moved out of Henge.
+    @Published var lastExport: URL?
 
     private init() {
         load()
@@ -134,6 +140,66 @@ final class Machines: ObservableObject {
             HengeLog.log("machines", "import of \(folder.lastPathComponent) failed: \(error.localizedDescription)")
         }
         importing = nil
+    }
+
+    /// Makes a folder "Bring in a Mac" can read back (the same files tools/export_ios.sh writes),
+    /// in Documents/Exports, which the Files app can reach. Deleting Henge deletes that folder too,
+    /// so it has to be moved out of Henge before a reinstall that replaces the app's data.
+    func export(_ mac: VirtualMac) {
+        guard exporting == nil, importing == nil else { return }
+        exporting = mac.name
+        exported = 0
+        lastExport = nil
+        lastError = nil
+        UIApplication.shared.isIdleTimerDisabled = true // a locked screen would suspend the app mid-way
+        Task {
+            defer {
+                exporting = nil
+                UIApplication.shared.isIdleTimerDisabled = false
+            }
+            do { lastExport = try await writeExport(mac) } catch {
+                lastError = error.localizedDescription
+                HengeLog.log("machines", "export of \(mac.name) failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func writeExport(_ mac: VirtualMac) async throws -> URL {
+        let fm = FileManager.default
+        let exports = Self.inbox.appendingPathComponent("Exports", isDirectory: true)
+        let safeName = mac.name.replacingOccurrences(of: "/", with: "-")
+        let final = exports.appendingPathComponent(safeName, isDirectory: true)
+        // Not under its final name until it is whole, so a cut-short export can't be mistaken for a Mac.
+        let partial = exports.appendingPathComponent(safeName + ".partial", isDirectory: true)
+        try? fm.removeItem(at: partial)
+        try? fm.removeItem(at: final)
+        let used = (try? mac.disk.resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?.totalFileAllocatedSize ?? 0
+        let free = (try? Self.root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?.volumeAvailableCapacityForImportantUsage ?? 0
+        let needed = Int64(used) + (256 << 20)
+        if free > 0 && free < needed {
+            throw message("Exporting \(mac.name) needs about \(ByteText.string(UInt64(needed))) free; this iPhone has \(ByteText.string(UInt64(free))). Deleting a downloaded macOS installer (Install macOS, swipe it) frees about 16 GB.")
+        }
+        try fm.createDirectory(at: partial, withIntermediateDirectories: true)
+        do {
+            try fm.copyItem(at: mac.rom, to: partial.appendingPathComponent("AVPBooter.vmapple2.bin"))
+            try fm.copyItem(at: mac.aux, to: partial.appendingPathComponent("auxiliary.bin"))
+            let info: [String: Any] = ["name": mac.name, "ecid": mac.ecid, "seed": mac.seed, "ramMB": mac.ramMB]
+            try JSONSerialization.data(withJSONObject: info).write(to: partial.appendingPathComponent("machine.json"))
+            let source = mac.disk.path, target = partial.appendingPathComponent(Self.packedDisk).path
+            let ok = await Task.detached { () -> Bool in
+                hv_sparse_pack_progress(source, target, { done, total, _ in
+                    let fraction = Double(done) / Double(max(total, 1))
+                    Task { @MainActor in Machines.shared.exported = fraction }
+                }, nil) == 0
+            }.value
+            guard ok else { throw message("The disk could not be written (not enough space?).") }
+            try fm.moveItem(at: partial, to: final)
+        } catch {
+            try? fm.removeItem(at: partial)
+            throw error
+        }
+        HengeLog.log("machines", "exported \(mac.name) to \(final.path)")
+        return final
     }
 
     /// A machine made here (the installer), already in its directory.

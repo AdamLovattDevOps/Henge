@@ -10,6 +10,7 @@ struct HomeView: View {
     @State private var installing = false
     @State private var jitReady = JITBootstrap.ready
     @State private var toDelete: VirtualMac?
+    @State private var movingExport = false
 
     var body: some View {
         NavigationStack {
@@ -20,6 +21,26 @@ struct HomeView: View {
                         Text(JITBootstrap.lastFailure ?? jit.automaticDescription)
                             .font(.footnote).foregroundStyle(.secondary)
                         Button("Turn On") { jit.enable() }
+                    }
+                }
+                Section("Memory") {
+                    LabeledContent("Extra memory", value: Entitlements.increasedMemory ? "On" : "Off")
+                    LabeledContent("Henge's limit", value: ByteText.string(UInt64(Entitlements.memoryLimitAtLaunch)))
+                    if !Entitlements.increasedMemory {
+                        Text("This install isn't signed with the increased memory limit entitlement. Reinstall Henge with a certificate that has it. Export your Mac first if the reinstall replaces the app's data.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                }
+                if let name = machines.exporting {
+                    Section {
+                        ProgressView("Exporting \(name)… keep Henge open", value: machines.exported)
+                    }
+                }
+                if let folder = machines.lastExport {
+                    Section("Exported") {
+                        Text("Saved in Files, under Henge, Exports, \(folder.lastPathComponent). Deleting Henge deletes it too, so move it somewhere else first.")
+                            .font(.footnote)
+                        Button("Move Out of Henge…") { movingExport = true }
                     }
                 }
                 if let name = machines.importing {
@@ -54,9 +75,14 @@ struct HomeView: View {
                             Button("Start") { running = mac }
                                 .buttonStyle(.bordered)
                                 .disabled(!jitReady)
-                        }
-                        .swipeActions {
-                            Button("Delete", role: .destructive) { toDelete = mac }
+                            Menu {
+                                Button("Export") { machines.export(mac) }
+                                    .disabled(machines.exporting != nil)
+                                Button("Delete", role: .destructive) { toDelete = mac }
+                            } label: {
+                                Image(systemName: "ellipsis.circle")
+                            }
+                            .accessibilityLabel("More for \(mac.name)")
                         }
                     }
                 }
@@ -76,6 +102,12 @@ struct HomeView: View {
             .sheet(isPresented: $installing) { InstallView() }
             .fileImporter(isPresented: $picking, allowedContentTypes: [.folder]) { result in
                 if case let .success(url) = result { machines.importFolder(url) }
+            }
+            .fileMover(isPresented: $movingExport, file: machines.lastExport) { result in
+                switch result {
+                case .success: machines.lastExport = nil
+                case .failure(let error): machines.lastError = error.localizedDescription
+                }
             }
             .confirmationDialog("Delete \(toDelete?.name ?? "this Mac")?", isPresented: Binding(get: { toDelete != nil }, set: { if !$0 { toDelete = nil } }),
                                 titleVisibility: .visible) {

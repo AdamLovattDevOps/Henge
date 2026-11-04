@@ -35,7 +35,7 @@ static int all_zero(const uint8_t *p, size_t n) {
     return 1;
 }
 
-int hv_sparse_pack(const char *src, const char *dst) {
+int hv_sparse_pack_progress(const char *src, const char *dst, void (*progress)(uint64_t, uint64_t, void *), void *opaque) {
     int in = open(src, O_RDONLY), out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     struct stat st;
     uint8_t *buf = malloc(CHUNK);
@@ -58,11 +58,13 @@ int hv_sparse_pack(const char *src, const char *dst) {
                 if (write_all(out, rec, 16) || write_all(out, buf, n)) goto done;
             }
             at += (off_t)n;
+            if (progress) progress((uint64_t)at, size, opaque);
         }
         pos = hole;
     }
     uint64_t end[2] = {0, 0};
     if (write_all(out, end, 16)) goto done;
+    if (fsync(out) != 0) goto done;
     rc = 0;
 done:
     free(buf);
@@ -70,6 +72,8 @@ done:
     if (out >= 0 && close(out) != 0) rc = -1;
     return rc;
 }
+
+int hv_sparse_pack(const char *src, const char *dst) { return hv_sparse_pack_progress(src, dst, NULL, NULL); }
 
 int hv_sparse_unpack(const char *src, const char *dst, void (*progress)(uint64_t, uint64_t, void *), void *opaque) {
     int in = open(src, O_RDONLY), out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
