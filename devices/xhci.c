@@ -146,8 +146,13 @@ static void transfer_event(HvXhci *x, uint64_t trb_pa, int cc, uint32_t residual
 /* Next TRB the guest owns on a ring, following links; 0 if the ring is empty. */
 static int ring_peek(HvXhci *x, HvXhciRing *r, uint32_t trb[4], uint64_t *at) {
     for (int guard = 0; guard < 64; guard++) {
-        rd(x, r->dequeue, trb, 16);
-        if ((trb[3] & 1) != (uint32_t)r->ccs) return 0;
+        /* The guest writes the TRB, then its cycle bit, from another core:
+           read the control word first (acquire), then the rest. */
+        uint32_t *ctl = hv_phys_ptr(x->m, r->dequeue + 12, 4);
+        uint32_t c = ctl ? __atomic_load_n(ctl, __ATOMIC_ACQUIRE) : 0;
+        if ((c & 1) != (uint32_t)r->ccs) return 0;
+        rd(x, r->dequeue, trb, 12);
+        trb[3] = c;
         if (((trb[3] >> 10) & 0x3f) == TRB_LINK) {
             if (trb[3] & 2) r->ccs ^= 1; /* toggle cycle */
             r->dequeue = ((uint64_t)trb[1] << 32 | trb[0]) & ~0xfull;

@@ -158,8 +158,12 @@ int hv_virtq_pop(HvVirtio *v, int qi, HvVirtqElem *e) {
     HvVirtq *q = &v->q[qi];
     uint16_t *avail = hv_phys_ptr(v->m, q->avail, 4 + 2u * q->size);
     if (!avail) return -1;
-    if (q->last_avail == avail[1]) return 0;
-    uint16_t head = avail[2 + q->last_avail % q->size];
+    uint16_t idx = __atomic_load_n(&avail[1], __ATOMIC_ACQUIRE);
+    if (q->last_avail == idx) return 0;
+    /* The guest writes the ring entry (and the descriptors) before the index,
+       from another core: the acquire above keeps these reads after it, or a
+       stale entry (the driver fills unused ones with 0xffff) comes back. */
+    uint16_t head = __atomic_load_n(&avail[2 + q->last_avail % q->size], __ATOMIC_RELAXED);
     q->last_avail++;
     e->head = head;
     e->nseg = 0;
