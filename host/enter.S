@@ -191,8 +191,11 @@ _hv_helper_entry:
     LOAD_X1_X30
     ldr x0, [x28, #CPU_SP]
     mov sp, x0
-    ldr x0, [x28, #CPU_HELPER_RET]
-    br x0
+    // Back into the block, or (after an SVC or ERET) to the start of the next
+    // one, which wants guest x0 live as well; host x15 is scratch.
+    ldr x15, [x28, #CPU_HELPER_RET]
+    ldr x0, [x28]
+    br x15
 
 // Shared tails of translated code, so each call site is a few words (the
 // stub's data follows its blr; blocks reach these through HvCpu, not BL, since

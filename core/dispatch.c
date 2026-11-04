@@ -230,6 +230,37 @@ static uint32_t wfe(HvCpu *cpu) {
     return 0;
 }
 
+/* After an SVC or ERET, the block the CPU goes to next, if the dispatcher has
+   nothing to do first: no request, interrupt or timer due, no flush, and the
+   block in this CPU's indirect-branch cache for the new state. hv_helper then
+   resumes there instead of leaving (a hundred thousand round trips a second). */
+static void *fast_resume(HvCpu *cpu) {
+    static int off = -1; /* HV_NO_FAST_RESUME: every exception and return goes through the dispatcher */
+    if (off < 0) off = getenv("HV_NO_FAST_RESUME") != NULL;
+    HvMachine *m = cpu->m;
+    HvPerCpu *p = cpu->pc_state;
+    if (off || !m->chain || m->trace || m->log >= 2 || !p || cpu->pc == m->stop_pc || cpu->halted || cpu->off) { m->stats.fr_fail[0]++; return NULL; }
+    if (__atomic_load_n(&cpu->exit_req, __ATOMIC_RELAXED) || __atomic_load_n(&m->flush_pending, __ATOMIC_RELAXED) ||
+        __atomic_load_n(&m->stw_active, __ATOMIC_RELAXED)) {
+        m->stats.fr_fail[1]++;
+        return NULL;
+    }
+    if ((p->irq_line && !(cpu->daif & HV_PSTATE_I)) || (p->fiq_line && !(cpu->daif & HV_PSTATE_F))) { m->stats.fr_fail[2]++; return NULL; }
+    if (cpu->timer_due && mach_absolute_time() >= cpu->timer_due) { m->stats.fr_fail[3]++; return NULL; }
+    uint32_t flags = block_flags(cpu);
+    int kernel = flags & HV_BLOCK_EL1;
+    uint64_t va = cpu->pc;
+    if ((int)((va >> 55) & 1) != kernel || (va & 3)) return NULL;
+    uint64_t tag = va ^ cpu->ijc_salt[kernel];
+    uint64_t *ent = p->ijc + (size_t)(flags & (HV_IJC_TABLES - 1)) * (HV_IJC_TABLE_BYTES / 8) + (size_t)hv_ijc_index(tag) * 2;
+    void *code = ent[0] == tag ? (void *)(uintptr_t)ent[1] : ent[2] == tag ? (void *)(uintptr_t)ent[3] : NULL;
+    if (code) {
+        cpu->exit_reason = HV_EXIT_BRANCH;
+        m->stats.fast_resumes++;
+    } else m->stats.fr_fail[4]++;
+    return code;
+}
+
 /* Blocks call this through hv_helper_entry. Returns 1 to leave the block. */
 static uint64_t reg_hist[65536]; /* --stats: MRS/MSR/SYS by op0:op1:CRn:CRm:op2; reads low, writes high 32 bits */
 
@@ -254,11 +285,26 @@ uint32_t hv_helper(HvCpu *cpu, const HvHelperInfo *info_in) {
         return hv_sysreg_msr(cpu, info->insn, info->pc);
     case HV_OP_SYS:
         return hv_sysreg_sys(cpu, info->insn, info->pc);
-    case HV_OP_EXCEPTION:
-        return hv_exception_insn(cpu, info->insn, info->pc);
-    case HV_OP_ERET:
+    case HV_OP_EXCEPTION: {
+        int r = hv_exception_insn(cpu, info->insn, info->pc);
+        if (r && (info->insn & 0xffe0001fu) == 0xd4000001u) { /* SVC: into the vector's block directly */
+            void *code = fast_resume(cpu);
+            if (code) {
+                cpu->helper_ret = (uint64_t)(uintptr_t)code;
+                return 0;
+            }
+        }
+        return r;
+    }
+    case HV_OP_ERET: {
         hv_eret(cpu);
+        void *code = fast_resume(cpu);
+        if (code) {
+            cpu->helper_ret = (uint64_t)(uintptr_t)code;
+            return 0;
+        }
         return 1;
+    }
     case HV_OP_FPTRAP:
         hv_raise_sync(cpu, HV_EC_FP_ACCESS, 1u << 24 | 0xeu << 20, 0, info->pc);
         return 1;
@@ -528,7 +574,10 @@ static void print_stats(HvCpu *cpu, int force) {
         fprintf(stderr, "  user light fills: shared region %.0fK/s, elsewhere %.0fK/s\n", RATE(light_region[0]) / 1e3, RATE(light_region[1]) / 1e3);
         fprintf(stderr, "  code-page protects/s: none %.0f, one entry %.0f, whole-TLB scans %.0f\n", RATE(protect_kind[0]),
                 RATE(protect_kind[1]), RATE(protect_kind[2]));
-        fprintf(stderr, "  WFE waits in place %.0f/s; exits chained as placed %.0f/s\n", RATE(wfe_waits), RATE(chained_early));
+        fprintf(stderr, "  fast resume refused/s: state %.0f, exit request %.0f, interrupt %.0f, timer %.0f, not cached %.0f\n", RATE(fr_fail[0]),
+                RATE(fr_fail[1]), RATE(fr_fail[2]), RATE(fr_fail[3]), RATE(fr_fail[4]));
+        fprintf(stderr, "  WFE waits in place %.0f/s; exits chained as placed %.0f/s; SVC/ERET resumed in place %.0f/s\n", RATE(wfe_waits),
+                RATE(chained_early), RATE(fast_resumes));
         fprintf(stderr, "  exit requests/s: TLBI posts %.0f, wakes %.0f (of them device work %.0f), kick all %.0f, own %.0f\n",
                 RATE(kick_src[0]), RATE(kick_src[1]), RATE(kick_src[3]), RATE(kick_src[2]), RATE(kick_src[4]));
         fprintf(stderr, "  light refills %.0fK/s, light branch-cache fills %.0fK/s, chained to other pages %.0f/s\n", RATE(refills) / 1e3,
@@ -765,6 +814,7 @@ static int run_loop(HvCpu *cpu, int one) {
         if (m->tick && (kicked || (++since_tick >= 64 && (since_tick = 0, next_due && mach_absolute_time() >= next_due)))) {
             since_tick = 0;
             next_due = m->tick(m, cpu);
+            cpu->timer_due = next_due;
         }
         int why = pending_chain ? 0 : kicked ? 1 : last_reason != HV_EXIT_BRANCH ? 2 : 5;
         if (hv_check_interrupts(cpu)) {

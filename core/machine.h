@@ -77,6 +77,8 @@ typedef struct HvStats {
     uint64_t light_kind[4];
     uint64_t light_fail[4];
     uint64_t light_walks;
+    uint64_t fast_resumes;
+    uint64_t fr_fail[5];    /* SVCs and ERETs that went to their block without the dispatcher */
     uint64_t protect_kind[3]; /* a page becoming code, per CPU: not mapped writable, one entry, scan */
     uint64_t light_region[2]; /* user light fills: in the shared region (0x18..0x28 << 28), elsewhere */
     uint64_t chained_early;   /* exits chained as their block was placed */

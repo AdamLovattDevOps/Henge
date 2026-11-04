@@ -104,6 +104,7 @@ typedef struct HvCpu {
     uint64_t cntkctl_el1;
     uint64_t actlr_el1;
     uint64_t sctlr_seen;     /* MMU/FP state the current TLB contents were filled under */
+    uint64_t timer_due;      /* host time this CPU's timer next fires (the dispatcher's last tick said), 0: none */
     /* TLB slots (table << HV_TLB_BITS | index) filled with user addresses since the
        last user flush, so a context switch clears those instead of scanning all
        three tables. More than HV_USER_FILLS means: scan. */
