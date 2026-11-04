@@ -51,6 +51,11 @@ static int cmd_key(HvAes *a) {
     a->cbc = mode == 1;
     a->encrypt = (cmd >> 20) & 1;
     if (sel) {
+        static unsigned seen;
+        if (!(seen & (1u << sel)) && a->m->log) {
+            seen |= 1u << sel;
+            fprintf(stderr, "hengevm: aes: key select %u (cmd %08x)%s\n", sel, cmd, sel <= 3 ? "" : " not modelled");
+        }
         if (sel <= 3) a->key[ctx] = builtin(sel);
         return 1;
     }
