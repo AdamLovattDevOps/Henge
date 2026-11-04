@@ -245,15 +245,33 @@ static void new_frame(void) {
 
 /* ---- MMIO, from the CPU thread; the framework is 32-bit only ---- */
 
+/* HV_PVG_TRACE=1: every register access, with the time, for learning the
+   protocol an iOS host would have to speak (no PVG there). */
+static int pvg_trace = -1;
+static double trace_t0;
+
+static void trace(const char *dev, int write, uint64_t off, uint64_t v, unsigned size) {
+    if (pvg_trace < 0) {
+        pvg_trace = getenv("HV_PVG_TRACE") != NULL;
+        trace_t0 = [NSDate timeIntervalSinceReferenceDate];
+    }
+    if (!pvg_trace) return;
+    fprintf(stderr, "pvgtrace %.4f %s %s +%04llx = %llx (%u) pc %llx\n", [NSDate timeIntervalSinceReferenceDate] - trace_t0,
+            dev, write == 2 ? "IRQ" : write ? "W" : "R", (unsigned long long)off, (unsigned long long)v, size,
+            (unsigned long long)board->m->access_pc);
+}
+
 static uint64_t gfx_read(void *opaque, uint64_t off, unsigned size) {
     (void)opaque;
     uint64_t v = [pgdev mmioReadAtOffset:off];
     if (size == 8) v |= (uint64_t)[pgdev mmioReadAtOffset:off + 4] << 32;
+    trace("gfx", 0, off, v, size);
     return v;
 }
 
 static void gfx_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
     (void)opaque;
+    trace("gfx", 1, off, v, size);
     [pgdev mmioWriteAtOffset:off value:(uint32_t)v];
     if (size == 8) [pgdev mmioWriteAtOffset:off + 4 value:(uint32_t)(v >> 32)];
 }
@@ -261,11 +279,14 @@ static void gfx_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
 static uint64_t iosfc_read(void *opaque, uint64_t off, unsigned size) {
     (void)opaque;
     uint64_t v = [iosfc mmioReadAtOffset:off];
-    return size == 8 ? v : v & ((1ull << (size * 8)) - 1);
+    v = size == 8 ? v : v & ((1ull << (size * 8)) - 1);
+    trace("iosfc", 0, off, v, size);
+    return v;
 }
 
 static void iosfc_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
-    (void)opaque, (void)size;
+    (void)opaque;
+    trace("iosfc", 1, off, v, size);
     [iosfc mmioWriteAtOffset:off value:v];
 }
 
@@ -299,6 +320,7 @@ int hv_pvg_attach(HvVmapple *b, const char *screenshot) {
         idesc.raiseInterrupt = ^bool(uint32_t vector) {
             (void)vector;
             atomic_store(&pending_iosfc, 1);
+            trace("iosfc", 2, vector, 0, 0);
             hv_machine_kick_all(board->m);
             return true;
         };
@@ -312,6 +334,7 @@ int hv_pvg_attach(HvVmapple *b, const char *screenshot) {
         desc.raiseInterrupt = ^(uint32_t vector) {
             (void)vector;
             atomic_store(&pending_gfx, 1);
+            trace("gfx", 2, vector, 0, 0);
             hv_machine_kick_all(board->m);
         };
         pgdev = PGCreateDeviceWithDescriptor(desc);

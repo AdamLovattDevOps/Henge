@@ -191,7 +191,10 @@ int asr_send_buffer(asr_client_t asr, const void* data, size_t size)
 		done += bytes;
 		if (bytes) last = time(NULL);
 		if (done == size) break;
-		if ((device_error != IDEVICE_E_SUCCESS && device_error != IDEVICE_E_TIMEOUT && device_error != IDEVICE_E_UNKNOWN_ERROR) || time(NULL) - last > 600) {
+		/* A short send (NOT_ENOUGH_DATA), a timeout or an unknown error all
+		   mean "try the rest again"; only a gone device ends it. Resending
+		   the whole chunk instead would put duplicate bytes in the stream. */
+		if (device_error == IDEVICE_E_NO_DEVICE || device_error == IDEVICE_E_SSL_ERROR || time(NULL) - last > 600) {
 			logger(LL_ERROR, "Unable to send data to ASR. Sent %zu of %zu bytes (error %d).\n", done, size, device_error);
 			return -1;
 		}
