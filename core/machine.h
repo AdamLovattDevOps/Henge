@@ -173,6 +173,8 @@ typedef struct HvMachine {
 } HvMachine;
 
 int hv_machine_init(HvMachine *m, size_t jit_bytes);
+/* The same with JIT memory the host provides (iOS: the region a debugger granted and its writable alias). */
+int hv_machine_init_jit(HvMachine *m, void *rx, void *rw, size_t jit_bytes);
 void hv_machine_free(HvMachine *m);
 int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int readonly);
 int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,

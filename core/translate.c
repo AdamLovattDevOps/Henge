@@ -1177,10 +1177,9 @@ int hv_translate_block(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t 
     if (m->jit.used & 1) m->jit.used++;
     uint32_t *dst = hv_jit_reserve(&m->jit, total);
     if (!dst) return -1;
-    hv_jit_begin_write();
-    memcpy(dst, e->w, pool_at * 4);
-    memcpy(dst + pool_at, e->pool, e->npool * 8);
-    hv_jit_end_write(dst, total);
+    hv_jit_write(&m->jit, dst, e->w, pool_at * 4);
+    hv_jit_write(&m->jit, dst + pool_at, e->pool, e->npool * 8);
+    hv_jit_finish(&m->jit, dst, total);
     b->code = dst;
     return 0;
 }

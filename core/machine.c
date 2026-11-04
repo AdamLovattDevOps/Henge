@@ -11,9 +11,21 @@
 extern void hv_exit(void);
 extern void hv_helper_entry(void);
 
+static int init_rest(HvMachine *m);
+
 int hv_machine_init(HvMachine *m, size_t jit_bytes) {
     memset(m, 0, sizeof *m);
     if (hv_jit_region_open(&m->jit, jit_bytes) != 0) return -1;
+    return init_rest(m);
+}
+
+int hv_machine_init_jit(HvMachine *m, void *rx, void *rw, size_t jit_bytes) {
+    memset(m, 0, sizeof *m);
+    if (hv_jit_region_attach(&m->jit, rx, rw, jit_bytes) != 0) return -1;
+    return init_rest(m);
+}
+
+static int init_rest(HvMachine *m) {
     m->blocks = calloc(HV_MAX_BLOCKS, sizeof(HvBlock));
     if (!m->blocks) return -1;
     m->stop_pc = ~0ull;
