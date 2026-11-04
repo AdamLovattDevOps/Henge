@@ -39,8 +39,10 @@ void hv_tlb_stash_drop(HvCpu *cpu, int asid); /* asid -1: all */
 /* Empty the indirect-branch cache for all user (0) or for kernel (1) VAs. */
 void hv_ijc_reset(HvCpu *cpu, int kernel);
 /* The indirect-branch cache slot of a tag (VA ^ salt); translated code computes the same. */
+/* The cache is two-way: a tag's set is two entries, this one (way 0, the one
+   filled last) and the next. */
 static inline uint32_t hv_ijc_index(uint64_t tag) {
-    return (uint32_t)(((tag ^ tag >> 16 ^ tag >> 46) >> 2) & ((1u << HV_IJC_BITS) - 1));
+    return (uint32_t)(((tag ^ tag >> 16 ^ tag >> 46) >> 2) & ((1u << (HV_IJC_BITS - 1)) - 1)) << 1;
 }
 static inline uint32_t hv_ijc_key(uint64_t va, uint64_t salt) {
     return (uint32_t)(((va >> 14) * 0x9e3779b97f4a7c15ull ^ (salt >> 48) * 0xc2b2ae3d27d4eb4full) >> 44);

@@ -452,6 +452,20 @@ static void print_stats(HvCpu *cpu, int force) {
         fprintf(stderr, "  TLBIs left to other CPUs/s: raced %.0f, every address space's cached targets %.0f, big range %.0f, ASID or all %.0f\n",
                 RATE(posted_kind[0]), RATE(posted_kind[3]), RATE(posted_kind[1]), RATE(posted_kind[2]));
         fprintf(stderr, "  remote drop races/s: walking %.0f, filling %.0f, during %.0f\n", RATE(race_kind[0]), RATE(race_kind[1]), RATE(race_kind[2]));
+        {
+            static const char *kn[16] = {"copy", "pcrel", "branch", "branch-reg", "eret", "literal", "memory", "prefetch",
+                                         "exception", "sysreg", "sys", "barrier", "wait", "pac", "undef", "?"};
+            uint64_t ti = 0, tw = 0;
+            for (int k = 0; k < 16; k++) ti += s->kind_insns[k] - last.kind_insns[k], tw += s->kind_words[k] - last.kind_words[k];
+            if (ti) {
+                fprintf(stderr, "  inline words per insn %.2f:", (double)tw / ti);
+                for (int k = 0; k < 16; k++) {
+                    uint64_t i = s->kind_insns[k] - last.kind_insns[k], w = s->kind_words[k] - last.kind_words[k];
+                    if (i * 200 >= ti) fprintf(stderr, " %s %.0f%%x%.1f", kn[k], 100.0 * i / ti, (double)w / i);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
         fprintf(stderr, "  exit requests/s: TLBI posts %.0f, wakes %.0f (of them device work %.0f), kick all %.0f, own %.0f\n",
                 RATE(kick_src[0]), RATE(kick_src[1]), RATE(kick_src[3]), RATE(kick_src[2]), RATE(kick_src[4]));
         fprintf(stderr, "  light refills %.0fK/s, light branch-cache fills %.0fK/s, chained to other pages %.0f/s\n", RATE(refills) / 1e3,
@@ -739,7 +753,7 @@ static int run_loop(HvCpu *cpu, int one) {
             uint64_t *t = pcs->ijc + (size_t)(b->flags & (HV_IJC_TABLES - 1)) * (HV_IJC_TABLE_BYTES / 8);
             uint64_t tag = b->va ^ cpu->ijc_salt[kernel];
             uint64_t *ent = t + (size_t)hv_ijc_index(tag) * 2;
-            if (why == 5 && ent[0] == tag) {
+            if (why == 5 && (ent[0] == tag || ent[2] == tag)) {
                 why = 4; /* it was cached: not a miss */
                 static int dbg = -1, shown;
                 if (dbg < 0) dbg = getenv("HV_IJC_DEBUG") != NULL;

@@ -339,11 +339,18 @@ _hv_xjump_thunk:
     ldr x7, [x7, #CPU_IJC_TAB]    // this flags value's table
     eor x6, x15, x15, lsr #16
     eor x6, x6, x15, lsr #46
-    ubfx x6, x6, #2, #IJC_BITS
-    add x7, x7, x6, lsl #4
-    ldp x6, x7, [x7]
+    ubfx x6, x6, #2, #(IJC_BITS - 1)
+    add x7, x7, x6, lsl #5        // the set: two entries (x30 stays the site's data)
+    ldr x6, [x7]
+    eor x6, x6, x15
+    cbnz x6, 6f
+    ldr x7, [x7, #8]
+    ldr x30, [x28, #240]
+    br x7
+6:  ldr x6, [x7, #16]
     eor x6, x6, x15
     cbnz x6, 1f
+    ldr x7, [x7, #24]
     ldr x30, [x28, #240]
     br x7
 1:  // a miss: as hv_ijc_thunk, then leave if the block is not made yet

@@ -171,14 +171,22 @@ static void put_ijc_jump(Emit *e, int check) {
     put(e, 0xca000000u | 6 << 16 | 15 << 5 | 15);           /* eor x15, x15, x6: the tag */
     put(e, 0xca400000u | 15 << 16 | 16 << 10 | 15 << 5 | 7); /* eor x7, x15, x15, lsr #16 */
     put(e, 0xca400000u | 15 << 16 | 46 << 10 | 7 << 5 | 7);  /* eor x7, x7, x15, lsr #46 */
-    put(e, UBFM_X(7, 7, 2, 2 + HV_IJC_BITS - 1));           /* ubfx x7, x7, #2, #bits */
+    put(e, UBFM_X(7, 7, 2, 2 + HV_IJC_BITS - 2));           /* ubfx x7, x7, #2, #bits - 1: the set */
     put(e, LDR_X(6, 28, HV_CPU_IJC_TAB + 8 * (e->flags & (HV_IJC_TABLES - 1))));
-    put(e, ADD_LSL(6, 6, 7, 4));
-    put(e, LDP_X(7, 6, 6, 0));                              /* x7 = tag, x6 = entry */
+    put(e, ADD_LSL(6, 6, 7, 5));
+    put(e, LDR_X(7, 6, 0));                                 /* way 0's tag */
     put(e, 0xca000000u | 15 << 16 | 7 << 5 | 7);            /* eor x7, x7, x15 */
+    uint32_t to_way1 = e->n;
+    put(e, CBNZ_X(7));
+    put(e, LDR_X(6, 6, 8));
+    put(e, BR_X(6));                                        /* hit: x0, x1 are the guest's */
+    patch_branch(&e->w[to_way1], (int64_t)e->n - to_way1);
+    put(e, LDR_X(7, 6, 16));                                /* way 1's */
+    put(e, 0xca000000u | 15 << 16 | 7 << 5 | 7);
     uint32_t to_miss = e->n;
     put(e, CBNZ_X(7));
-    put(e, BR_X(6));                                        /* hit: x0, x1 are the guest's */
+    put(e, LDR_X(6, 6, 24));
+    put(e, BR_X(6));
     patch_branch(&e->w[to_miss], (int64_t)e->n - to_miss);  /* miss: x15 is the tag, so the VA is x15 ^ salt */
     put(e, LDR_X(7, 28, salt));
     put(e, 0xca000000u | 15 << 16 | 7 << 5 | 7);            /* eor x7, x7, x15: the VA */
@@ -1666,7 +1674,13 @@ static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32
         e->cur_pc = pc;
         e->cur_i = i;
         e->u_prev = e->u_live, e->u_live = 0;
+        uint32_t n0 = e->n;
         ended = translate_one(e, code[i], pc);
+        if (m->stats_interval) {
+            HvInsnKind k = hv_classify(code[i]);
+            m->stats.kind_insns[k & 15]++;
+            m->stats.kind_words[k & 15] += e->n - n0;
+        }
         e->after[i] = e->n;
         i++;
         if (e->n + WORDS_PER_INSN_MAX * 2 > MAX_WORDS || e->npool + 8 > MAX_LITS || e->nool + 4 > MAX_OOL) break;

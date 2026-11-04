@@ -336,6 +336,7 @@ static void ijc_clear_page(HvCpu *cpu, uint64_t page, int kernel, uint64_t salt)
             uint64_t tag = (page | (uint64_t)o << 2) ^ salt;
             uint64_t *ent = tab + (size_t)hv_ijc_index(tag) * 2;
             if (ent[0] == tag) ent[0] = 0;
+            if (ent[2] == tag) ent[2] = 0;
         }
     }
 }
@@ -606,6 +607,7 @@ void hv_ijc_fill(HvCpu *cpu, HvBlock *b) {
     uint64_t *t = pcs->ijc + (size_t)(b->flags & (HV_IJC_TABLES - 1)) * (HV_IJC_TABLE_BYTES / 8);
     uint64_t tag = b->va ^ cpu->ijc_salt[kernel];
     uint64_t *ent = t + (size_t)hv_ijc_index(tag) * 2;
+    if (ent[0] != tag && ent[0]) ent[2] = ent[0], ent[3] = ent[1]; /* way 0's goes to way 1 (over this one's, if there) */
     ent[0] = tag;
     ent[1] = (uint64_t)(uintptr_t)b->code;
     pcs->ijc_tables_used |= 1u << (b->flags & (HV_IJC_TABLES - 1));
