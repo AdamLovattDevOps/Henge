@@ -48,6 +48,8 @@ typedef struct {
     uint32_t nfix;
     Ool ool[MAX_OOL];
     uint32_t nool;
+    struct { uint32_t slot, at; } site[MAX_OOL]; /* chainable exits: their slot and the B chaining patches */
+    uint32_t nsite;
     uint32_t flags;
     int slow_mem;
     uint64_t page;       /* guest VA of the 16 KB page the block is in */
@@ -180,12 +182,21 @@ static void put_branch_exit(Emit *e, uint64_t target) {
         put_ijc_jump(e);
         return;
     }
-    uint64_t *slot = &e->m->slots[e->m->nslots++];
+    uint32_t slot_index = e->m->nslots++;
+    uint64_t *slot = &e->m->slots[slot_index];
     *slot = 0;
     put(e, 0xb9400000u | (HV_CPU_EXIT_REQ / 4) << 10 | 28 << 5 | 15); /* ldr w15, [x28, #exit_req] */
-    put_lit(e, 6, (uint64_t)(uintptr_t)slot);
     uint32_t to_exit = e->n;
     put(e, 0x35000000u | 15);                                         /* cbnz w15, exit (patched below) */
+    /* Chaining rewrites this B to go straight to the target block (one aligned
+       B may be rewritten while other CPUs run it); until then, or when the
+       target is out of B's range, it falls through to the data slot. */
+    if (e->nsite < MAX_OOL) {
+        e->site[e->nsite].slot = slot_index;
+        e->site[e->nsite++].at = e->n;
+    }
+    put(e, B_OP | 1);                                                 /* b next */
+    put_lit(e, 6, (uint64_t)(uintptr_t)slot);
     put(e, LDR_X(15, 6, 0));
     uint32_t to_unchained = e->n;
     put(e, 0xb4000000u | 15);                                         /* cbz x15, unchained (patched below) */
@@ -1137,7 +1148,7 @@ static void emit_ool(Emit *e) {
 
 int hv_translate_block(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail) {
     Emit *e = &E;
-    e->n = e->npool = e->nfix = e->nool = 0;
+    e->n = e->npool = e->nfix = e->nool = e->nsite = 0;
     e->flags = b->flags;
     e->slow_mem = m->slow_mem;
     e->page = b->va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
@@ -1185,5 +1196,6 @@ int hv_translate_block(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t 
     hv_jit_write(&m->jit, dst + pool_at, e->pool, e->npool * 8);
     hv_jit_finish(&m->jit, dst, total);
     b->code = dst;
+    for (uint32_t k = 0; k < e->nsite; k++) m->slot_site[e->site[k].slot] = dst + e->site[k].at;
     return 0;
 }

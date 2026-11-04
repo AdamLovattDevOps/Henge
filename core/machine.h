@@ -147,6 +147,7 @@ typedef struct HvMachine {
     HvStats stats;
     int chain;               /* block chaining and the indirect-branch cache are enabled */
     uint64_t *slots;         /* chainable exits' targets (0: not chained) */
+    uint32_t **slot_site;    /* the B in each exit's stub that chaining rewrites to jump to the target */
     uint32_t nslots;
     HvCpu *cpu;              /* CPU 0: the one that polls devices */
     HvCpu *cpus[HV_MAX_CPUS]; /* every CPU, so device and invalidation code can ask them to leave */

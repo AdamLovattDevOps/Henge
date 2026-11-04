@@ -435,6 +435,14 @@ static void print_stats(HvCpu *cpu, int force) {
    jump gets a block that just wrote its own page back to the dispatcher. */
 static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
     __atomic_store_n(slot, (uint64_t)(uintptr_t)b->code, __ATOMIC_RELEASE);
+    /* And the stub's B, when the target is in its range: a direct branch, no load. */
+    uint32_t *site = m->slot_site[slot - m->slots];
+    int64_t off = site ? b->code - site : 0;
+    if (site && off >= -(1 << 25) && off < (1 << 25)) {
+        uint32_t insn = 0x14000000u | (uint32_t)(off & 0x3ffffff);
+        hv_jit_write(&m->jit, site, &insn, 4);
+        hv_jit_finish(&m->jit, site, 1);
+    }
     m->stats.chained++;
 }
 

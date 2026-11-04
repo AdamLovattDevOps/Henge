@@ -31,7 +31,8 @@ static int init_rest(HvMachine *m) {
     m->stop_pc = ~0ull;
     m->chain = 1;
     m->slots = calloc(HV_MAX_SLOTS, sizeof *m->slots);
-    if (!m->slots) return -1;
+    m->slot_site = calloc(HV_MAX_SLOTS, sizeof *m->slot_site);
+    if (!m->slots || !m->slot_site) return -1;
     pthread_mutex_init(&m->big_mu, NULL);
     pthread_cond_init(&m->big_cv, NULL);
     pthread_mutexattr_t ra;
@@ -186,6 +187,7 @@ void hv_machine_free(HvMachine *m) {
         free(m->percpu[i].ucode);
     }
     free(m->slots);
+    free(m->slot_site);
 }
 
 int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int readonly) {
