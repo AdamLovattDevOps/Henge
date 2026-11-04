@@ -13,6 +13,7 @@
 #include "pl031.h"
 #include "virtio_blk.h"
 #include "virtio_input.h"
+#include "virtio_usb.h"
 #include "xhci.h"
 #include "virtio_net.h"
 #include "virtio_snd.h"
@@ -63,6 +64,7 @@ typedef struct HvVmapple {
     HvVirtioSnd *snd;
     HvVirtioInput *keyboard, *mouse;
     HvXhci *usb;             /* USB controller with the keyboard macOS actually uses */
+    HvVirtioUsb *vusb;       /* the USB device port an installer talks to (installer boots only) */
     uint8_t *cfg, *rom, *ram;
     uint64_t ram_size;
     uint64_t panic_events;   /* last pvpanic event the guest reported */

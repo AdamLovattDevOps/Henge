@@ -113,6 +113,8 @@ static uint64_t tick_locked(HvMachine *m, HvCpu *cpu) {
     hv_virtio_input_poll(b->keyboard);
     hv_virtio_input_poll(b->mouse);
     hv_virtio_snd_poll(b->snd);
+    hv_virtio_usb_poll(b->vusb);
+    hv_bdif_poll(b->bdif);
     return deadline; /* every GIC state change already updated the CPU's lines */
 }
 
@@ -168,6 +170,11 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
     b->keyboard = hv_virtio_input_create(m, b->pcie, HV_VINPUT_KEYBOARD);
     if (!order) b->mouse = hv_virtio_input_create(m, b->pcie, HV_VINPUT_MOUSE);
     if (!getenv("HV_NO_SOUND")) b->snd = hv_virtio_snd_create(m, b->pcie);
+    /* Installer boots (the ROM goes to DFU) get the USB device port, as VZ gives it. */
+    if (cfg->run_installer1 || cfg->run_installer2) {
+        b->vusb = hv_virtio_usb_create(m, b->pcie);
+        b->bdif->usb = b->vusb;
+    }
 
     m->tick = tick;
     m->tick_opaque = b;
