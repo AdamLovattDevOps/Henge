@@ -410,9 +410,10 @@ static void test_guest_programs(void) {
     /* Fresh GIC state for the guest to configure. */
     HvGic *g = board.gic;
     memset(g->enabled, 0, sizeof g->enabled);
+    memset(g->cpu[0].enabled, 0, sizeof g->cpu[0].enabled);
     g->ctlr = 0;
-    g->igrpen1 = 0;
-    g->waker = 6;
+    g->cpu[0].igrpen1 = 0;
+    g->cpu[0].waker = 6;
     memset(&init, 0, sizeof init);
     seed_cpu(&init, 3, VMAPPLE_MEM + 0x10000);
     uint64_t t0 = hv_counter();

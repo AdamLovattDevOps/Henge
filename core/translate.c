@@ -1055,7 +1055,11 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
     }
     case HV_INSN_WAIT:
         if (((insn >> 5) & 7) == 3 || ((insn >> 12) & 0xf) == 1) put_helper(e, pc, insn, HV_OP_WFI); /* WFI, WFIT, WFET */
-        put_exit(e, pc + 4); /* WFE just yields to the dispatcher */
+        else { /* WFE: waiting for another CPU, so ask the dispatcher to let one run */
+            put(e, 0x52800026u);                                             /* movz w6, #1 */
+            put(e, 0xb9000000u | (HV_CPU_EXIT_REQ / 4) << 10 | 28 << 5 | 6); /* str w6, [x28, #exit_req] */
+        }
+        put_exit(e, pc + 4);
         return 1;
     case HV_INSN_EXCEPTION:
         put_helper(e, pc, insn, HV_OP_EXCEPTION);

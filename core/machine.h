@@ -137,6 +137,12 @@ typedef struct HvMachine {
     HvCpu *cpus[HV_MAX_CPUS]; /* every CPU, so device and invalidation code can ask them to leave */
     int ncpus;
     HvPerCpu percpu[HV_MAX_CPUS];
+    /* With more than one CPU, only the holder of this runs guest code (a fair
+       ticket lock, handed over at every kick and while a CPU sleeps). */
+    int big_lock_on;
+    pthread_mutex_t big_mu;
+    pthread_cond_t big_cv;
+    uint64_t big_next, big_serving;
     int stats_interval;  /* seconds between --stats lines, 0 = off */
     /* --profile: host PCs of the CPU thread sampled every millisecond, drained by the stats line. */
     uint64_t *prof;
@@ -163,6 +169,10 @@ int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len);
 
 void hv_cpu_reset(HvCpu *cpu, HvMachine *m); /* CPU 0 */
 void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index);
+void hv_big_lock(HvMachine *m);
+void hv_big_unlock(HvMachine *m);
+/* Let a waiting CPU run (the lock is held again on return). */
+void hv_big_yield(HvMachine *m);
 /* Make every CPU leave its block at the next exit. */
 void hv_machine_kick_all(HvMachine *m);
 /* Wake one CPU out of WFI (and make it leave its block). */

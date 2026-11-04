@@ -108,7 +108,13 @@ void hv_eret(HvCpu *cpu) {
     cpu->excl_addr = ~0ull;
 }
 
-/* PSCI 1.0 for one CPU. */
+static HvCpu *cpu_by_mpidr(HvMachine *m, uint64_t mpidr) {
+    for (int i = 0; i < m->ncpus; i++)
+        if (m->cpus[i] && (m->cpus[i]->mpidr & 0xff00ffffffull) == (mpidr & 0xff00ffffffull)) return m->cpus[i];
+    return NULL;
+}
+
+/* PSCI 1.0. */
 static uint64_t psci(HvCpu *cpu, uint64_t fn) {
     static int log = -1;
     if (log < 0) log = getenv("HV_PSCI_LOG") != NULL;
@@ -120,19 +126,40 @@ static uint64_t psci(HvCpu *cpu, uint64_t fn) {
     case 0x84000006: return 2;                               /* MIGRATE_INFO_TYPE: no trusted OS */
     case 0x84000008:                                         /* SYSTEM_OFF */
     case 0x84000009:                                         /* SYSTEM_RESET */
-        cpu->halted = (uint32_t)fn == 0x84000008 ? 1 : 2;
+        for (int i = 0; i < cpu->m->ncpus; i++) /* the whole machine stops */
+            if (cpu->m->cpus[i]) cpu->m->cpus[i]->halted = (uint32_t)fn == 0x84000008 ? 1 : 2;
+        hv_machine_kick_all(cpu->m);
         return 0;
     case 0x8400000a: {                                       /* PSCI_FEATURES */
         uint32_t q = (uint32_t)cpu->x[1];
-        if (q == 0x84000000 || q == 0x84000006 || q == 0x84000008 || q == 0x84000009 ||
+        if (q == 0x84000000 || q == 0x84000002 || q == 0x84000006 || q == 0x84000008 || q == 0x84000009 ||
             q == 0x8400000a || q == 0xc4000003 || q == 0x84000003 || q == 0xc4000004 || q == 0x84000004)
             return 0;
         return (uint64_t)-1;
     }
-    case 0x84000003: case 0xc4000003:                        /* CPU_ON: no other CPUs yet */
-        return (uint64_t)-2;                                 /* INVALID_PARAMETERS */
-    case 0x84000004: case 0xc4000004:                        /* AFFINITY_INFO */
-        return (cpu->x[1] & 0xffffff) == (cpu->mpidr & 0xffffff) ? 0 : 1;
+    case 0x84000002:                                         /* CPU_OFF: until another CPU_ON */
+        cpu->off = 1;
+        return 0;
+    case 0x84000003: case 0xc4000003: {                      /* CPU_ON: target, entry point, context id */
+        HvCpu *t = cpu_by_mpidr(cpu->m, cpu->x[1]);
+        if (!t) return (uint64_t)-2;                         /* INVALID_PARAMETERS */
+        if (!t->off) return (uint64_t)-4;                    /* ALREADY_ON */
+        uint64_t mpidr = t->mpidr, entry = cpu->x[2], context = cpu->x[3];
+        if ((uint32_t)fn == 0x84000003) entry = (uint32_t)entry, context = (uint32_t)context;
+        /* As at reset: EL1h, MMU and caches off, everything masked. */
+        hv_cpu_reset_index(t, cpu->m, t->index);
+        t->mpidr = mpidr;
+        t->pc = entry;
+        t->x[0] = context;
+        __atomic_store_n(&t->off, 0, __ATOMIC_RELEASE);
+        hv_cpu_wake(t);
+        return 0;
+    }
+    case 0x84000004: case 0xc4000004: {                      /* AFFINITY_INFO: 0 on, 1 off */
+        HvCpu *t = cpu_by_mpidr(cpu->m, cpu->x[1]);
+        if (!t) return (uint64_t)-2;
+        return t->off ? 1 : 0;
+    }
     /* vmapple's paravirtualized PAC (XNU osfmk/arm64/hv_hvc.h): the guest
        cannot program PAC keys itself, so the hypervisor does. HengeVM never
        signs pointers, so there is nothing to program; each call only has to
@@ -187,9 +214,9 @@ int hv_exception_insn(HvCpu *cpu, uint32_t insn, uint64_t pc) {
     }
     if (opc == 0 && ll == 2 && cpu->el == 1) { /* HVC: the hypervisor's PSCI and vmapple's PAC calls */
         cpu->x[0] = psci(cpu, cpu->x[0]);
-        if (!cpu->halted) return 0; /* like a call: the block carries on (xnu makes one per context switch) */
+        if (!cpu->halted && !cpu->off) return 0; /* like a call: the block carries on (xnu makes one per context switch) */
         cpu->pc = pc + 4;
-        cpu->exit_reason = HV_EXIT_HALT;
+        cpu->exit_reason = cpu->halted ? HV_EXIT_HALT : HV_EXIT_BRANCH; /* CPU_OFF: the dispatcher parks it */
         return 1;
     }
     if (opc == 1 && ll == 0) { /* BRK */

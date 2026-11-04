@@ -18,6 +18,8 @@ int hv_machine_init(HvMachine *m, size_t jit_bytes) {
     m->chain = 1;
     m->slots = calloc(HV_MAX_SLOTS, sizeof *m->slots);
     if (!m->slots) return -1;
+    pthread_mutex_init(&m->big_mu, NULL);
+    pthread_cond_init(&m->big_cv, NULL);
     for (int i = 0; i < HV_MAX_CPUS; i++) { /* untouched pages cost nothing, so every CPU gets its tables now */
         HvPerCpu *p = &m->percpu[i];
         p->ijc = calloc(HV_IJC_TABLES * HV_IJC_TABLE_BYTES / 8, 8);
@@ -27,6 +29,32 @@ int hv_machine_init(HvMachine *m, size_t jit_bytes) {
         pthread_cond_init(&p->wake_cv, NULL);
     }
     return 0;
+}
+
+void hv_big_lock(HvMachine *m) {
+    if (!m->big_lock_on) return;
+    pthread_mutex_lock(&m->big_mu);
+    uint64_t me = m->big_next++;
+    while (m->big_serving != me) pthread_cond_wait(&m->big_cv, &m->big_mu);
+    pthread_mutex_unlock(&m->big_mu);
+}
+
+void hv_big_unlock(HvMachine *m) {
+    if (!m->big_lock_on) return;
+    pthread_mutex_lock(&m->big_mu);
+    m->big_serving++;
+    pthread_cond_broadcast(&m->big_cv);
+    pthread_mutex_unlock(&m->big_mu);
+}
+
+void hv_big_yield(HvMachine *m) {
+    if (!m->big_lock_on) return;
+    pthread_mutex_lock(&m->big_mu);
+    int waiting = m->big_next - m->big_serving > 1;
+    pthread_mutex_unlock(&m->big_mu);
+    if (!waiting) return;
+    hv_big_unlock(m);
+    hv_big_lock(m);
 }
 
 void hv_cpu_wake(HvCpu *cpu) {
@@ -185,7 +213,16 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
     m->cpus[index] = cpu;
     if (m->ncpus <= (int)index) m->ncpus = (int)index + 1;
     if (index == 0) m->cpu = cpu;
-    cpu->ijc = (uint64_t)(uintptr_t)cpu->pc_state->ijc;
+    HvPerCpu *p = cpu->pc_state;
+    /* Ids start over, so entries tagged with the old ones must go. */
+    for (int t = 0; t < HV_IJC_TABLES; t++)
+        if (p->ijc_tables_used >> t & 1) memset(p->ijc + (size_t)t * (HV_IJC_TABLE_BYTES / 8), 0, HV_IJC_TABLE_BYTES);
+    p->ijc_tables_used = 0;
+    memset(p->ijc_keyed, 0, sizeof p->ijc_keyed);
+    p->ijc_keyed_count = 0;
+    memset(p->ijc_pages, 0, sizeof p->ijc_pages);
+    memset(p->jc, 0, sizeof p->jc);
+    cpu->ijc = (uint64_t)(uintptr_t)p->ijc;
     cpu->next_cid = 1;
     cpu->kernel_gen = 1;
     cpu->ijc_salt[1] = 1ull << 48; /* tags of an all-zero table never match */

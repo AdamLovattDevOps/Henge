@@ -50,6 +50,7 @@ typedef struct HvVmapple {
     uint64_t avp_rtc[8];     /* Apple virtual RTC control registers +0x00..+0x38 (only +0x18, +0x20, +0x38 are written) */
     HvMachine *m;
     HvCpu *cpu;
+    int ncpus;
     HvGic *gic;
     HvPl011 *uart;
     HvPl031 *rtc;
@@ -68,9 +69,9 @@ typedef struct HvVmapple {
     void (*poll)(void);      /* extra device work on the CPU thread each tick (Mac PVG) */
 } HvVmapple;
 
-/* Builds the machine around m and cpu. Disks may be NULL (no device then).
+/* Builds the machine around m and cfg->nr_cpus CPUs (cpus is an array of them). Disks may be NULL (no device then).
    Guest RAM is reserved, not committed: pages are only used once touched. */
-int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size, HvDisk *root, HvDisk *aux,
+int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpus, uint64_t ram_size, HvDisk *root, HvDisk *aux,
                       const HvCfgParams *cfg, const uint8_t mac[6]);
 /* Copies a boot ROM image into the firmware region. */
 int hv_vmapple_load_rom(HvVmapple *b, const char *path);

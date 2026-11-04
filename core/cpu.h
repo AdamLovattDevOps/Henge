@@ -120,7 +120,8 @@ typedef struct HvCpu {
     uint32_t index;          /* which CPU: m->percpu[index] holds its caches and interrupt lines */
     struct HvPerCpu *pc_state;
     uint64_t icount;         /* blocks entered, for tests and stats */
-    int halted;              /* PSCI CPU_OFF / SYSTEM_OFF */
+    int halted;              /* SYSTEM_OFF / SYSTEM_RESET / guest panic: the machine stops */
+    int off;                 /* PSCI: powered off (a secondary not started yet, or CPU_OFF) until CPU_ON */
 } HvCpu;
 
 #define HV_CPU_X(n)        ((n) * 8)

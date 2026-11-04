@@ -92,7 +92,8 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
         /* Writes to this page must now take the slow path so we notice them. */
         if (!ram->code_pages[pg]) {
             ram->code_pages[pg] = 1;
-            hv_tlb_protect_code(cpu, ram->host + (pg << HV_TLB_PAGE_BITS));
+            for (int i = 0; i < m->ncpus; i++) /* in every CPU's TLB, or a write from another CPU goes unnoticed */
+                if (m->cpus[i]) hv_tlb_protect_code(m->cpus[i], ram->host + (pg << HV_TLB_PAGE_BITS));
         }
         return b;
     }
@@ -189,6 +190,7 @@ static int wait_for_interrupt(HvCpu *cpu) {
     if (wait_ticks > 240000) wait_ticks = 240000;
     uint64_t t0 = mach_absolute_time();
     /* Sleep until the next timer event or until a device thread has work for us. */
+    hv_big_unlock(m); /* let the other CPUs run while this one sleeps */
     pthread_mutex_lock(&p->wake_mu);
     if (!p->wake_pending) {
         struct timespec ts = {(time_t)(wait_ticks / 24000000), (long)(wait_ticks % 24000000) * 1000 / 24};
@@ -196,6 +198,7 @@ static int wait_for_interrupt(HvCpu *cpu) {
     }
     p->wake_pending = 0;
     pthread_mutex_unlock(&p->wake_mu);
+    hv_big_lock(m);
     m->stats.wfi++;
     m->stats.wfi_ticks += mach_absolute_time() - t0;
     m->tick(m, cpu);
@@ -322,6 +325,14 @@ static void print_stats(HvCpu *cpu, int force) {
             double busy = ti.user_time.seconds + ti.user_time.microseconds / 1e6 + ti.system_time.seconds +
                           ti.system_time.microseconds / 1e6;
             fprintf(stderr, "  cpu thread ran %.0f%% of the interval\n", 100 * (busy - last_busy) / dt);
+            if (m->ncpus > 1) {
+                fprintf(stderr, "  cpus:");
+                for (int i = 0; i < m->ncpus; i++)
+                    if (m->cpus[i])
+                        fprintf(stderr, " [%d] %s el%u pc %llx", i, m->cpus[i]->off ? "off" : "on", m->cpus[i]->el,
+                                (unsigned long long)m->cpus[i]->pc);
+                fprintf(stderr, "\n");
+            }
             last_busy = busy;
         }
         mach_port_deallocate(mach_task_self(), self);
@@ -394,17 +405,35 @@ static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
 
 static int run(HvCpu *cpu, int one);
 
+/* A powered-off CPU waits here, without the big lock, for PSCI CPU_ON. */
+static void wait_while_off(HvCpu *cpu) {
+    HvMachine *m = cpu->m;
+    HvPerCpu *p = cpu->pc_state;
+    hv_big_unlock(m);
+    pthread_mutex_lock(&p->wake_mu);
+    while (__atomic_load_n(&cpu->off, __ATOMIC_ACQUIRE) && !cpu->halted) {
+        p->wake_pending = 0;
+        pthread_cond_wait(&p->wake_cv, &p->wake_mu);
+    }
+    pthread_mutex_unlock(&p->wake_mu);
+    hv_big_lock(m);
+}
+
 int hv_run(HvCpu *cpu) {
+    hv_big_lock(cpu->m);
     hv_fp_enter(cpu);
     int r = run(cpu, 0);
     hv_fp_leave(cpu);
+    hv_big_unlock(cpu->m);
     return r;
 }
 
 int hv_run_one(HvCpu *cpu) {
+    hv_big_lock(cpu->m);
     hv_fp_enter(cpu);
     int r = run(cpu, 1);
     hv_fp_leave(cpu);
+    hv_big_unlock(cpu->m);
     return r;
 }
 
@@ -445,8 +474,20 @@ static int run(HvCpu *cpu, int one) {
             pending_chain = NULL;
         }
         if (cpu->halted) return HV_EXIT_HALT;
+        if (cpu->off) {
+            wait_while_off(cpu); /* comes back after CPU_ON, reset to its entry point */
+            pending_chain = NULL;
+            last_reason = HV_EXIT_EXCEPTION;
+            continue;
+        }
         /* Someone asked the CPU to leave (the 1 ms kicker, a device, an invalidation): service devices now. */
         int kicked = __atomic_exchange_n(&cpu->exit_req, 0, __ATOMIC_RELAXED) != 0;
+        if (kicked && m->big_lock_on) {
+            /* Give another CPU its turn. Whatever it does in between may touch
+               what this CPU's exclusive monitor watches, so the monitor clears. */
+            cpu->excl_addr = ~0ull;
+            hv_big_yield(m);
+        }
         if (m->tick && (kicked || ++since_tick >= 64)) {
             since_tick = 0;
             m->tick(m, cpu);

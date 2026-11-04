@@ -17,7 +17,9 @@
 #include "vmapple.h"
 
 static HvMachine m;
-static HvCpu cpu;
+static HvCpu cpus[HV_MAX_CPUS]; /* the board takes them as an array */
+#define cpu (cpus[0])
+static int ncpus = 1;
 static HvVmapple board;
 static volatile sig_atomic_t interrupted;
 
@@ -172,8 +174,17 @@ static void *cpu_thread(void *unused) {
     return NULL;
 }
 
+/* CPUs 1 and up: run whenever PSCI CPU_ON starts them; the machine stops with CPU 0. */
+static void *secondary_thread(void *arg) {
+    HvCpu *c = arg;
+    int r = hv_run(c);
+    if (!c->halted)
+        fprintf(stderr, "hengevm: cpu %u stopped (%s) at pc %llx el%u\n", c->index, reason_name(r), (unsigned long long)c->pc, c->el);
+    return NULL;
+}
+
 static void usage(void) {
-    fprintf(stderr, "usage: hengevm --rom FILE --disk FILE --aux FILE --ecid N [--seed N] [--ram MB] [--log N] [--trace 1] [--screenshot PNG] [--watch VA] [--stats SECONDS [--profile 1]] [--window] [--no-pvg] [--no-chain] [--break PC [--break-hits N]] [--dump PA LEN FILE] [--aux-offset BYTES]\n");
+    fprintf(stderr, "usage: hengevm --rom FILE --disk FILE --aux FILE --ecid N [--seed N] [--ram MB] [--log N] [--trace 1] [--screenshot PNG] [--watch VA] [--stats SECONDS [--profile 1]] [--cpus N] [--window] [--no-pvg] [--no-chain] [--break PC [--break-hits N]] [--dump PA LEN FILE] [--aux-offset BYTES]\n");
     exit(2);
 }
 
@@ -212,6 +223,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--watch")) watch = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--stats")) stats = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--profile")) profile = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--cpus")) ncpus = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--watch-pa")) watch_pa = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--translate")) translate_va = strtoull(argv[++i], NULL, 0);
 
@@ -245,7 +257,10 @@ int main(int argc, char **argv) {
     m.stats_interval = stats; /* set after hv_machine_init, which clears the machine */
     if (profile) m.prof = calloc(HV_PROF_RING, sizeof *m.prof);
     m.chain = !no_chain && brk == ~0ull; /* breakpoints need every block to come back */
-    HvCfgParams cfg = {.nr_cpus = getenv("HV_CFG_CPUS") ? (uint32_t)atoi(getenv("HV_CFG_CPUS")) : 1, .ecid = ecid, .seed = seed, .mac_en0 = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01}};
+    if (ncpus < 1) ncpus = 1;
+    if (ncpus > HV_MAX_CPUS) ncpus = HV_MAX_CPUS;
+    m.big_lock_on = ncpus > 1;
+    HvCfgParams cfg = {.nr_cpus = (uint32_t)ncpus, .ecid = ecid, .seed = seed, .mac_en0 = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01}};
     static const uint8_t mac[6] = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01};
     if (hv_vmapple_create(&board, &m, &cpu, ram_mb << 20, &disk, &aux, &cfg, mac) != 0 ||
         hv_vmapple_load_rom(&board, rom) != 0) {
@@ -276,6 +291,10 @@ int main(int argc, char **argv) {
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 8u << 20);
     pthread_create(&t, &attr, cpu_thread, NULL);
+    for (int i = 1; i < ncpus; i++) {
+        pthread_t s;
+        pthread_create(&s, &attr, secondary_thread, &cpus[i]);
+    }
     pthread_t k;
     pthread_create(&k, NULL, kicker_thread, NULL);
     if (getenv("HV_TYPE_AT")) {

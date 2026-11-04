@@ -323,6 +323,55 @@ int hv_sysreg_msr(HvCpu *cpu, uint32_t insn, uint64_t pc) {
     return 0;
 }
 
+/* One TLBI, applied to one CPU's TLB and indirect-branch cache. */
+static void tlbi(HvCpu *cpu, uint32_t op1, uint32_t crn, uint32_t crm, uint32_t op2, uint64_t xt, uint64_t pc) {
+    (void)crn;
+    /* VAE1, VAAE1, VALE1, VAALE1 (and their IS/OS forms) name one page:
+       Xt[43:0] is VA[55:12]. Everything else (all, by ASID, ranges) drops it all. */
+    int by_va = crn == 8 && op1 == 0 && (crm == 1 || crm == 3 || crm == 7) && (op2 & 1);
+    int by_asid = crn == 8 && op1 == 0 && (crm == 1 || crm == 3 || crm == 7) && op2 == 2; /* ASIDE1: non-global (user) entries */
+    /* RVAE1, RVAAE1, RVALE1, RVAALE1 (IS/OS/local): xnu uses these for every
+       multi-page unmap. Xt: ASID[63:48], TG[47:46], SCALE[45:44], NUM[43:39],
+       BaseADDR[36:0] in granule units; (NUM+1) << (5*SCALE+1) granules. */
+    int by_range = crn == 8 && op1 == 0 && (crm == 2 || crm == 5 || crm == 6) && (op2 & 1);
+    if (by_range) {
+        uint32_t tg = (xt >> 46) & 3;
+        int shift = tg == 1 ? 12 : tg == 2 ? 14 : tg == 3 ? 16 : 0;
+        uint64_t pages = (((xt >> 39) & 31) + 1) << (5 * ((xt >> 44) & 3) + 1);
+        int all_asids = op2 == 3 || op2 == 7;
+        /* BaseADDR is VA[36+shift:shift], sign-extended so TTBR1 ranges come out as kernel VAs. */
+        uint64_t va = shift ? (uint64_t)((int64_t)((xt & 0x1fffffffffull) << (64 - 37)) >> (64 - 37 - shift)) : 0;
+        uint64_t len = shift ? pages << shift : 0;
+        if (!shift || len > (256ull << HV_TLB_PAGE_BITS)) {
+            /* Reserved granule or a big range: drop that half. */
+            if ((va >> 55) & 1 || !shift) hv_tlb_flush(cpu);
+            else {
+                hv_tlb_flush_user(cpu);
+                cpu->m->stats.reset_why[7]++;
+                hv_ijc_drop_range(cpu, va, len, all_asids ? -1 : (int)(xt >> 48));
+            }
+        } else {
+            uint64_t first = va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
+            for (uint64_t p = first; p < va + len; p += 1ull << HV_TLB_PAGE_BITS)
+                hv_tlb_flush_va_asid(cpu, p, all_asids ? -1 : (int)(xt >> 48));
+        }
+        return;
+    }
+    if (by_va) {
+        uint64_t va = (uint64_t)((int64_t)((xt & 0xfffffffffffull) << 20) >> 8);
+        int all_asids = op2 == 3 || op2 == 7; /* VAAE1, VAALE1 */
+        hv_tlb_flush_va_asid(cpu, va, all_asids ? -1 : (int)(xt >> 48));
+    } else if (by_asid) {
+        hv_tlb_flush_user(cpu);
+        cpu->m->stats.reset_why[1]++;
+        hv_ijc_drop_asid(cpu, (uint16_t)(xt >> 48));
+    } else {
+        if (cpu->m->log >= 2)
+            fprintf(stderr, "tlbi-all S1_%u_C%u_C%u_%u pc %llx\n", op1, crn, crm, op2, (unsigned long long)pc);
+        hv_tlb_flush(cpu);
+    }
+}
+
 int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
     uint32_t op1 = (insn >> 16) & 7, crn = (insn >> 12) & 0xf, crm = (insn >> 8) & 0xf, op2 = (insn >> 5) & 7;
     int rt = insn & 0x1f;
@@ -353,49 +402,13 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
     }
     if (crn == 8 || crn == 9) { /* TLBI */
         if (cpu->el == 0) return undefined(cpu, pc);
-        /* VAE1, VAAE1, VALE1, VAALE1 (and their IS/OS forms) name one page:
-           Xt[43:0] is VA[55:12]. Everything else (all, by ASID, ranges) drops it all. */
-        int by_va = crn == 8 && op1 == 0 && (crm == 1 || crm == 3 || crm == 7) && (op2 & 1);
-        int by_asid = crn == 8 && op1 == 0 && (crm == 1 || crm == 3 || crm == 7) && op2 == 2; /* ASIDE1: non-global (user) entries */
-        /* RVAE1, RVAAE1, RVALE1, RVAALE1 (IS/OS/local): xnu uses these for every
-           multi-page unmap. Xt: ASID[63:48], TG[47:46], SCALE[45:44], NUM[43:39],
-           BaseADDR[36:0] in granule units; (NUM+1) << (5*SCALE+1) granules. */
-        int by_range = crn == 8 && op1 == 0 && (crm == 2 || crm == 5 || crm == 6) && (op2 & 1);
-        if (by_range) {
-            uint32_t tg = (xt >> 46) & 3;
-            int shift = tg == 1 ? 12 : tg == 2 ? 14 : tg == 3 ? 16 : 0;
-            uint64_t pages = (((xt >> 39) & 31) + 1) << (5 * ((xt >> 44) & 3) + 1);
-            int all_asids = op2 == 3 || op2 == 7;
-            /* BaseADDR is VA[36+shift:shift], sign-extended so TTBR1 ranges come out as kernel VAs. */
-            uint64_t va = shift ? (uint64_t)((int64_t)((xt & 0x1fffffffffull) << (64 - 37)) >> (64 - 37 - shift)) : 0;
-            uint64_t len = shift ? pages << shift : 0;
-            if (!shift || len > (256ull << HV_TLB_PAGE_BITS)) {
-                /* Reserved granule or a big range: drop that half. */
-                if ((va >> 55) & 1 || !shift) hv_tlb_flush(cpu);
-                else {
-                    hv_tlb_flush_user(cpu);
-                    cpu->m->stats.reset_why[7]++;
-                    hv_ijc_drop_range(cpu, va, len, all_asids ? -1 : (int)(xt >> 48));
-                }
-            } else {
-                uint64_t first = va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
-                for (uint64_t p = first; p < va + len; p += 1ull << HV_TLB_PAGE_BITS)
-                    hv_tlb_flush_va_asid(cpu, p, all_asids ? -1 : (int)(xt >> 48));
-            }
-            return 0;
-        }
-        if (by_va) {
-            uint64_t va = (uint64_t)((int64_t)((xt & 0xfffffffffffull) << 20) >> 8);
-            int all_asids = op2 == 3 || op2 == 7; /* VAAE1, VAALE1 */
-            hv_tlb_flush_va_asid(cpu, va, all_asids ? -1 : (int)(xt >> 48));
-        } else if (by_asid) {
-            hv_tlb_flush_user(cpu);
-            cpu->m->stats.reset_why[1]++;
-            hv_ijc_drop_asid(cpu, (uint16_t)(xt >> 48));
-        } else {
-            if (cpu->m->log >= 2)
-                fprintf(stderr, "tlbi-all S1_%u_C%u_C%u_%u pc %llx\n", op1, crn, crm, op2, (unsigned long long)pc);
-            hv_tlb_flush(cpu);
+        /* The shareable forms (IS, OS: CRm 1, 2, 3, 5) reach every CPU. With the
+           big lock the others are parked, so their TLBs can be changed from here. */
+        HvMachine *m = cpu->m;
+        int broadcast = (crm == 1 || crm == 2 || crm == 3 || crm == 5) && m && m->ncpus > 1;
+        for (int i = 0; i < (broadcast ? m->ncpus : 1); i++) {
+            HvCpu *c = broadcast ? m->cpus[i] : cpu;
+            if (c) tlbi(c, op1, crn, crm, op2, xt, pc);
         }
         return 0;
     }

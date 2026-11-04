@@ -22,7 +22,8 @@ static void pvpanic_write(void *opaque, uint64_t off, uint64_t v, unsigned size)
     HvVmapple *b = opaque;
     b->panic_events = v;
     fprintf(stderr, "hengevm: guest reported a panic (pvpanic event %llx)\n", (unsigned long long)v);
-    if (v & 1) b->cpu->halted = 4;
+    if (v & 1)
+        for (int i = 0; i < b->ncpus; i++) b->cpu[i].halted = 4;
 }
 
 /* Not in QEMU's vmapple, which targets macOS 12 guests. iBootStage2 (Sequoia)
@@ -103,6 +104,7 @@ static void pvg_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
 static uint64_t tick(HvMachine *m, HvCpu *cpu) {
     HvVmapple *b = m->tick_opaque;
     uint64_t deadline = hv_timer_update(b->gic, cpu);
+    if (cpu->index != 0) return deadline; /* the others only have their own timers to look after */
     hv_pl031_tick(b->rtc);
     if (b->poll) b->poll();
     hv_virtio_blk_poll(b->root_blk);
@@ -119,6 +121,8 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
     memset(b, 0, sizeof *b);
     b->m = m;
     b->cpu = cpu;
+    b->ncpus = cfg->nr_cpus ? (int)cfg->nr_cpus : 1;
+    if (b->ncpus > HV_MAX_CPUS) b->ncpus = HV_MAX_CPUS;
     b->ram_size = ram_size;
     b->ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (b->ram == MAP_FAILED) return -1;
@@ -172,7 +176,11 @@ int hv_vmapple_load_rom(HvVmapple *b, const char *path) {
 }
 
 void hv_vmapple_reset_cpu(HvVmapple *b) {
-    hv_cpu_reset(b->cpu, b->m);
-    b->cpu->mpidr = 0x80000000; /* Aff0 = 0, bit 31 RES1 */
-    b->cpu->pc = VMAPPLE_FIRMWARE;
+    for (int i = 0; i < b->ncpus; i++) {
+        HvCpu *c = &b->cpu[i];
+        hv_cpu_reset_index(c, b->m, (uint32_t)i);
+        c->mpidr = 0x80000000u | (uint32_t)i; /* Aff0 = the config's cpu_ids[i], bit 31 RES1 */
+        c->pc = VMAPPLE_FIRMWARE;
+        c->off = i != 0; /* secondaries wait for PSCI CPU_ON */
+    }
 }
