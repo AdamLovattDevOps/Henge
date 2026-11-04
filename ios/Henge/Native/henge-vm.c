@@ -124,4 +124,12 @@ void henge_vm_key(uint16_t code, int down) { if (state == 1) hv_vm_key(code, dow
 void henge_vm_mouse_move(int dx, int dy) { if (state == 1) hv_vm_mouse_move(dx, dy); }
 void henge_vm_mouse_button(int button, int down) { if (state == 1) hv_vm_mouse_button(button, down); }
 
+int henge_vm_boot_display(const uint8_t **pixels, int *width, int *height, int *stride) {
+    HvBootDisplay d;
+    if (!state || hv_vm_boot_display(&d) != 0) return -1;
+    *pixels = d.pixels;
+    *width = (int)d.width, *height = (int)d.height, *stride = (int)d.stride;
+    return 0;
+}
+
 size_t henge_available_memory(void) { return os_proc_available_memory(); }

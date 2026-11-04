@@ -32,6 +32,16 @@ HvVmapple *hv_vm_board(void);
 HvCpu *hv_vm_cpu(int index);
 int hv_vm_ncpus(void);
 
+/* The boot framebuffer iBoot hands the kernel (XNU's boot_args video info):
+   the Apple logo and progress bar while booting or installing, before a GPU
+   driver takes the display. Host pointer to the pixels (32-bit BGRA), or NULL
+   until the kernel has its boot_args. */
+typedef struct HvBootDisplay {
+    const uint8_t *pixels;
+    uint32_t width, height, stride;
+} HvBootDisplay;
+int hv_vm_boot_display(HvBootDisplay *d);
+
 /* Extra device work on CPU 0 each tick (Mac graphics). Set before hv_vm_start. */
 void hv_vm_set_poll(void (*poll)(void));
 

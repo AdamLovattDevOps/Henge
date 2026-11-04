@@ -97,6 +97,9 @@ struct InstallView: View {
     private var installing: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Installing on \(installer.machineName)").font(.headline).foregroundStyle(Stone.text)
+            BootDisplay()
+                .aspectRatio(16.0 / 10.0, contentMode: .fit)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             Text(Installer.stepName(installer.step)).foregroundStyle(Stone.text)
             ProgressView(value: installer.stepProgress)
             Text("The Mac starts its installer and macOS writes itself to the disk. This can take a long time on the iPhone.")

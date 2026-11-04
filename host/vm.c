@@ -28,6 +28,41 @@ HvMachine *hv_vm_machine(void) { return &m; }
 HvVmapple *hv_vm_board(void) { return &board; }
 HvCpu *hv_vm_cpu(int index) { return index >= 0 && index < ncpus ? &cpus[index] : NULL; }
 int hv_vm_ncpus(void) { return ncpus; }
+
+/* arm64 boot_args: {u16 Revision, u16 Version, u64 virtBase, physBase, memSize,
+   topOfKernelData, Video {baseAddr, display, rowBytes, width, height, depth}, ...}.
+   Found by scanning page starts for one whose physBase is the RAM base. */
+int hv_vm_boot_display(HvBootDisplay *d) {
+    static uint64_t found; /* RAM offset of boot_args */
+    uint8_t *ram = board.ram;
+    uint64_t size = board.ram_size;
+    if (!ram) return -1;
+    for (int pass = 0; pass < 2; pass++) {
+        if (!found || pass) {
+            if (pass && found) found = 0;
+            for (uint64_t off = 0; off + 0x1000 <= size && !found; off += 0x4000) {
+                const uint64_t *q = (const uint64_t *)(ram + off);
+                const uint16_t *h = (const uint16_t *)(ram + off);
+                if (h[0] != 2 || (h[1] != 2 && h[1] != 3)) continue;
+                if (q[2] != VMAPPLE_MEM || q[3] == 0 || q[3] > size) continue;
+                uint64_t base = q[5], row = q[7], w = q[8], hh = q[9], depth = q[10];
+                if (w < 320 || w > 8192 || hh < 200 || hh > 8192 || row < w * 4 || (depth & 0xff) != 32) continue;
+                if (base < VMAPPLE_MEM || base - VMAPPLE_MEM + row * hh > size) continue;
+                found = off;
+            }
+        }
+        if (!found) return -1;
+        const uint64_t *q = (const uint64_t *)(ram + found);
+        uint64_t base = q[5], row = q[7], w = q[8], hh = q[9];
+        if (q[2] == VMAPPLE_MEM && w >= 320 && w <= 8192 && hh >= 200 && hh <= 8192 && base >= VMAPPLE_MEM &&
+            base - VMAPPLE_MEM + row * hh <= size) {
+            d->pixels = ram + (base - VMAPPLE_MEM);
+            d->width = (uint32_t)w, d->height = (uint32_t)hh, d->stride = (uint32_t)row;
+            return 0;
+        }
+    }
+    return -1;
+}
 void hv_vm_set_poll(void (*poll)(void)) { extra_poll = poll; }
 
 const char *hv_vm_reason_name(int r) {

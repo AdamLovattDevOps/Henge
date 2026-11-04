@@ -45,13 +45,16 @@ struct SessionView: View {
         RoundedRectangle(cornerRadius: 18, style: .continuous)
             .fill(Color.black)
             .aspectRatio(16.0 / 10.0, contentMode: .fit)
-            .overlay(
-                VStack(spacing: 8) {
-                    StonesMark(height: 30)
+            .overlay(BootDisplay().clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous)))
+            .overlay(alignment: .bottom) {
+                VStack(spacing: 2) {
                     Text(phase).font(.headline).foregroundStyle(Stone.bezelText)
-                    Text("The display comes in a later build.").font(.caption).foregroundStyle(Stone.bezelDim)
+                    Text("Boot screen only: the full display needs a GPU iOS does not have yet.").font(.caption2).foregroundStyle(Stone.bezelDim)
                 }
-            )
+                .padding(8)
+                .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 10))
+                .padding(8)
+            }
     }
 
     private var phase: String {

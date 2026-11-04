@@ -40,6 +40,29 @@ The machine follows the memory map and devices of QEMU's open-source `vmapple`
 machine (hw/vmapple in QEMU, GPL-2.0-or-later). That code is the reference for
 device behaviour; nothing here comes from Virtualization.framework.
 
+## Installing macOS (no Mac needed)
+
+`hengevm --install IPSW` (and the iOS app's Install macOS) install macOS on a
+blank machine the way Virtualization.framework's installer does: the boot ROM
+starts in DFU mode (cfg `run_installer`) and shows up as a USB device, and a
+standard restore runs over that link. Apple's signing server personalizes the
+boot chain for the machine's ECID, as for any Mac; nothing is decrypted or
+patched on the host (encrypted images go to the guest as they are, and the
+restore OS asks for its keys itself; the host only fetches the URL it names).
+
+- The USB port: Apple's virtio USB device controller, PCI 0x106b:0x1a01 for the
+  kernel (`AppleVirtIOUSBDeviceController`), and channel 0x100000 of the boot
+  ROM's bdif MMIO transport for AVPBooter and iBoot (devices/virtio_usb.c,
+  devices/bdif.c). Requests (host to guest) carry {u32 len, u8 endpoint, u8 type}
+  and the data; responses {u8 type, u8 endpoint} and the data.
+- The host side: libirecovery, usbmuxd and idevicerestore (third_party, upstream
+  sources; the boot-ROM exploit is left out) linked against host/libusb_shim.c,
+  a libusb whose one device is that port. usbmuxd sends 16 KB transfers (each
+  request is one read on the device side), and ASR sends wait for a slow disk.
+- iOS: tools/build_ios_restore.sh builds the same stack (with libplist,
+  libimobiledevice, libtatsu, libzip, mbedtls for compiling only) and
+  host/curl_shim.m puts libcurl's easy API on NSURLSession.
+
 ## Milestones
 
 1. The translator runs small arm64 test programs at EL1 with the MMU off, and the

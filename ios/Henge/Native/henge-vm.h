@@ -39,6 +39,10 @@ void henge_vm_key(uint16_t code, int down);
 void henge_vm_mouse_move(int dx, int dy);
 void henge_vm_mouse_button(int button, int down);
 
+/* The boot framebuffer (Apple logo and progress bar), 32-bit BGRA, or -1 if
+   the kernel has not got that far. The pixels are the guest's live memory. */
+int henge_vm_boot_display(const uint8_t **pixels, int *width, int *height, int *stride);
+
 /* Bytes this process may still allocate before jetsam (os_proc_available_memory). */
 size_t henge_available_memory(void);
 

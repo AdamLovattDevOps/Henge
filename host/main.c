@@ -151,6 +151,16 @@ static void *cpu_thread(void *unused) {
         fprintf(stderr, "hengevm: %s %llu bytes at %llx to %s\n", p ? "wrote" : "cannot dump", (unsigned long long)a->dump_len,
                 (unsigned long long)a->dump_pa, a->dump_path);
     }
+    if (getenv("HV_BOOT_DISPLAY_DUMP")) { /* debugging: the boot framebuffer, raw BGRA, for the iOS view */
+        HvBootDisplay bd;
+        if (hv_vm_boot_display(&bd) == 0) {
+            FILE *f = fopen(getenv("HV_BOOT_DISPLAY_DUMP"), "wb");
+            if (f) fwrite(bd.pixels, 1, (size_t)bd.stride * bd.height, f), fclose(f);
+            fprintf(stderr, "hengevm: boot display %ux%u stride %u written\n", bd.width, bd.height, bd.stride);
+        } else {
+            fprintf(stderr, "hengevm: no boot display found\n");
+        }
+    }
     hv_vm_flush_disks();
     exit(0);
     return NULL;
