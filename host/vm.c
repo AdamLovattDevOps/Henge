@@ -5,6 +5,7 @@
 #include <pthread/qos.h>
 #include <signal.h>
 #include <stdio.h>
+#include <time.h>
 
 #include "usb_host.h"
 #include <stdlib.h>
@@ -37,10 +38,19 @@ int hv_vm_boot_display(HvBootDisplay *d) {
     uint8_t *ram = board.ram;
     uint64_t size = board.ram_size;
     if (!ram) return -1;
+    static double last_scan;
     for (int pass = 0; pass < 2; pass++) {
         if (!found || pass) {
+            /* A full scan at most every 2 s; boot_args sits low in RAM
+               (iBoot puts it near 0x78ed0000), so the first GB is enough. */
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            double now = ts.tv_sec + ts.tv_nsec * 1e-9;
+            if (now - last_scan < 2) return -1;
+            last_scan = now;
             if (pass && found) found = 0;
-            for (uint64_t off = 0; off + 0x1000 <= size && !found; off += 0x4000) {
+            uint64_t limit = size < (1ull << 30) ? size : 1ull << 30;
+            for (uint64_t off = 0; off + 0x1000 <= limit && !found; off += 0x4000) {
                 const uint64_t *q = (const uint64_t *)(ram + off);
                 const uint16_t *h = (const uint16_t *)(ram + off);
                 if (h[0] != 2 || (h[1] != 2 && h[1] != 3)) continue;
