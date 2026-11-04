@@ -199,6 +199,15 @@ static uint32_t wfe(HvCpu *cpu) {
     }
     const void *host = (const void *)(uintptr_t)(va + (uint64_t)e->addend);
     uint64_t want = cpu->excl_val[0] & (size == 8 ? ~0ull : (1ull << (8 * size)) - 1);
+    /* The host's WFE wakes at its event stream (about every microsecond on the
+       Mac); if it does not come back that soon (no event stream), spin instead. */
+    static int sleep_ok = -1;
+    if (sleep_ok < 0) {
+        __asm__ volatile("sevl; wfe" ::: "memory"); /* clear the event register */
+        uint64_t t0 = mach_absolute_time();
+        __asm__ volatile("wfe" ::: "memory");
+        sleep_ok = mach_absolute_time() - t0 < 24 * 20;
+    }
     uint64_t deadline = mach_absolute_time() + 24 * 50; /* 50 us at 24 MHz */
     cpu->m->stats.wfe_waits++;
     for (;;) {
@@ -214,7 +223,8 @@ static uint32_t wfe(HvCpu *cpu) {
             __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED);
             break;
         }
-        __asm__ volatile("wfe" ::: "memory");
+        if (sleep_ok) __asm__ volatile("wfe" ::: "memory");
+        else __asm__ volatile("yield" ::: "memory");
     }
     __asm__ volatile("clrex" ::: "memory");
     return 0;

@@ -419,10 +419,11 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
         hv_tlbi_apply(cpu, op1, crn, crm, op2, xt);
         int broadcast = (crm == 1 || crm == 2 || crm == 3 || crm == 5) && m && m->ncpus > 1;
         if (broadcast) {
-            /* One page (the common case): the others' entries for it go from here,
-               with nobody waited for unless a page walk of theirs raced. Their
-               branch caches still drop it themselves, at their next exit (every
-               cache lookup and chained exit checks exit_req first). */
+            /* One page or a small range (the common cases): the others' TLB
+               entries, stashed entries and cached branch targets for it go from
+               here (hv_tlbi_drop_remote_va), with nobody waited for unless a page
+               walk or cache fill of theirs raced; one that may be running code
+               from the page is made to leave its block. */
             int by_va = crn == 8 && op1 == 0 && (crm == 1 || crm == 3) && (op2 & 1);
             uint64_t va = (uint64_t)((int64_t)((xt & 0xfffffffffffull) << 20) >> 8);
             int asid = op2 == 3 || op2 == 7 ? -1 : (int)(xt >> 48);

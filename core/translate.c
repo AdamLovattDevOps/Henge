@@ -1748,10 +1748,10 @@ int hv_translate_place(HvMachine *m, HvBlock *b) {
     /* Exits in the page to blocks that exist already (or back to this one's
        start) are chained now, in the copy about to be written: no trip through
        the dispatcher to do it. As chain() does for the rest. */
-    for (uint32_t k = 0; k < e->nsite; k++) {
+    for (uint32_t k = 0; k < e->nsite && !m->trace; k++) { /* tracing logs every block entry */
         uint32_t slot = e->site[k].slot;
         uint64_t t = e->site[k].target;
-        if (m->slot_xa[slot] || e->site[k].flags != b->flags) continue;
+        if (m->slot_xa[slot] || e->site[k].flags != b->flags || t == m->stop_pc) continue; /* the dispatcher stops there */
         const uint32_t *code = NULL;
         if (t == b->va) code = dst;
         else {

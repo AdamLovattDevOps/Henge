@@ -94,6 +94,7 @@ static uint64_t post_locked_done(HvCpu *target, HvPerCpu *p) {
     uint64_t seq = __atomic_add_fetch(&p->req_seq, 1, __ATOMIC_SEQ_CST);
     pthread_mutex_unlock(&p->req_mu);
     __atomic_store_n(&target->exit_req, 1, __ATOMIC_SEQ_CST);
+    __asm__ volatile("sev" ::: "memory"); /* a WFE waiting in place (wfe() in dispatch.c) sees it now */
     target->m->stats.kick_src[0]++;
     return seq;
 }
@@ -189,8 +190,15 @@ void hv_big_yield(HvMachine *m) {
     hv_big_lock(m);
 }
 
+/* Make cpu leave its block at its next checked exit (and end an in-place WFE wait). */
+void hv_cpu_kick(HvCpu *cpu) {
+    __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_SEQ_CST);
+    __asm__ volatile("sev" ::: "memory");
+}
+
 void hv_cpu_wake(HvCpu *cpu) {
-    __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_SEQ_CST);
+    __asm__ volatile("sev" ::: "memory");
     cpu->m->stats.kick_src[1]++;
     HvPerCpu *p = cpu->pc_state;
     pthread_mutex_lock(&p->wake_mu);
@@ -202,7 +210,8 @@ void hv_cpu_wake(HvCpu *cpu) {
 void hv_machine_kick_all(HvMachine *m) {
     m->stats.kick_src[2]++;
     for (int i = 0; i < m->ncpus; i++)
-        if (m->cpus[i]) __atomic_store_n(&m->cpus[i]->exit_req, 1, __ATOMIC_RELAXED);
+        if (m->cpus[i]) __atomic_store_n(&m->cpus[i]->exit_req, 1, __ATOMIC_SEQ_CST);
+    __asm__ volatile("sev" ::: "memory");
 }
 
 /* Device work is for CPU 0, which polls the devices. */
@@ -383,7 +392,13 @@ void hv_cpu_reset(HvCpu *cpu, HvMachine *m) {
 }
 
 void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
-    memset(cpu, 0, sizeof *cpu);
+    /* Everything but m and pc_state: other CPUs' TLBIs read those of a CPU
+       being started (PSCI CPU_ON) at any time. */
+    _Static_assert(offsetof(HvCpu, m) < offsetof(HvCpu, pc_state), "HvCpu layout");
+    size_t a = offsetof(HvCpu, m), b = offsetof(HvCpu, pc_state);
+    memset(cpu, 0, a);
+    memset((char *)cpu + a + sizeof cpu->m, 0, b - a - sizeof cpu->m);
+    memset((char *)cpu + b + sizeof cpu->pc_state, 0, sizeof *cpu - b - sizeof cpu->pc_state);
     cpu->m = m;
     cpu->index = index;
     cpu->pc_state = &m->percpu[index];

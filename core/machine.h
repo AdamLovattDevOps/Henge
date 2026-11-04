@@ -293,6 +293,8 @@ void hv_big_yield(HvMachine *m);
 void hv_machine_kick_all(HvMachine *m);
 /* Wake one CPU out of WFI (and make it leave its block). */
 void hv_cpu_wake(HvCpu *cpu);
+/* Make it leave its block at the next checked exit, without waking it from WFI. */
+void hv_cpu_kick(HvCpu *cpu);
 
 /* From any thread: device work is waiting for the CPU thread's tick. Makes a
    running block leave and ends a WFI sleep. */

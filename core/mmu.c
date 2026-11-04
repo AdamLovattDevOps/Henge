@@ -293,7 +293,9 @@ void hv_tlb_flush_user_range(HvCpu *cpu, uint64_t va, uint64_t len) {
         if (e->read_tag == HV_TLB_INVALID && e->exec_tag == HV_TLB_INVALID && e->write_tag == HV_TLB_INVALID) continue;
         uint64_t tag = e->read_tag != HV_TLB_INVALID ? e->read_tag + HV_TLB_ADJ : e->exec_tag != HV_TLB_INVALID ? e->exec_tag : e->write_tag + HV_TLB_ADJ;
         if ((tag >> 55) & 1) continue; /* the slot holds a kernel page by now */
-        if (((tag & 0x00ffffffffffffffull) - lo) < len) memset(e, 0x80, sizeof *e); /* tagged addresses: by the low 56 bits */
+        /* Any overlap (a 4 KB-granule range may start inside the page); tagged addresses: by the low 56 bits. */
+        uint64_t pg = tag & 0x00ffffffffffffffull;
+        if (pg < lo + len && pg + PAGE_MASK + 1 > lo) memset(e, 0x80, sizeof *e);
     }
 }
 
@@ -529,8 +531,11 @@ int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid) {
     if (c1 & 1) { target->m->stats.race_kind[1]++; return 0; } /* caching a block it may have looked up through the old mapping */
     if (!((va >> 55) & 1)) stash_drop(p, asid);
     uint32_t idx = (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1);
+    int fetched = 0; /* the target may be running code from the page: it must leave and look again */
     for (int t = 0; t < 3; t++) { /* the slot whatever its tag byte, as hv_tlb_flush_va_asid does */
         HvTlbEntry *e = &target->tlb[idx][t];
+        uint64_t x = __atomic_load_n(&e->exec_tag, __ATOMIC_RELAXED);
+        if (x != HV_TLB_INVALID && ((x ^ va) & 0x00ffffffffffc000ull) == 0) fetched = 1;
         __atomic_store_n(&e->read_tag, HV_TLB_INVALID, __ATOMIC_RELAXED);
         __atomic_store_n(&e->write_tag, HV_TLB_INVALID, __ATOMIC_RELAXED);
         __atomic_store_n(&e->exec_tag, HV_TLB_INVALID, __ATOMIC_RELAXED);
@@ -544,6 +549,7 @@ int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid) {
     int ok = __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST) == s1 && /* no fill in between */
              __atomic_load_n(&p->ijc_seq, __ATOMIC_SEQ_CST) == c1;
     if (!ok) target->m->stats.race_kind[2]++;
+    else if (fetched) hv_cpu_kick(target);
     return ok;
 }
 
