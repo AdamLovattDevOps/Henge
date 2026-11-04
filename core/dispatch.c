@@ -116,7 +116,7 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
         gen = __atomic_load_n(&ram->page_gen[pg], __ATOMIC_ACQUIRE);
     }
     /* Translate without the lock, into this thread's buffer... */
-    HvBlock nb = {.va = va, .pa = pa, .flags = flags, .gen = gen, .ram = ram, .pg = pg};
+    HvBlock nb = {.va = va, .pa = pa, .flags = flags, .gen = gen, .ram = ram, .pg = pg, .maker = cpu->index + 1};
     uint64_t t0 = m->stats_interval ? mach_absolute_time() : 0;
     if (hv_translate_emit(m, &nb, code, avail) != 0) goto flush_unlocked;
     if (m->stats_interval) {

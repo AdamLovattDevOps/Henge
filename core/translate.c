@@ -1443,7 +1443,9 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
            helper leaves itself when one may cover the page this block runs from
            (see hv_helper). IC IALLU leaves. */
         if (crn == 7 && ((crm != 1 && crm != 5) || (op1 == 3 && crm == 5 && op2 == 1))) return 0;
-        if (crn == 8 && !e->no_ijc) return 0;
+        static int tlbi_leaves = -1; /* HV_TLBI_LEAVES: every TLBI ends its block, as before */
+        if (tlbi_leaves < 0) tlbi_leaves = getenv("HV_TLBI_LEAVES") != NULL;
+        if (crn == 8 && !e->no_ijc && !tlbi_leaves) return 0;
         put_exit(e, pc + 4);
         return 1;
     }
@@ -1760,7 +1762,9 @@ int hv_translate_place(HvMachine *m, HvBlock *b) {
         else {
             uint64_t pa = (b->pa & ~((1ull << HV_TLB_PAGE_BITS) - 1)) | (t & ((1ull << HV_TLB_PAGE_BITS) - 1));
             HvBlock *tb = hv_block_find(m, hv_block_hash(t, pa, b->flags), t, pa, b->flags, b->gen);
-            if (tb) code = tb->code;
+            /* Only to this CPU's own blocks: one another CPU just wrote must be
+               entered through an isb first (the dispatcher, a light lookup). */
+            if (tb && tb->maker == b->maker) code = tb->code;
         }
         if (!code) continue;
         m->slots[slot] = (uint64_t)(uintptr_t)code;

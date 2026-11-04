@@ -41,6 +41,7 @@ typedef struct HvBlock {
     uint64_t pg;
     uint32_t *code;
     struct HvBlock *next;
+    uint32_t maker;      /* the CPU that translated it (index + 1; 0: not a CPU, as in tests) */
 } HvBlock;
 
 #define HV_BLOCK_EL1   1u        /* translated for EL1 (selects tlb[1]) */

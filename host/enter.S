@@ -149,6 +149,9 @@ _hv_enter:
     ldr x0, [x28, #CPU_SP]
     mov sp, x0
     ldr x0, [x28, #0]
+    // Another CPU may have just written the block: its writes and cache
+    // invalidation are done, but this core must not run what it fetched before.
+    isb
     br x15
 
 _hv_exit:
@@ -195,6 +198,7 @@ _hv_helper_entry:
     // one, which wants guest x0 live as well; host x15 is scratch.
     ldr x15, [x28, #CPU_HELPER_RET]
     ldr x0, [x28]
+    isb                           // the next block may be one another CPU just wrote (see hv_enter)
     br x15
 
 // Shared tails of translated code, so each call site is a few words (the
@@ -317,6 +321,7 @@ _hv_ijc_thunk:
     ldr x7, [x28, #0x130]
     ldr x30, [x28, #240]
     cbz x6, 1f
+    isb                           // a block found in the hash may be one another CPU just wrote
     br x6
 1:  ldr x15, [x28, #CPU_REFILL_RET]
     add x15, x15, #4
@@ -393,6 +398,7 @@ _hv_xjump_thunk:
     ldr x30, [x28, #CPU_REFILL_RET]
     cbz x6, 3f
     ldr x30, [x28, #240]
+    isb                           // as in hv_ijc_thunk
     br x6
 3:  stp x0, x1, [x28]             // leave with pc = the target (and the guest's x30: hv_exit saves it)
     ldr x0, [x30, #8]
