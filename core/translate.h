@@ -32,5 +32,10 @@ enum {
    `avail` how many may be read before the end of the guest page.
    Returns -1 if the JIT region is full. */
 int hv_translate_block(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail);
+/* The same in two steps, so CPUs translate in parallel: emit into this
+   thread's buffer (no lock needed), then place it in the JIT region (under the
+   translation lock). place returns -1 if the region is full. */
+int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail);
+int hv_translate_place(HvMachine *m, HvBlock *b);
 
 #endif

@@ -412,13 +412,41 @@ static void tlb_fill(HvCpu *cpu, uint64_t va, int el, const HvWalk *w) {
     }
 }
 
+/* Walks that may fill the TLB are bracketed by the CPU's walk_seq (odd while
+   one runs), so another CPU's TLBI can drop entries here itself and know no
+   fill from an old page table raced it (hv_tlbi_drop_remote_va). */
+static void walk_begin(HvCpu *cpu) {
+    if (cpu->pc_state) __atomic_add_fetch(&cpu->pc_state->walk_seq, 1, __ATOMIC_SEQ_CST);
+}
+
+static void walk_end(HvCpu *cpu) {
+    if (cpu->pc_state) __atomic_add_fetch(&cpu->pc_state->walk_seq, 1, __ATOMIC_RELEASE);
+}
+
 uint32_t hv_mmu_access(HvCpu *cpu, uint64_t va, HvAccess acc, int el, uint64_t *pa) {
     HvWalk w;
+    walk_begin(cpu);
     hv_mmu_walk(cpu, va, acc, el, &w);
+    if (!w.fsc) tlb_fill(cpu, va, el, &w);
+    walk_end(cpu);
     if (w.fsc) return w.fsc;
-    tlb_fill(cpu, va, el, &w);
     *pa = w.pa;
     return 0;
+}
+
+int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va) {
+    HvPerCpu *p = target->pc_state;
+    uint32_t s1 = __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST);
+    if (s1 & 1) return 0; /* mid-walk: it may be about to fill from the old table */
+    uint32_t idx = (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1);
+    for (int t = 0; t < 3; t++) { /* the slot whatever its tag byte, as hv_tlb_flush_va_asid does */
+        HvTlbEntry *e = &target->tlb[t][idx];
+        __atomic_store_n(&e->read_tag, HV_TLB_INVALID, __ATOMIC_RELAXED);
+        __atomic_store_n(&e->write_tag, HV_TLB_INVALID, __ATOMIC_RELAXED);
+        __atomic_store_n(&e->exec_tag, HV_TLB_INVALID, __ATOMIC_RELAXED);
+    }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    return __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST) == s1; /* no fill in between */
 }
 
 const uint32_t *hv_mmu_fetch(HvCpu *cpu, uint64_t va, uint64_t *pa, uint32_t *avail) {
@@ -440,12 +468,14 @@ const uint32_t *hv_mmu_fetch(HvCpu *cpu, uint64_t va, uint64_t *pa, uint32_t *av
     }
     HvWalk w;
     cpu->m->stats.fetch_walks++;
+    walk_begin(cpu);
     hv_mmu_walk(cpu, va, HV_ACC_EXEC, cpu->el, &w);
+    if (!w.fsc) tlb_fill(cpu, va, cpu->el, &w);
+    walk_end(cpu);
     if (w.fsc) {
         hv_raise_abort(cpu, 1, va, w.fsc, 0, w.s1ptw, va);
         return NULL;
     }
-    tlb_fill(cpu, va, cpu->el, &w);
     uint64_t chunk = w.block_size < (1ull << HV_TLB_PAGE_BITS) ? w.block_size : 1ull << HV_TLB_PAGE_BITS;
     uint64_t left = chunk - (va & (chunk - 1));
     const uint32_t *p = hv_phys_ptr(cpu->m, w.pa, 4);

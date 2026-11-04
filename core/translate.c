@@ -50,6 +50,7 @@ typedef struct {
     uint32_t nool;
     struct { uint32_t slot, at; } site[MAX_OOL]; /* chainable exits: their slot and the B chaining patches */
     uint32_t nsite;
+    uint32_t pool_at, total; /* the finished block: code words, then the literal pool */
     uint32_t flags;
     int slow_mem;
     uint64_t page;       /* guest VA of the 16 KB page the block is in */
@@ -58,7 +59,7 @@ typedef struct {
     uint64_t cur_pc;     /* guest PC of the instruction being translated (or whose out-of-line exit is) */
 } Emit;
 
-static Emit E; /* translation runs on the dispatcher thread only */
+static __thread Emit E; /* each CPU translates on its own thread, outside the translation lock */
 
 /* ---- encodings ---- */
 
@@ -185,13 +186,17 @@ static void put_exit(Emit *e, uint64_t target) {
    so the chain stays correct across page-table changes. Other pages go through
    the indirect-branch cache. */
 static void put_branch_exit(Emit *e, uint64_t target) {
-    if ((target & ~((1ull << HV_TLB_PAGE_BITS) - 1)) != e->page || e->m->nslots == HV_MAX_SLOTS) {
+    uint32_t slot_index = ~0u;
+    if ((target & ~((1ull << HV_TLB_PAGE_BITS) - 1)) == e->page) {
+        slot_index = __atomic_fetch_add(&e->m->nslots, 1, __ATOMIC_RELAXED); /* translations run in parallel */
+        if (slot_index >= HV_MAX_SLOTS) slot_index = ~0u; /* out of slots until the next flush: no chaining */
+    }
+    if (slot_index == ~0u) {
         /* Another page may be remapped under us, so look it up by VA instead of chaining. */
         put_lit(e, 15, target);
         put_ijc_jump(e);
         return;
     }
-    uint32_t slot_index = e->m->nslots++;
     uint64_t *slot = &e->m->slots[slot_index];
     *slot = 0;
     put(e, 0xb9400000u | (HV_CPU_EXIT_REQ / 4) << 10 | 28 << 5 | 15); /* ldr w15, [x28, #exit_req] */
@@ -1148,7 +1153,7 @@ static void emit_ool(Emit *e) {
     }
 }
 
-int hv_translate_block(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail) {
+int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail) {
     Emit *e = &E;
     e->n = e->npool = e->nfix = e->nool = e->nsite = 0;
     e->flags = b->flags;
@@ -1191,13 +1196,25 @@ int hv_translate_block(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t 
         }
     }
 
+    e->pool_at = pool_at;
+    e->total = total;
+    return 0;
+}
+
+int hv_translate_place(HvMachine *m, HvBlock *b) {
+    Emit *e = &E;
     if (m->jit.used & 1) m->jit.used++;
-    uint32_t *dst = hv_jit_reserve(&m->jit, total);
+    uint32_t *dst = hv_jit_reserve(&m->jit, e->total);
     if (!dst) return -1;
-    hv_jit_write(&m->jit, dst, e->w, pool_at * 4);
-    hv_jit_write(&m->jit, dst + pool_at, e->pool, e->npool * 8);
-    hv_jit_finish(&m->jit, dst, total);
+    hv_jit_write(&m->jit, dst, e->w, e->pool_at * 4);
+    hv_jit_write(&m->jit, dst + e->pool_at, e->pool, e->npool * 8);
+    hv_jit_finish(&m->jit, dst, e->total);
     b->code = dst;
     for (uint32_t k = 0; k < e->nsite; k++) m->slot_site[e->site[k].slot] = dst + e->site[k].at;
     return 0;
+}
+
+int hv_translate_block(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail) {
+    if (hv_translate_emit(m, b, code, avail) != 0) return -1;
+    return hv_translate_place(m, b);
 }

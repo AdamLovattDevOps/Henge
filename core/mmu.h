@@ -47,7 +47,11 @@ void hv_ijc_drop_asid(HvCpu *cpu, uint16_t asid);
 /* TTBR0 changed: use the new address space's user entries. */
 void hv_ijc_switch(HvCpu *cpu);
 void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid); /* asid -1: every address space */
-void hv_ijc_drop_va(HvCpu *cpu, uint64_t va, int asid);       /* just the cached branch targets in the page */
+void hv_ijc_drop_va(HvCpu *cpu, uint64_t va, int asid);
+/* Another CPU's TLBI of one page: drop target's entries for it from here. 1 if
+   that is enough (no page walk of target's raced it), 0 if target must do it
+   itself and be waited for. Its branch cache is still target's own business. */
+int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va);       /* just the cached branch targets in the page */
 void hv_ijc_drop_range(HvCpu *cpu, uint64_t va, uint64_t len, int asid);
 void hv_ucode_add(HvCpu *cpu, uint64_t va); /* a user target was cached in this page (current address space) */
 void hv_tlb_protect_code(HvCpu *cpu, const uint8_t *host_page);

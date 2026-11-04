@@ -1,6 +1,7 @@
 #ifndef HENGEVM_GICV3_H
 #define HENGEVM_GICV3_H
 
+#include <pthread.h>
 #include <stdint.h>
 
 #include "machine.h"
@@ -27,6 +28,7 @@ typedef struct HvGicCpu {
 
 typedef struct HvGic {
     HvMachine *m;
+    pthread_mutex_t mu;            /* the GIC's own lock (see gicv3.c) */
     uint32_t ctlr;                 /* GICD_CTLR */
     /* SPIs (INTIDs 32 and up; entries below 32 are unused: see HvGicCpu) */
     uint8_t group[HV_GIC_NUM_IRQS];

@@ -1,5 +1,6 @@
 #include "gicv3.h"
 
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -16,6 +17,8 @@
 #define R(op0, op1, crn, crm, op2) ((op0) << 14 | (op1) << 11 | (crn) << 7 | (crm) << 3 | (op2))
 
 /* INTID i's state as CPU c sees it: banked below 32, shared above. */
+void hv_gicv3_update(HvGic *g);
+
 #define F(g, c, field, i) (*((i) < 32 ? &(g)->cpu[c].field[i] : &(g)->field[i]))
 
 static int ncpus(HvGic *g) {
@@ -59,7 +62,7 @@ static int hppi(HvGic *g, int c, int masked) {
     return best;
 }
 
-void hv_gicv3_update(HvGic *g) {
+static void hv_gicv3_update_body(HvGic *g) {
     for (int c = 0; c < ncpus(g); c++) {
         int i = hppi(g, c, 1);
         HvPerCpu *p = &g->m->percpu[c];
@@ -71,7 +74,7 @@ void hv_gicv3_update(HvGic *g) {
     }
 }
 
-void hv_gicv3_set_irq(HvGic *g, int intid, int level) {
+static void hv_gicv3_set_irq_body(HvGic *g, int intid, int level) {
     if (intid < 32 || intid >= HV_GIC_NUM_IRQS) return;
     level = level != 0;
     if (g->level[intid] == level) return; /* nothing changed: skip the rescan */
@@ -80,7 +83,7 @@ void hv_gicv3_set_irq(HvGic *g, int intid, int level) {
     hv_gicv3_update(g);
 }
 
-void hv_gicv3_set_ppi(HvGic *g, int c, int intid, int level) {
+static void hv_gicv3_set_ppi_body(HvGic *g, int c, int intid, int level) {
     if (intid < 16 || intid >= 32 || c >= HV_MAX_CPUS) return;
     HvGicCpu *k = &g->cpu[c];
     level = level != 0;
@@ -90,7 +93,7 @@ void hv_gicv3_set_ppi(HvGic *g, int c, int intid, int level) {
     hv_gicv3_update(g);
 }
 
-void hv_gicv3_pend(HvGic *g, int intid) {
+static void hv_gicv3_pend_body(HvGic *g, int intid) {
     if (intid < 32 || intid >= HV_GIC_NUM_IRQS) return;
     g->latch[intid] = 1;
     hv_gicv3_update(g);
@@ -117,7 +120,7 @@ static void end_of_interrupt(HvGic *g, int c, int intid) {
     hv_gicv3_update(g);
 }
 
-static uint64_t icc_read(HvMachine *m, HvCpu *cpu, uint32_t reg) {
+static uint64_t icc_read_body(HvMachine *m, HvCpu *cpu, uint32_t reg) {
     HvGic *g = m->gic;
     int c = (int)cpu->index;
     HvGicCpu *k = &g->cpu[c];
@@ -145,7 +148,7 @@ static uint64_t icc_read(HvMachine *m, HvCpu *cpu, uint32_t reg) {
     }
 }
 
-static void icc_write(HvMachine *m, HvCpu *cpu, uint32_t reg, uint64_t v) {
+static void icc_write_body(HvMachine *m, HvCpu *cpu, uint32_t reg, uint64_t v) {
     HvGic *g = m->gic;
     int c = (int)cpu->index;
     HvGicCpu *k = &g->cpu[c];
@@ -269,7 +272,7 @@ static int bank0(uint32_t a) {
     return (a & 0x7f) < 4;
 }
 
-static uint64_t dist_read(void *opaque, uint64_t off, unsigned size) {
+static uint64_t dist_read_body(void *opaque, uint64_t off, unsigned size) {
     HvGic *g = opaque;
     if (off >= 0x6100 && off < 0x6100 + 8 * HV_GIC_NUM_IRQS) { /* IROUTER<n>, n >= 32 */
         uint64_t v = g->route[(off - 0x6000) / 8];
@@ -288,7 +291,7 @@ static uint64_t dist_read(void *opaque, uint64_t off, unsigned size) {
     return (word >> ((off & 3) * 8)) & (size >= 4 ? 0xffffffffu : (1u << (size * 8)) - 1);
 }
 
-static void dist_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
+static void dist_write_body(void *opaque, uint64_t off, uint64_t v, unsigned size) {
     HvGic *g = opaque;
     if (off >= 0x6100 && off < 0x6100 + 8 * HV_GIC_NUM_IRQS) {
         uint64_t *r = &g->route[(off - 0x6000) / 8];
@@ -308,7 +311,7 @@ static void dist_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
 }
 
 /* One redistributor per CPU, 128 KB apart: RD_base at 0, SGI_base at 0x10000. */
-static uint64_t redist_read(void *opaque, uint64_t off, unsigned size) {
+static uint64_t redist_read_body(void *opaque, uint64_t off, unsigned size) {
     HvGic *g = opaque;
     uint64_t v = 0;
     int c = (int)(off >> 17);
@@ -334,7 +337,7 @@ static uint64_t redist_read(void *opaque, uint64_t off, unsigned size) {
     return size == 8 ? v : v & ((1ull << (size * 8)) - 1);
 }
 
-static void redist_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
+static void redist_write_body(void *opaque, uint64_t off, uint64_t v, unsigned size) {
     HvGic *g = opaque;
     int c = (int)(off >> 17);
     off &= 0x1ffff;
@@ -353,8 +356,77 @@ static void redist_write(void *opaque, uint64_t off, uint64_t v, unsigned size) 
     hv_gicv3_update(g);
 }
 
+/* Every way in takes the GIC's own lock (recursive: the bodies call hv_gicv3_update).
+   Devices call in holding the device lock; the CPUs' ICC registers and timers do not need it. */
+void hv_gicv3_update(HvGic *g) {
+    pthread_mutex_lock(&g->mu);
+    hv_gicv3_update_body(g);
+    pthread_mutex_unlock(&g->mu);
+}
+
+void hv_gicv3_set_irq(HvGic *g, int intid, int level) {
+    pthread_mutex_lock(&g->mu);
+    hv_gicv3_set_irq_body(g, intid, level);
+    pthread_mutex_unlock(&g->mu);
+}
+
+void hv_gicv3_set_ppi(HvGic *g, int c, int intid, int level) {
+    pthread_mutex_lock(&g->mu);
+    hv_gicv3_set_ppi_body(g, c, intid, level);
+    pthread_mutex_unlock(&g->mu);
+}
+
+void hv_gicv3_pend(HvGic *g, int intid) {
+    pthread_mutex_lock(&g->mu);
+    hv_gicv3_pend_body(g, intid);
+    pthread_mutex_unlock(&g->mu);
+}
+
+static uint64_t icc_read(HvMachine *m, HvCpu *cpu, uint32_t reg) {
+    pthread_mutex_lock(&((HvGic *)m->gic)->mu);
+    uint64_t v_ = icc_read_body(m, cpu, reg);
+    pthread_mutex_unlock(&((HvGic *)m->gic)->mu);
+    return v_;
+}
+
+static void icc_write(HvMachine *m, HvCpu *cpu, uint32_t reg, uint64_t v) {
+    pthread_mutex_lock(&((HvGic *)m->gic)->mu);
+    icc_write_body(m, cpu, reg, v);
+    pthread_mutex_unlock(&((HvGic *)m->gic)->mu);
+}
+
+static uint64_t dist_read(void *opaque, uint64_t off, unsigned size) {
+    pthread_mutex_lock(&((HvGic *)opaque)->mu);
+    uint64_t v_ = dist_read_body(opaque, off, size);
+    pthread_mutex_unlock(&((HvGic *)opaque)->mu);
+    return v_;
+}
+
+static void dist_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
+    pthread_mutex_lock(&((HvGic *)opaque)->mu);
+    dist_write_body(opaque, off, v, size);
+    pthread_mutex_unlock(&((HvGic *)opaque)->mu);
+}
+
+static uint64_t redist_read(void *opaque, uint64_t off, unsigned size) {
+    pthread_mutex_lock(&((HvGic *)opaque)->mu);
+    uint64_t v_ = redist_read_body(opaque, off, size);
+    pthread_mutex_unlock(&((HvGic *)opaque)->mu);
+    return v_;
+}
+
+static void redist_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
+    pthread_mutex_lock(&((HvGic *)opaque)->mu);
+    redist_write_body(opaque, off, v, size);
+    pthread_mutex_unlock(&((HvGic *)opaque)->mu);
+}
+
 HvGic *hv_gicv3_create(HvMachine *m, uint64_t dist_pa, uint64_t redist_pa) {
     HvGic *g = calloc(1, sizeof *g);
+    pthread_mutexattr_t ra;
+    pthread_mutexattr_init(&ra);
+    pthread_mutexattr_settype(&ra, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&g->mu, &ra);
     g->m = m;
     for (int c = 0; c < HV_MAX_CPUS; c++) {
         g->cpu[c].waker = 6; /* ProcessorSleep and ChildrenAsleep until the guest wakes it */
@@ -364,6 +436,8 @@ HvGic *hv_gicv3_create(HvMachine *m, uint64_t dist_pa, uint64_t redist_pa) {
     m->icc_read = icc_read;
     m->icc_write = icc_write;
     hv_machine_add_mmio(m, dist_pa, 0x10000, g, dist_read, dist_write, "gicv3-dist");
+    m->mmio[m->nmmio - 1].self_locked = 1;
     hv_machine_add_mmio(m, redist_pa, 0x400000, g, redist_read, redist_write, "gicv3-redist");
+    m->mmio[m->nmmio - 1].self_locked = 1;
     return g;
 }

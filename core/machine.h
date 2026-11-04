@@ -27,6 +27,7 @@ typedef struct HvMmio {
     uint64_t (*read)(void *opaque, uint64_t off, unsigned size);
     void (*write)(void *opaque, uint64_t off, uint64_t val, unsigned size);
     const char *name;
+    int self_locked;     /* the device takes its own lock (the GIC): no device lock around it */
 } HvMmio;
 
 typedef struct HvBlock {
@@ -58,6 +59,9 @@ typedef struct HvStats {
     uint64_t blocks, translations, block_flushes;
     uint64_t flush_smc, flush_ic, flush_full;  /* why translations were dropped */
     uint64_t chained, ijc_fills, ijc_resets;
+    uint64_t syncs, sync_ticks;        /* TLBI acks waited for, and host ticks spent waiting */
+    uint64_t dev_waits, dev_wait_ticks; /* device lock taken while another CPU held it */
+    uint64_t tr_waits, tr_wait_ticks;   /* translation lock likewise */
     uint64_t code_protects;   /* pages that became code (every CPU's TLB scanned for writable entries) */
     uint64_t tlb_miss_kind[4]; /* TLB misses: EL0 empty, EL0 other page there, EL1 empty, EL1 other page there */
     uint64_t slow_why[6];     /* slow accesses by cause: MMIO, code-page write, page end, TLB miss, other, TLB entry there but mismatched */
@@ -118,6 +122,7 @@ typedef struct HvPerCpu {
        flush barrier). tlb_live: active and not itself waiting for acks, i.e. it
        may be using TLB entries right now. */
     int active, tlb_live;
+    uint32_t walk_seq;           /* odd while it walks page tables and fills its TLB (see hv_tlbi_drop_remote_va) */
 } HvPerCpu;
 
 #define HV_REQ_TLB_ALL 1u   /* drop the whole TLB and branch cache */

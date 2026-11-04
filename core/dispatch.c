@@ -81,8 +81,25 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
     HvBlock *b = find(m, h, va, pa, flags, gen);
     if (b) return jc[j] = b;
 
-    pthread_mutex_lock(&m->tr_mu);
-    b = find(m, h, va, pa, flags, gen); /* another CPU may have just made it */
+    if (m->flush_pending) goto flush_unlocked;
+    /* Translate without the lock, into this thread's buffer... */
+    HvBlock nb = {.va = va, .pa = pa, .flags = flags, .gen = gen, .ram = ram, .pg = pg};
+    uint64_t t0 = m->stats_interval ? mach_absolute_time() : 0;
+    if (hv_translate_emit(m, &nb, code, avail) != 0) goto flush_unlocked;
+    if (m->stats_interval) {
+        m->stats.translate_ticks += mach_absolute_time() - t0;
+        m->stats.translated_insns += nb.ninsns;
+    }
+    /* ...then take it only to place and publish the block. */
+    if (pthread_mutex_trylock(&m->tr_mu) != 0) {
+        uint64_t w0 = m->stats_interval ? mach_absolute_time() : 0;
+        pthread_mutex_lock(&m->tr_mu);
+        if (m->stats_interval) {
+            m->stats.tr_waits++;
+            m->stats.tr_wait_ticks += mach_absolute_time() - w0;
+        }
+    }
+    b = find(m, h, va, pa, flags, gen); /* another CPU may have just made it: ours is dropped (its space stays used until a flush) */
     if (b) {
         pthread_mutex_unlock(&m->tr_mu);
         return jc[j] = b;
@@ -92,28 +109,22 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
         goto flush;
     }
     b = &m->blocks[m->nblocks];
-    *b = (HvBlock){.va = va, .pa = pa, .flags = flags, .gen = gen, .ram = ram, .pg = pg};
+    size_t used0 = m->jit.used;
+    if (hv_translate_place(m, &nb) != 0) { /* JIT region full: start over */
+        m->stats.flush_full++;
+        goto flush;
+    }
+    *b = nb;
     m->stats.translations++;
-    if (m->stats_interval) { /* diagnostics: was this code translated before? (hashed bitmaps, so approximate) */
-        static uint64_t seen_va[1 << 18], seen_vapa[1 << 18];
+    if (m->stats_interval) {
+        m->stats.translated_words += m->jit.used - used0;
+        static uint64_t seen_va[1 << 18], seen_vapa[1 << 18]; /* was this code translated before? (hashed, so approximate) */
         uint32_t hv = (uint32_t)(((va >> 2) ^ flags) * 0x9e3779b97f4a7c15ull >> 40);
         uint32_t hp = (uint32_t)((((va >> 2) ^ flags) * 0x9e3779b97f4a7c15ull ^ pa * 0xc2b2ae3d27d4eb4full) >> 40);
         if (seen_va[hv >> 6] >> (hv & 63) & 1) m->stats.retrans_va++;
         if (seen_vapa[hp >> 6] >> (hp & 63) & 1) m->stats.retrans_vapa++;
         seen_va[hv >> 6] |= 1ull << (hv & 63);
         seen_vapa[hp >> 6] |= 1ull << (hp & 63);
-    }
-    uint64_t t0 = m->stats_interval ? mach_absolute_time() : 0;
-    size_t used0 = m->jit.used;
-    int tr = hv_translate_block(m, b, code, avail);
-    if (m->stats_interval) {
-        m->stats.translate_ticks += mach_absolute_time() - t0;
-        m->stats.translated_insns += b->ninsns;
-        m->stats.translated_words += m->jit.used - used0;
-    }
-    if (tr != 0) { /* JIT region full: start over */
-        m->stats.flush_full++;
-        goto flush;
     }
     m->nblocks++;
     b->next = m->hash[h];
@@ -127,6 +138,8 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
     }
     pthread_mutex_unlock(&m->tr_mu);
     return b;
+flush_unlocked:
+    pthread_mutex_lock(&m->tr_mu);
 flush:
     __atomic_store_n(&m->flush_pending, 1, __ATOMIC_SEQ_CST);
     pthread_mutex_unlock(&m->tr_mu);
@@ -395,7 +408,9 @@ static void print_stats(HvCpu *cpu, int force) {
                 fprintf(stderr, "    worst: va %llx pa %llx flags %x gen %u/%u\n", (unsigned long long)b->va,
                         (unsigned long long)b->pa, b->flags, b->gen, b->ram->page_gen[b->pg]);
         }
-        fprintf(stderr, "  new code pages %.0f/s\n", RATE(code_protects));
+        fprintf(stderr, "  new code pages %.0f/s; waits: tlbi acks %.0f/s %.1f%%, device lock %.0f/s %.1f%%, translation lock %.0f/s %.1f%% (of one CPU)\n",
+                RATE(code_protects), RATE(syncs), RATE(sync_ticks) / 240000.0, RATE(dev_waits), RATE(dev_wait_ticks) / 240000.0,
+                RATE(tr_waits), RATE(tr_wait_ticks) / 240000.0);
         fprintf(stderr, "  tlb misses K/s: el0 empty %.0f el0 conflict %.0f el1 empty %.0f el1 conflict %.0f\n",
                 RATE(tlb_miss_kind[0]) / 1e3, RATE(tlb_miss_kind[1]) / 1e3, RATE(tlb_miss_kind[2]) / 1e3, RATE(tlb_miss_kind[3]) / 1e3);
         fprintf(stderr, "  slow mem causes K/s: mmio %.0f code-page write %.0f page end %.0f tlb miss %.0f other %.0f entry-but-tag %.0f\n",
@@ -558,6 +573,7 @@ static int host_pointer_check(HvCpu *cpu, uint64_t prev_pc) {
 static int run_loop(HvCpu *cpu, int one) {
     HvMachine *m = cpu->m;
     uint32_t since_tick = 0;
+    uint64_t next_due = 0; /* host time of this CPU's next timer event, from its last tick (0: none armed) */
     uint64_t last_fault = ~0ull, prev_pc = 0;
     HvBlock *prev_b = NULL;
     uint64_t *pending_chain = NULL;
@@ -589,9 +605,12 @@ static int run_loop(HvCpu *cpu, int one) {
             cpu->excl_addr = ~0ull;
             hv_big_yield(m);
         }
-        if (m->tick && (kicked || ++since_tick >= 64)) {
+        /* Ticks take the device lock, so not every few blocks: on a kick (the 1 ms
+           kicker, a device with work for CPU 0, an interrupt raised for this
+           CPU) or once this CPU's own timer is due. */
+        if (m->tick && (kicked || (++since_tick >= 64 && (since_tick = 0, next_due && mach_absolute_time() >= next_due)))) {
             since_tick = 0;
-            m->tick(m, cpu);
+            next_due = m->tick(m, cpu);
         }
         int why = pending_chain ? 0 : kicked ? 1 : last_reason != HV_EXIT_BRANCH ? 2 : 5;
         if (hv_check_interrupts(cpu)) {

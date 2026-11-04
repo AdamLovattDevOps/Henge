@@ -142,9 +142,7 @@ static int read_reg(HvCpu *cpu, uint32_t reg, uint64_t *v) {
     }
     /* GIC CPU interface (ICC_*_EL1): CRn 12, CRm 8..12, and ICC_PMR_EL1. */
     if (reg == R(3, 0, 4, 6, 0) || ((reg >> 14) == 3 && ((reg >> 11) & 7) == 0 && ((reg >> 7) & 15) == 12 && ((reg >> 3) & 15) >= 8)) {
-        hv_dev_lock(m);
-        *v = m->icc_read ? m->icc_read(m, cpu, reg) : 0;
-        hv_dev_unlock(m);
+        *v = m->icc_read ? m->icc_read(m, cpu, reg) : 0; /* the GIC locks itself */
         return 0;
     }
     /* The rest of the ID space reads as zero; so do debug and PMU registers. */
@@ -249,9 +247,7 @@ other:
         return 0;
     if (reg == R(3, 0, 4, 6, 0) ||
         ((reg >> 14) == 3 && ((reg >> 11) & 7) == 0 && ((reg >> 7) & 15) == 12 && ((reg >> 3) & 15) >= 8)) {
-        hv_dev_lock(m);
         if (m->icc_write) m->icc_write(m, cpu, reg, v);
-        hv_dev_unlock(m);
         return 0;
     }
     /* Debug and PMU registers: ignored. */
@@ -413,9 +409,19 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
         hv_tlbi_apply(cpu, op1, crn, crm, op2, xt);
         int broadcast = (crm == 1 || crm == 2 || crm == 3 || crm == 5) && m && m->ncpus > 1;
         if (broadcast) {
+            /* One page (the common case): the others' entries for it go from here,
+               with nobody waited for unless a page walk of theirs raced. Their
+               branch caches still drop it themselves, at their next exit (every
+               cache lookup and chained exit checks exit_req first). */
+            int by_va = crn == 8 && op1 == 0 && (crm == 1 || crm == 3) && (op2 & 1);
+            uint64_t va = (uint64_t)((int64_t)((xt & 0xfffffffffffull) << 20) >> 8);
             uint64_t seq[HV_MAX_CPUS] = {0};
-            for (int i = 0; i < m->ncpus; i++)
-                if (m->cpus[i] && m->cpus[i] != cpu) seq[i] = hv_cpu_post_tlbi(m->cpus[i], op1, crn, crm, op2, xt);
+            for (int i = 0; i < m->ncpus; i++) {
+                HvCpu *c = m->cpus[i];
+                if (!c || c == cpu) continue;
+                uint64_t s = hv_cpu_post_tlbi(c, op1, crn, crm, op2, xt);
+                if (!(by_va && hv_tlbi_drop_remote_va(c, va))) seq[i] = s;
+            }
             for (int i = 0; i < m->ncpus; i++)
                 if (seq[i]) hv_cpu_sync(cpu, m->cpus[i], seq[i]);
         }

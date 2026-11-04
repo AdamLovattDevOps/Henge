@@ -1,5 +1,6 @@
 #include "machine.h"
 
+#include <mach/mach_time.h>
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,7 +58,13 @@ static int init_rest(HvMachine *m) {
 __thread HvCpu *hv_self;
 
 void hv_dev_lock(HvMachine *m) {
+    if (pthread_mutex_trylock(&m->dev_mu) == 0) return;
+    uint64_t t0 = m->stats_interval ? mach_absolute_time() : 0;
     pthread_mutex_lock(&m->dev_mu);
+    if (m->stats_interval) {
+        m->stats.dev_waits++;
+        m->stats.dev_wait_ticks += mach_absolute_time() - t0;
+    }
 }
 
 void hv_dev_unlock(HvMachine *m) {
@@ -117,6 +124,8 @@ void hv_cpu_process_requests(HvCpu *cpu) {
 
 void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
     HvPerCpu *t = target->pc_state, *s = self ? self->pc_state : NULL;
+    HvMachine *mm = target->m;
+    uint64_t t0 = mm->stats_interval ? mach_absolute_time() : 0;
     if (s) __atomic_store_n(&s->tlb_live, 0, __ATOMIC_SEQ_CST); /* others need not wait for this one meanwhile */
     for (uint32_t spins = 0;; spins++) {
         if (__atomic_load_n(&t->ack_seq, __ATOMIC_ACQUIRE) >= seq) break;
@@ -127,6 +136,10 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
     if (s) {
         __atomic_store_n(&s->tlb_live, 1, __ATOMIC_SEQ_CST);
         hv_cpu_process_requests(self); /* anything that came in while we were not live */
+    }
+    if (mm->stats_interval) {
+        mm->stats.syncs++;
+        mm->stats.sync_ticks += mach_absolute_time() - t0;
     }
 }
 
@@ -208,7 +221,7 @@ int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,
                         uint64_t (*read)(void *, uint64_t, unsigned),
                         void (*write)(void *, uint64_t, uint64_t, unsigned), const char *name) {
     if (m->nmmio == HV_MAX_MMIO) return -1;
-    m->mmio[m->nmmio++] = (HvMmio){pa, size, opaque, read, write, name};
+    m->mmio[m->nmmio++] = (HvMmio){pa, size, opaque, read, write, name, 0};
     return 0;
 }
 
@@ -272,9 +285,9 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
     }
     HvMmio *d = hv_mmio_lookup(m, pa);
     if (!d || len > 8) return -1;
-    hv_dev_lock(m);
+    if (!d->self_locked) hv_dev_lock(m);
     uint64_t v = d->read ? d->read(d->opaque, pa - d->pa, len) : 0;
-    hv_dev_unlock(m);
+    if (!d->self_locked) hv_dev_unlock(m);
     memcpy(buf, &v, len);
     if (m->log >= 3)
         fprintf(stderr, "mmio read  %s+%llx size %u = %llx pc %llx\n", d->name, (unsigned long long)(pa - d->pa), len,
@@ -307,9 +320,9 @@ int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
     if (m->log >= 3)
         fprintf(stderr, "mmio write %s+%llx size %u = %llx pc %llx\n", d->name, (unsigned long long)(pa - d->pa), len,
                 (unsigned long long)v, (unsigned long long)m->access_pc);
-    hv_dev_lock(m);
+    if (!d->self_locked) hv_dev_lock(m);
     if (d->write) d->write(d->opaque, pa - d->pa, v, len);
-    hv_dev_unlock(m);
+    if (!d->self_locked) hv_dev_unlock(m);
     return 0;
 }
 
