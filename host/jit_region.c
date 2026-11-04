@@ -65,12 +65,17 @@ void hv_jit_write(HvJitRegion *region, uint32_t *start, const void *src, size_t 
         memcpy((uint8_t *)start + region->rw_diff, src, bytes);
         return;
     }
+#if TARGET_OS_OSX
     pthread_jit_write_protect_np(0); /* MAP_JIT: writable on this thread only, until hv_jit_finish */
+#endif
     memcpy(start, src, bytes);
 }
 
 void hv_jit_finish(HvJitRegion *region, uint32_t *start, size_t words) {
+    (void)region;
+#if TARGET_OS_OSX
     if (!region->rw_diff) pthread_jit_write_protect_np(1);
+#endif
     if (start && words) sys_icache_invalidate(start, words * sizeof(uint32_t));
 }
 

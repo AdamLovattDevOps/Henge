@@ -1,9 +1,17 @@
-/* The guest's sound on the Mac: the default output device through an AudioUnit
+/* The guest's sound on the host (Mac or iOS): the default output device through an AudioUnit
    whose render callback pulls PCM straight from the virtio-snd ring. The unit
    is set to the stream's own format, and CoreAudio converts to the device. */
 #include "audio_mac.h"
 
 #include <AudioToolbox/AudioToolbox.h>
+#include <TargetConditionals.h>
+
+/* The Mac's default output device, or the iOS app's own output (the app sets its audio session to playback). */
+#if TARGET_OS_IPHONE
+#define HV_OUTPUT_UNIT kAudioUnitSubType_RemoteIO
+#else
+#define HV_OUTPUT_UNIT kAudioUnitSubType_DefaultOutput
+#endif
 #include <stdio.h>
 
 static AudioComponentInstance unit;
@@ -29,7 +37,7 @@ static int start(void *opaque, unsigned channels, unsigned format, unsigned rate
         unit_running = 0;
     }
     if (!unit) {
-        AudioComponentDescription desc = {kAudioUnitType_Output, kAudioUnitSubType_DefaultOutput,
+        AudioComponentDescription desc = {kAudioUnitType_Output, HV_OUTPUT_UNIT,
                                           kAudioUnitManufacturer_Apple, 0, 0};
         AudioComponent comp = AudioComponentFindNext(NULL, &desc);
         if (!comp || AudioComponentInstanceNew(comp, &unit) != noErr) return -1;

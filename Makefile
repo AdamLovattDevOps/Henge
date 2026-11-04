@@ -71,3 +71,27 @@ clean:
 	rm -rf $(B)
 
 .PHONY: all test clean
+
+# ---- iOS: the engine as a static library for the Henge app (ios/) ----
+# make ios-lib -> build/ios/libhengevm.a. Networking links the arm64 iOS builds
+# of libslirp and glib from Husk's sysroot (scripts there make them); see ios/README.md.
+IOS_SDK = $(shell xcrun --sdk iphoneos --show-sdk-path)
+IOS_CC = xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isysroot $(IOS_SDK)
+IOS_DEPS ?= $(HOME)/Documents/Coding/Husk/build/ios-arm64/sysroot
+IOS_CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices -I$(IOS_DEPS)/include/slirp
+IB = build/ios
+IOS_SRC = $(wildcard core/*.c) host/jit_region.c host/disk.c host/vm.c host/net_slirp.c host/audio_mac.c \
+          $(filter-out devices/pvg_mac.m,$(wildcard devices/*.c))
+IOS_OBJ = $(patsubst %.c,$(IB)/%.o,$(IOS_SRC)) $(IB)/host/enter.o
+
+$(IB)/%.o: %.c core/*.h host/*.h devices/*.h
+	@mkdir -p $(dir $@)
+	$(IOS_CC) $(IOS_CFLAGS) -c $< -o $@
+$(IB)/host/enter.o: host/enter.S
+	@mkdir -p $(dir $@)
+	$(IOS_CC) -c $< -o $@
+$(IB)/libhengevm.a: $(IOS_OBJ)
+	rm -f $@
+	xcrun --sdk iphoneos libtool -static -o $@ $(IOS_OBJ)
+ios-lib: $(IB)/libhengevm.a
+.PHONY: ios-lib
