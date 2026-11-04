@@ -1,6 +1,8 @@
 #include "vm.h"
 
+#include <TargetConditionals.h>
 #include <pthread.h>
+#include <pthread/qos.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -81,9 +83,17 @@ static void *kicker_thread(void *unused) {
     return NULL;
 }
 
+/* iOS parks default-QoS threads on efficiency cores readily; the guest's CPUs are what the user waits on. */
+static void cpu_qos(void) {
+#if TARGET_OS_IPHONE
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+#endif
+}
+
 /* CPUs 1 and up: run whenever PSCI CPU_ON starts them; the machine stops with CPU 0. */
 static void *secondary_thread(void *arg) {
     HvCpu *c = arg;
+    cpu_qos();
     int r = hv_run(c);
     if (!c->halted)
         fprintf(stderr, "hengevm: cpu %u stopped (%s) at pc %llx el%u\n", c->index, hv_vm_reason_name(r),
@@ -102,6 +112,7 @@ int hv_vm_run_cpu0(void) {
 
 static void *cpu0_thread(void *unused) {
     (void)unused;
+    cpu_qos();
     int r = hv_vm_run_cpu0();
     hv_vm_flush_disks();
     if (exit_cb) exit_cb(r);

@@ -5,7 +5,7 @@
 # The disk goes in packed (disk.img.hvsparse: holes left out) so that 64 GB of
 # mostly empty image moves as what it actually holds. Reads the disk; writes nothing to it.
 set -e
-DISK=$1; AUX=$2; ECID=$3; NAME=${4:-Mac}; RAM=${5:-4096}; OUT=${6:-$HOME/Desktop/$NAME}
+DISK=$1; AUX=$2; ECID=$3; NAME=${4:-Mac}; RAM=${5:-2048}; OUT=${6:-$HOME/Desktop/$NAME}
 [ -f "$DISK" ] && [ -f "$AUX" ] && [ -n "$ECID" ] || { echo "usage: $0 DISK AUX ECID [NAME] [RAM_MB] [OUTDIR]" >&2; exit 2; }
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 make -C "$HERE" build/hvsparse >/dev/null

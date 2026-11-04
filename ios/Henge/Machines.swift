@@ -90,6 +90,7 @@ final class Machines: ObservableObject {
             let dest = mac.directory
             let fm = FileManager.default
             try fm.createDirectory(at: dest, withIntermediateDirectories: true)
+            excludeFromBackup()
             for name in ["AVPBooter.vmapple2.bin", "auxiliary.bin", "machine.json", "disk.img"] {
                 let from = folder.appendingPathComponent(name)
                 guard fm.fileExists(atPath: from.path) else { continue }
@@ -135,6 +136,14 @@ final class Machines: ObservableObject {
 
     private var listURL: URL { Self.root.appendingPathComponent("machines.json") }
 
+    /// Disk images are tens of gigabytes: keep them out of iCloud and computer backups.
+    private func excludeFromBackup() {
+        var url = Self.root
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? url.setResourceValues(values)
+    }
+
     private func load() {
         guard let data = try? Data(contentsOf: listURL), let list = try? JSONDecoder().decode([VirtualMac].self, from: data) else { return }
         all = list.filter { FileManager.default.fileExists(atPath: $0.disk.path) }
@@ -142,6 +151,7 @@ final class Machines: ObservableObject {
 
     private func save() {
         try? FileManager.default.createDirectory(at: Self.root, withIntermediateDirectories: true)
+        excludeFromBackup()
         if let data = try? JSONEncoder().encode(all) { try? data.write(to: listURL, options: .atomic) }
     }
 
