@@ -311,7 +311,10 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
     for (int i = 0; i < m->ncpus; i++) {
         HvCpu *c = m->cpus[i];
         if (!c) continue;
-        if (!hv_self || c == hv_self) {
+        /* Only a CPU may reset its own cache; from any other thread (a device,
+           or no CPU running yet) it is a request, or a running CPU could read a
+           half-written entry and jump into the wrong code. */
+        if (c == hv_self) {
             hv_ijc_reset(c, 0);
             hv_ijc_reset(c, 1);
         } else {
