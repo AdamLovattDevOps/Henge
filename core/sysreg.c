@@ -278,6 +278,15 @@ int hv_sysreg_mrs(HvCpu *cpu, uint32_t insn, uint64_t pc) {
     return 0;
 }
 
+/* Blocks carry on after most MSRs (see the translator), so an interrupt this
+   write let through (unmasking, or a GIC register raising a line) must make
+   the block leave at its next exit for the dispatcher to take it. */
+static void irq_check(HvCpu *cpu) {
+    HvMachine *m = cpu->m;
+    if (m && ((m->irq_line && !(cpu->daif & HV_PSTATE_I)) || (m->fiq_line && !(cpu->daif & HV_PSTATE_F))))
+        __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED);
+}
+
 int hv_sysreg_msr(HvCpu *cpu, uint32_t insn, uint64_t pc) {
     if (((insn >> 19) & 3) == 0) { /* MSR (immediate) to a PSTATE field */
         uint32_t op1 = (insn >> 16) & 7, op2 = (insn >> 5) & 7, imm = (insn >> 8) & 0xf;
@@ -294,6 +303,7 @@ int hv_sysreg_msr(HvCpu *cpu, uint32_t insn, uint64_t pc) {
         case 031: write_reg(cpu, R(3, 3, 4, 2, 6), (uint64_t)(imm & 1) << 12); break; /* SSBS */
         default: return undefined(cpu, pc);
         }
+        irq_check(cpu);
         return 0;
     }
     uint32_t reg = (insn >> 5) & 0xffff;
@@ -304,6 +314,7 @@ int hv_sysreg_msr(HvCpu *cpu, uint32_t insn, uint64_t pc) {
                 cpu->el);
     if (cpu->el == 0 && !el0_allowed(cpu, reg, 1)) return undefined(cpu, pc);
     if (write_reg(cpu, reg, rt == 31 ? 0 : cpu->x[rt]) != 0) return undefined(cpu, pc);
+    irq_check(cpu);
     return 0;
 }
 
@@ -358,6 +369,7 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
                 if ((va >> 55) & 1 || !shift) hv_tlb_flush(cpu);
                 else {
                     hv_tlb_flush_user(cpu);
+                    cpu->m->stats.reset_why[7]++;
                     if (all_asids) hv_ijc_reset(cpu, 0);
                     else hv_ijc_drop_asid(cpu, (uint16_t)(xt >> 48));
                 }

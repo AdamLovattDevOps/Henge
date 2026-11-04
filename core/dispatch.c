@@ -302,8 +302,29 @@ static void print_stats(HvCpu *cpu, int force) {
             last_busy = busy;
         }
         mach_port_deallocate(mach_task_self(), self);
-        fprintf(stderr, "  cache drops/s: full %.0f, ASID %.0f, user VA %.0f, kernel VA %.0f, code %.0f\n", RATE(reset_why[0]),
-                RATE(reset_why[1]), RATE(reset_why[2]), RATE(reset_why[3]), RATE(reset_why[4]));
+        fprintf(stderr, "  cache drops/s: full %.0f, ASID %.0f, user VA %.0f, kernel VA %.0f, code %.0f (whole user half %.0f, filter full %.0f, big user range %.0f)\n", RATE(reset_why[0]),
+                RATE(reset_why[1]), RATE(reset_why[2]), RATE(reset_why[3]), RATE(reset_why[4]), RATE(reset_why[5]), RATE(reset_why[6]), RATE(reset_why[7]));
+        { /* block hash health: chain lengths and how much of it is stale */
+            uint64_t used = 0, stale = 0, maxlen = 0, sumsq = 0;
+            uint32_t worst = 0;
+            for (uint32_t h = 0; h < HV_BLOCK_HASH; h++) {
+                uint64_t len = 0;
+                for (HvBlock *b = m->hash[h]; b; b = b->next) {
+                    len++;
+                    if (b->ram->page_gen[b->pg] != b->gen) stale++;
+                }
+                if (len) used++;
+                sumsq += len * len;
+                if (len > maxlen) maxlen = len, worst = h;
+            }
+            fprintf(stderr, "  block hash: %llu buckets used, %llu stale blocks, max chain %llu, mean walk %.1f\n",
+                    (unsigned long long)used, (unsigned long long)stale, (unsigned long long)maxlen,
+                    m->nblocks ? (double)sumsq / m->nblocks : 0.0);
+            int k = 0;
+            for (HvBlock *b = m->hash[worst]; b && k < 6; b = b->next, k++)
+                fprintf(stderr, "    worst: va %llx pa %llx flags %x gen %u/%u\n", (unsigned long long)b->va,
+                        (unsigned long long)b->pa, b->flags, b->gen, b->ram->page_gen[b->pg]);
+        }
         fprintf(stderr, "  misses at: RET %.0fK/s, BR/BLR %.0fK/s, B/BL %.0fK/s, conditional %.0fK/s, MSR %.0fK/s, other %.0fK/s, unknown %.0fK/s\n",
                 RATE(miss_kind[0]) / 1e3, RATE(miss_kind[1]) / 1e3, RATE(miss_kind[2]) / 1e3, RATE(miss_kind[3]) / 1e3,
                 RATE(miss_kind[4]) / 1e3, RATE(miss_kind[5]) / 1e3, RATE(miss_kind[6]) / 1e3);
@@ -383,6 +404,7 @@ static int run(HvCpu *cpu, int one) {
     HvMachine *m = cpu->m;
     uint32_t since_tick = 0;
     uint64_t last_fault = ~0ull, prev_pc = 0;
+    HvBlock *prev_b = NULL;
     uint64_t *pending_chain = NULL;
     uint32_t last_reason = HV_EXIT_BRANCH;
     for (;;) {
@@ -439,7 +461,37 @@ static int run(HvCpu *cpu, int one) {
             uint64_t *t = m->ijc + (size_t)(b->flags & (HV_IJC_TABLES - 1)) * (HV_IJC_TABLE_BYTES / 8);
             uint64_t tag = b->va ^ cpu->ijc_salt[kernel];
             uint64_t *ent = t + (size_t)hv_ijc_index(tag) * 2;
-            if (why == 5 && ent[0] == tag) why = 4; /* it was cached: not a miss */
+            if (why == 5 && ent[0] == tag) {
+                why = 4; /* it was cached: not a miss */
+                static int dbg = -1, shown;
+                if (dbg < 0) dbg = getenv("HV_IJC_DEBUG") != NULL;
+                if (dbg) { /* what instruction came just before the target (put_exit leaves with pc + 4) */
+                    static uint64_t hist[4], total;
+                    uint32_t before = 0;
+                    uint64_t off = b->pa - b->ram->pa;
+                    if (off & 0x3fff) memcpy(&before, b->ram->host + off - 4, 4);
+                    int k = cpu->miss_site ? 0 : before == 0xd5033fdf ? 1 : (before & 0xfff00000u) == 0xd5100000u ? 2 : 3;
+                    hist[k]++;
+                    if (++total % 200000 == 0)
+                        fprintf(stderr, "ijc cached-miss kinds: ijc site %llu, after ISB %llu, after MSR %llu, other %llu\n",
+                                (unsigned long long)hist[0], (unsigned long long)hist[1], (unsigned long long)hist[2],
+                                (unsigned long long)hist[3]);
+                    static uint64_t others;
+                    if (k == 3 && ++others % 50000 == 0 && shown < 60) {
+                        shown++;
+                        fprintf(stderr, "ijc cached-miss other: target %llx el%u reason %u, insn before %08x\n", (unsigned long long)b->va, cpu->el, last_reason, before);
+                    }
+                }
+                if (0) {
+                    shown++;
+                    uint32_t last = 0;
+                    if (prev_b && prev_b->ninsns)
+                        memcpy(&last, prev_b->ram->host + (prev_b->pa - prev_b->ram->pa) + 4 * (prev_b->ninsns - 1), 4);
+                    fprintf(stderr, "ijc cached-miss: target %llx flags %x from site %llx (prev block %llx flags %x, %u insns, last %08x, reason %u)\n",
+                            (unsigned long long)b->va, b->flags, (unsigned long long)cpu->miss_site,
+                            (unsigned long long)prev_pc, prev_b ? prev_b->flags : 0, prev_b ? prev_b->ninsns : 0, last, last_reason);
+                }
+            }
             ent[0] = tag;
             ent[1] = (uint64_t)(uintptr_t)b->code;
             m->ijc_tables_used |= 1u << (b->flags & (HV_IJC_TABLES - 1));
@@ -451,6 +503,7 @@ static int run(HvCpu *cpu, int one) {
             if (!(m->ijc_keyed[k >> 6] >> (k & 63) & 1)) {
                 m->ijc_keyed[k >> 6] |= 1ull << (k & 63);
                 if (++m->ijc_keyed_count > (1u << 17)) { /* an eighth full: start the cache and the filter over */
+                    m->stats.reset_why[6]++;
                     hv_ijc_reset(cpu, 0);
                     hv_ijc_reset(cpu, 1);
                     memset(m->ijc_keyed, 0, sizeof m->ijc_keyed);
@@ -465,6 +518,7 @@ static int run(HvCpu *cpu, int one) {
         if (m->trace) fprintf(stderr, "block %llx el%u\n", (unsigned long long)cpu->pc, cpu->el);
         if (m->log >= 4 && host_pointer_check(cpu, prev_pc)) return HV_EXIT_UNSUPPORTED;
         prev_pc = cpu->pc;
+        prev_b = b;
         m->stats.why[why]++;
         m->stats.recent[m->stats.nrecent++ & 15] = cpu->pc | cpu->el;
         if (why == 5 && m->stats_interval) {

@@ -233,10 +233,9 @@ static void ijc_clear_page(HvCpu *cpu, uint64_t page, int kernel, uint64_t salt)
     }
 }
 
-void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid) {
-    /* Tagged addresses may sit in any slot's tag byte, so check by the low 56 bits. */
-    uint32_t idx = (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1);
-    /* The page may hold cached branch targets even if its TLB entry is gone. */
+/* The page may hold cached branch targets even if its TLB entry is gone: forget
+   them, if the filters say it has any. */
+void hv_ijc_drop_va(HvCpu *cpu, uint64_t va, int asid) {
     int kernel = (va >> 55) & 1;
     HvMachine *m = cpu->m;
     if (m) {
@@ -256,10 +255,16 @@ void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid) {
             m->stats.reset_why[kernel ? 3 : 2]++;
             uint64_t page = va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
             if (kernel) ijc_clear_page(cpu, page, 1, cpu->ijc_salt[1]);
-            else if (asid < 0) hv_ijc_reset(cpu, 0); /* every address space: their slots differ, so start the user half over */
+            else if (asid < 0) m->stats.reset_why[5]++, hv_ijc_reset(cpu, 0); /* every address space: their slots differ, so start the user half over */
             else ijc_clear_page(cpu, page, 0, current_asid(cpu) < 0 ? cpu->ijc_salt[0] : (uint64_t)cpu->asid_cid[asid] << 48);
         }
     }
+}
+
+void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid) {
+    /* Tagged addresses may sit in any slot's tag byte, so check by the low 56 bits. */
+    uint32_t idx = (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1);
+    hv_ijc_drop_va(cpu, va, asid);
     for (int el = 0; el < 3; el++) {
         HvTlbEntry *e = &cpu->tlb[el][idx];
         memset(e, 0x80, sizeof *e);

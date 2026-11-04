@@ -54,7 +54,7 @@ typedef struct HvStats {
     uint64_t blocks, translations, block_flushes;
     uint64_t flush_smc, flush_ic, flush_full;  /* why translations were dropped */
     uint64_t chained, ijc_fills, ijc_resets;
-    uint64_t reset_why[5];    /* cache drops: full flush, TLBI by ASID, TLBI user VA, TLBI kernel VA, code change */
+    uint64_t reset_why[8];    /* cache drops: full flush, TLBI by ASID, TLBI user VA, TLBI kernel VA, code change, user VA in every ASID (whole user half), keyed filter full, big user range */
     uint64_t why[6];          /* dispatcher entries by cause: chain fill, kick, exception/sysreg, interrupt, cached target, cache miss */
     uint64_t miss_kind[7];    /* cache misses by the branch that missed: RET, BR/BLR, B/BL, conditional, MSR, other, unknown */
     uint64_t recent[16];      /* debugging: the last blocks the dispatcher entered (pc | el) */

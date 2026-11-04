@@ -883,6 +883,31 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
                 return 1;
             }
         }
+        {
+            /* Writes blocks are translated against (the flags: FP enable, PAN,
+               SPSel) or that change translation leave for the dispatcher. The
+               rest carry on: DAIF writes inside the block (the helper asks to
+               leave if an interrupt is now due), others through a chainable exit,
+               which still notices exit_req. */
+            uint32_t reg = (insn >> 5) & 0xffff;
+#define SR(op0, op1, crn, crm, op2) ((op0) << 14 | (op1) << 11 | (crn) << 7 | (crm) << 3 | (op2))
+            int imm_form = ((insn >> 19) & 3) == 0;
+            uint32_t field = ((insn >> 16) & 7) << 3 | ((insn >> 5) & 7);
+            if ((imm_form && (field == 036 || field == 037)) || (!imm_form && reg == SR(3, 3, 4, 2, 1))) {
+                /* An interrupt this let through is taken before the next instruction. */
+                put(e, 0xb9400000u | (HV_CPU_EXIT_REQ / 4) << 10 | 28 << 5 | 6); /* ldr w6, [x28, #exit_req] */
+                put(e, 0x35000000u | 6);                                         /* cbnz w6, out of line */
+                put_ool(e, (Ool){.kind = OOL_EXIT, .pc = pc + 4});
+                return 0;
+            }
+            if (!imm_form && reg != SR(3, 0, 1, 0, 2) && reg != SR(3, 0, 4, 2, 3) && reg != SR(3, 0, 4, 2, 0) &&
+                reg != SR(3, 0, 1, 0, 0) && reg != SR(3, 0, 2, 0, 0) && reg != SR(3, 0, 2, 0, 1) && reg != SR(3, 0, 2, 0, 2) &&
+                !e->no_ijc) {
+                put_branch_exit(e, pc + 4);
+                return 1;
+            }
+#undef SR
+        }
         put_exit(e, pc + 4);
         return 1;
     case HV_INSN_SYS: {
@@ -911,7 +936,11 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
             return 0;
         }
         if (op2 == 6) { /* ISB: later instructions must see earlier system register writes */
-            put_exit(e, pc + 4);
+            /* Writes that change how blocks are translated already left. What is
+               left to synchronise is code invalidation, which sets exit_req: the
+               chainable exit checks it. */
+            if (e->no_ijc) put_exit(e, pc + 4);
+            else put_branch_exit(e, pc + 4);
             return 1;
         }
         put(e, insn); /* DSB, DMB, SB */
