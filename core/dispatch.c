@@ -311,7 +311,7 @@ static uint32_t helper(HvCpu *cpu, const HvHelperInfo *info_in) {
     HvHelperInfo info_copy = *info_in;
     info_copy.op &= 0xff; /* the rest: hv_helper_thunk's refill flags */
     const HvHelperInfo *info = &info_copy;
-    if (info->op < 12) cpu->m->stats.helper[info->op]++;
+    if (info->op < 12 && cpu->m->stats_interval) cpu->m->stats.helper[info->op]++;
     if (cpu->m->stats_interval && (info->op == HV_OP_MRS || info->op == HV_OP_MSR || info->op == HV_OP_SYS))
         reg_hist[(info->insn >> 5) & 0xffff] += info->op == HV_OP_MRS ? 1 : 1ull << 32;
     switch (info->op) {
@@ -965,7 +965,7 @@ static int run_loop(HvCpu *cpu, int one) {
                 }
                 m->stats.fill_kind[kind]++;
             }
-            if (hv_ijc_fill_checked(cpu, b)) m->stats.ijc_fills++;
+            if (hv_ijc_fill_checked(cpu, b) && m->stats_interval) m->stats.ijc_fills++;
         }
         /* The block before left through a chainable direct branch to this one: link them. */
         /* Only if nothing in between (an abort, an interrupt) sent the CPU elsewhere. */
@@ -975,7 +975,7 @@ static int run_loop(HvCpu *cpu, int one) {
         if (m->log >= 4 && host_pointer_check(cpu, prev_pc)) return HV_EXIT_UNSUPPORTED;
         prev_pc = cpu->pc;
         prev_b = b;
-        m->stats.why[why]++;
+        if (m->stats_interval) m->stats.why[why]++;
         m->stats.recent[m->stats.nrecent++ & 15] = cpu->pc | cpu->el;
         if (why == 5 && m->stats_interval) {
             int kind = 6;
