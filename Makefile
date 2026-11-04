@@ -32,8 +32,8 @@ SLIRP_LIBS = $(shell pkg-config --libs slirp)
 $(B)/net_slirp.o: host/net_slirp.c host/net_slirp.h devices/virtio_net.h | $(B)
 	$(CC) $(CFLAGS) $(SLIRP_CFLAGS) -c $< -o $@
 
-$(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/audio_mac.o
-	$(CC) $(CFLAGS) host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/audio_mac.o $(SLIRP_LIBS) -framework AudioToolbox -framework ParavirtualizedGraphics -framework Metal \
+$(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/audio_mac.o $(B)/vm.o
+	$(CC) $(CFLAGS) host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/audio_mac.o $(B)/vm.o $(SLIRP_LIBS) -framework AudioToolbox -framework ParavirtualizedGraphics -framework Metal \
 	    -framework Foundation -framework CoreGraphics -framework ImageIO -framework CoreFoundation \
 	    -framework AppKit -framework QuartzCore -o $@
 

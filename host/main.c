@@ -10,39 +10,28 @@
 
 #include "dispatch.h"
 #include "exception.h"
-#include "audio_mac.h"
 #include "mmu.h"
-#include "net_slirp.h"
 #include "pvg.h"
-#include "vmapple.h"
+#include "vm.h"
 
-static HvMachine m;
-static HvCpu cpus[HV_MAX_CPUS]; /* the board takes them as an array */
-#define cpu (cpus[0])
+/* The machine lives in vm.c; these name its parts here. */
+#define m (*hv_vm_machine())
+#define board (*hv_vm_board())
+#define cpu (*hv_vm_cpu(0))
 static int ncpus = 3; /* --cpus: 3 boots as fast as 4 on a 2+4-core Mac and leaves room for the window */
-static HvVmapple board;
 static volatile sig_atomic_t interrupted;
 
 static void on_signal(int sig) {
     (void)sig;
     interrupted = 1;
-    cpu.halted = 3; /* the dispatcher stops at the next block */
+    hv_vm_stop();
 }
 
-static const char *reason_name(int r) {
-    switch (r) {
-    case HV_EXIT_HALT: return "halt";
-    case HV_EXIT_WFI: return "wfi with nothing to wake it";
-    case HV_EXIT_UNSUPPORTED: return "unsupported";
-    case HV_EXIT_FAULT_LOOP: return "fault on the exception vector";
-    default: return "other";
-    }
-}
+#define reason_name hv_vm_reason_name
 
 typedef struct RunArgs {
     uint64_t brk, brk_hits, dump_pa, dump_len;
     const char *dump_path;
-    HvDisk *disk, *aux;
 } RunArgs;
 static RunArgs run_args;
 static uint64_t translate_va;
@@ -50,14 +39,6 @@ static uint64_t translate_va;
 /* Chained blocks run without returning to the dispatcher; this makes them leave
    every millisecond so timers, devices and interrupts are serviced. */
 static mach_port_t cpu_port;
-static int pvg_on, net_on;
-
-/* Host-side device work on the CPU thread each tick. */
-static void board_poll(void) {
-    if (pvg_on) hv_pvg_poll();
-    if (net_on) hv_net_poll();
-}
-
 /* --profile: where the CPU thread is right now. */
 static void sample_cpu(void) {
     arm_thread_state64_t st;
@@ -70,12 +51,11 @@ static void sample_cpu(void) {
     __atomic_store_n(&m.prof_head, m.prof_head + 1, __ATOMIC_RELEASE);
 }
 
-static void *kicker_thread(void *unused) {
+static void *profile_thread(void *unused) {
     (void)unused;
     for (;;) {
         usleep(1000);
-        hv_machine_kick_all(&m);
-        if (m.prof && cpu_port) sample_cpu();
+        if (cpu_port) sample_cpu();
     }
     return NULL;
 }
@@ -122,7 +102,7 @@ static void *cpu_thread(void *unused) {
     m.stop_pc = a->brk;
     int r;
     for (;;) {
-        r = hv_run(&cpu);
+        r = hv_vm_run_cpu0();
         if (r != HV_EXIT_HALT || cpu.halted || cpu.pc != a->brk || --a->brk_hits == 0) break;
         m.stop_pc = ~0ull; /* step past it: run one block, then re-arm */
         uint64_t at = cpu.pc;
@@ -168,18 +148,8 @@ static void *cpu_thread(void *unused) {
         fprintf(stderr, "hengevm: %s %llu bytes at %llx to %s\n", p ? "wrote" : "cannot dump", (unsigned long long)a->dump_len,
                 (unsigned long long)a->dump_pa, a->dump_path);
     }
-    hv_disk_flush(a->disk);
-    hv_disk_flush(a->aux);
+    hv_vm_flush_disks();
     exit(0);
-    return NULL;
-}
-
-/* CPUs 1 and up: run whenever PSCI CPU_ON starts them; the machine stops with CPU 0. */
-static void *secondary_thread(void *arg) {
-    HvCpu *c = arg;
-    int r = hv_run(c);
-    if (!c->halted)
-        fprintf(stderr, "hengevm: cpu %u stopped (%s) at pc %llx el%u\n", c->index, reason_name(r), (unsigned long long)c->pc, c->el);
     return NULL;
 }
 
@@ -240,63 +210,37 @@ int main(int argc, char **argv) {
     if (!rom || !disk_path || !aux_path) usage();
     setvbuf(stderr, NULL, _IONBF, 0);
 
-    static HvDisk disk, aux;
-    if (hv_disk_open(&disk, disk_path, 0, 0) != 0 || hv_disk_open(&aux, aux_path, aux_offset, 0) != 0) {
-        fprintf(stderr, "hengevm: cannot open the disks\n");
+    HvVmConfig vc = {.rom = rom, .disk = disk_path, .aux = aux_path, .aux_offset = aux_offset, .ecid = ecid, .seed = seed,
+                     .ram_mb = ram_mb, .ncpus = ncpus, .log = log, .no_net = getenv("HV_NO_NET") != NULL};
+    if (getenv("HV_JIT_MB")) vc.jit_bytes = (size_t)atoi(getenv("HV_JIT_MB")) << 20; /* debugging: a small region flushes often */
+    char err[256];
+    if (hv_vm_create(&vc, err, sizeof err) != 0) {
+        fprintf(stderr, "hengevm: %s\n", err);
         return 1;
     }
-    size_t jit_mb = getenv("HV_JIT_MB") ? (size_t)atoi(getenv("HV_JIT_MB")) : 768; /* debugging: a small region flushes often */
-    if (hv_machine_init(&m, jit_mb << 20) != 0) {
-        fprintf(stderr, "hengevm: cannot map the JIT region\n");
-        return 1;
-    }
-    m.log = log;
     m.trace = trace;
     m.watch_va = watch;
     m.watch_pa = watch_pa;
-    m.stats_interval = stats; /* set after hv_machine_init, which clears the machine */
+    m.stats_interval = stats; /* set after the machine is made, which clears it */
     if (profile) m.prof = calloc(HV_PROF_RING, sizeof *m.prof);
     m.chain = !no_chain && brk == ~0ull; /* breakpoints need every block to come back */
-    if (ncpus < 1) ncpus = 1;
-    if (ncpus > HV_MAX_CPUS) ncpus = HV_MAX_CPUS;
-    m.big_lock_on = ncpus > 1 && getenv("HV_BIG_LOCK"); /* debugging: one CPU in guest code at a time */
-    HvCfgParams cfg = {.nr_cpus = (uint32_t)ncpus, .ecid = ecid, .seed = seed, .mac_en0 = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01}};
-    static const uint8_t mac[6] = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01};
-    if (hv_vmapple_create(&board, &m, &cpu, ram_mb << 20, &disk, &aux, &cfg, mac) != 0 ||
-        hv_vmapple_load_rom(&board, rom) != 0) {
-        fprintf(stderr, "hengevm: cannot build the machine or load the ROM\n");
-        return 1;
-    }
-    hv_vmapple_reset_cpu(&board);
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
-
+    int pvg_on = 0;
     if (use_pvg) {
-        if (hv_pvg_attach(&board, screenshot) != 0) {
-            fprintf(stderr, "hengevm: ParavirtualizedGraphics device unavailable; graphics stays inert\n");
-        } else {
-            pvg_on = 1;
-        }
+        if (hv_pvg_attach(&board, screenshot) != 0) fprintf(stderr, "hengevm: ParavirtualizedGraphics device unavailable; graphics stays inert\n");
+        else pvg_on = 1;
     }
-    if (board.net && !getenv("HV_NO_NET")) {
-        if (hv_net_attach(&m, board.net) != 0) fprintf(stderr, "hengevm: user-mode network unavailable\n");
-        else net_on = 1;
-    }
-    if (board.snd) hv_audio_attach(board.snd);
-    board.poll = board_poll;
-    run_args = (RunArgs){brk, brk_hits, dump_pa, dump_len, dump_path, &disk, &aux};
+    if (pvg_on) hv_vm_set_poll(hv_pvg_poll);
+    run_args = (RunArgs){brk, brk_hits, dump_pa, dump_len, dump_path};
     /* The CPU runs on its own thread: the graphics framework needs the main queue. */
+    hv_vm_start(0, NULL); /* the other CPUs and the kicker; CPU 0 is cpu_thread, for --break */
     pthread_t t;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 8u << 20);
     pthread_create(&t, &attr, cpu_thread, NULL);
-    for (int i = 1; i < ncpus; i++) {
-        pthread_t s;
-        pthread_create(&s, &attr, secondary_thread, &cpus[i]);
-    }
-    pthread_t k;
-    pthread_create(&k, NULL, kicker_thread, NULL);
+    if (profile) pthread_create(&t, NULL, profile_thread, NULL);
     if (getenv("HV_TYPE_AT")) {
         pthread_t ty;
         pthread_create(&ty, NULL, type_thread, NULL);
