@@ -37,6 +37,9 @@ $(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/
 	    -framework Foundation -framework CoreGraphics -framework ImageIO -framework CoreFoundation \
 	    -framework AppKit -framework QuartzCore -o $@
 
+# mmu.c: no SIMD (hv_tlb_refill runs with the guest's SIMD registers live).
+$(B)/mmu.o: core/mmu.c core/*.h host/*.h | $(B)
+	$(CC) $(CFLAGS) -mgeneral-regs-only -c $< -o $@
 $(B)/%.o: core/%.c core/*.h host/*.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(B)/%.o: host/%.c host/*.h core/*.h devices/*.h | $(B)
@@ -87,6 +90,9 @@ IOS_SRC = $(wildcard core/*.c) host/jit_region.c host/disk.c host/vm.c host/net_
           $(filter-out devices/pvg_mac.m,$(wildcard devices/*.c))
 IOS_OBJ = $(patsubst %.c,$(IB)/%.o,$(IOS_SRC)) $(IB)/host/enter.o
 
+$(IB)/core/mmu.o: core/mmu.c core/*.h host/*.h devices/*.h
+	@mkdir -p $(dir $@)
+	$(IOS_CC) $(IOS_CFLAGS) -mgeneral-regs-only -c $< -o $@
 $(IB)/%.o: %.c core/*.h host/*.h devices/*.h
 	@mkdir -p $(dir $@)
 	$(IOS_CC) $(IOS_CFLAGS) -c $< -o $@

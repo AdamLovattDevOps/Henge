@@ -71,7 +71,8 @@ typedef struct HvCpu {
     uint64_t lines_ptr;      /* 0x418: &pc_state->irq_line (irq, then fiq: one 8-byte load sees both) */
     uint64_t helper_thunk;   /* 0x420: hv_helper_thunk (blocks reach it through a register: it may be out of BL range) */
     uint64_t chain_thunk;    /* 0x428: hv_chain_thunk */
-    uint64_t pad2[2];
+    uint64_t refill_thunk;   /* 0x430: hv_refill_thunk */
+    uint64_t refill_ret;     /* 0x438: where it goes back to */
     uint64_t ijc_tab[16];    /* 0x440: each flags value's branch-cache table (ijc + flags * table size) */
     /* 0x4c0: [0] EL0 and unprivileged accesses, [1] EL1, [2] EL1 with PSTATE.PAN set,
        so toggling PAN (the kernel does it around every user copy) flushes nothing. */
@@ -166,6 +167,8 @@ typedef struct HvCpu {
 #define HV_CPU_LINES_PTR   0x418
 #define HV_CPU_HELPER_THUNK 0x420
 #define HV_CPU_CHAIN_THUNK 0x428
+#define HV_CPU_REFILL_THUNK 0x430
+#define HV_CPU_REFILL_RET  0x438
 #define HV_CPU_SPSEL       0x3fc
 #define HV_CPU_SP_EL1      0x398
 #define HV_CPU_IJC_TAB     0x440
@@ -205,6 +208,7 @@ _Static_assert(offsetof(HvCpu, host_sp) == HV_CPU_HOST_SP, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, lines_ptr) == HV_CPU_LINES_PTR, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, helper_thunk) == HV_CPU_HELPER_THUNK, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, chain_thunk) == HV_CPU_CHAIN_THUNK, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, refill_thunk) == HV_CPU_REFILL_THUNK, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, spsel) == HV_CPU_SPSEL, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, sp_el1) == HV_CPU_SP_EL1, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, ijc_tab) == HV_CPU_IJC_TAB, "HvCpu layout");

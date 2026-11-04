@@ -37,6 +37,8 @@ typedef struct {
     uint8_t recheck, addr, t, u, bytes;
     uint32_t tag_off;
     uint64_t site;      /* guest PC of the instruction that branches out of line */
+    uint32_t retry;     /* loads and stores: where their translation starts, to run again after a refill */
+    uint32_t rflags;    /* hv_tlb_refill's flags for it (0: no refill, straight to the helper) */
 } Ool;
 
 typedef struct {
@@ -79,6 +81,7 @@ static __thread Emit E; /* each CPU translates on its own thread, outside the tr
 #define SUB_X(d, n, m) (0xcb000000u | (m) << 16 | (n) << 5 | (d))
 #define ADD_EXT(d, n, m, opt, sh) (0x8b200000u | (m) << 16 | (opt) << 13 | (sh) << 10 | (n) << 5 | (d))
 #define CBNZ_X(t) (0xb5000000u | (t))
+#define CBZ_X(t) (0xb4000000u | (t))
 
 static void patch_branch(uint32_t *w, int64_t off);
 
@@ -219,6 +222,20 @@ static void put_branch_exit(Emit *e, uint64_t target) {
 /* Call hv_helper: guest x30 saved, a blr to hv_helper_thunk with the
    HvHelperInfo right after it (8-byte aligned), and x0 reloaded when it comes
    back. Seven or eight words; host x15 is clobbered. */
+static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op);
+
+/* A memory slow path whose thunk may refill the TLB and resume at `retry`:
+   the op word carries the refill flags (bits 18..8) and how far back retry is
+   from where the helper would resume (bits 31..19, in words). */
+static void put_helper_refill(Emit *e, uint64_t pc, uint32_t insn, uint32_t rflags, uint32_t retry) {
+    uint32_t start = e->n;
+    put_helper(e, pc, insn, HV_OP_MEM);
+    uint32_t resume = e->n - 1; /* the ldr x0, [x28] the helper comes back to */
+    uint32_t back = resume - retry;
+    if (back < (1u << 13) && rflags < (1u << 11)) e->w[resume - 1] = HV_OP_MEM | rflags << 8 | back << 19;
+    (void)start;
+}
+
 static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op) {
     put(e, STR_X(30, 28, HV_CPU_X(30)));
     put(e, LDR_X(15, 28, HV_CPU_HELPER_THUNK));
@@ -575,6 +592,7 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
     uint8_t s[3];
     for (int i = 0; i < 3; i++) s[i] = pick(&used);
     int A = s[0], T = s[1], U = s[2];
+    uint32_t retry = e->n; /* a refilled TLB miss runs the access again from here */
     spill(e, s, 3);
 
     /* Effective address into A, or used where it is: a guest base register with nothing added. */
@@ -632,10 +650,15 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
         put(e, UBFM_X(U, U, HV_TLB_PAGE_BITS, 63));
     }
     put(e, CBNZ_X(U));
+    /* Writeback forms change their base, and the retry recomputes it: those
+       (and RMW, exclusive and vector forms) go straight to the helper. */
+    int can_refill = !vec_kind && !rmw && op.mode != HV_ADDR_PRE && op.mode != HV_ADDR_POST && op.bytes <= 64 && !e->slow_mem;
+    /* hv_tlb_refill's flags: bit 9 set (so never 0), bit 0 write, bits 2..1 the table, 8..3 bytes - 1 */
+    uint32_t rflags = can_refill ? 1u << 9 | (uint32_t)(op.store ? 1 : 0) | (uint32_t)el_idx << 1 | (op.bytes - 1) << 3 : 0;
     put_ool(e, (Ool){.kind = OOL_SLOW, .pc = pc, .insn = insn, .nrestore = 3, .restore = {A, T, U},
                      .recheck = !(op.align && op.bytes > 1) && op.bytes <= HV_TLB_ADJ + 1, .addr = (uint8_t)addr,
                      .t = (uint8_t)T, .u = (uint8_t)U, .bytes = (uint8_t)op.bytes,
-                     .tag_off = tlb + (op.store ? 8 : 0)});
+                     .tag_off = tlb + (op.store ? 8 : 0), .retry = retry, .rflags = rflags});
     uint32_t slow = e->nool - 1;
     put(e, LDR_X(U, T, tlb + 24));
     /* Single loads and stores take [addr, addend] directly; the rest want the host address in A. */
@@ -1261,7 +1284,7 @@ static void emit_ool(Emit *e) {
     for (uint32_t i = 0; i < e->nool; i++) {
         Ool *o = &e->ool[i];
         patch_branch(&e->w[o->at], (int64_t)e->n - o->at);
-        if (0 && o->recheck) { /* dropped: 6 words per access for ~12K helper calls a second */
+        if (o->recheck) { /* the fast check refuses a page's last 15 bytes: check exactly, and go back if it fits */
             put(e, LDR_X(o->u, o->t, o->tag_off));
             put(e, SUB_X(o->u, o->addr, o->u));
             put_add_imm(e, o->u, o->u, (int64_t)o->bytes - 1 - HV_TLB_ADJ);
@@ -1269,6 +1292,17 @@ static void emit_ool(Emit *e) {
             put(e, CBNZ_X(o->u) | 2u << 5); /* cbnz u, +2: a real miss */
             put(e, B_OP);
             patch_branch(&e->w[e->n - 1], (int64_t)(o->at + 1) - (e->n - 1));
+        }
+        if (o->kind == OOL_SLOW && o->rflags) {
+            /* A TLB miss: hv_helper_thunk tries the light refill first (x7 = the
+               address; x7 is never a guest register) and, if it filled the TLB,
+               comes back to run the access again; else it is the usual helper. */
+            put(e, MOV_X(7, o->addr));
+            unspill(e, o->restore, o->nrestore);
+            put_helper_refill(e, o->pc, o->insn, o->rflags, o->retry);
+            put(e, B_OP);
+            patch_branch(&e->w[e->n - 1], (int64_t)o->join - (e->n - 1));
+            continue;
         }
         unspill(e, o->restore, o->nrestore);
         if (o->kind == OOL_EXIT) {

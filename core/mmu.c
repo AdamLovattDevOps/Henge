@@ -16,8 +16,25 @@ static int granule_bits(uint32_t tg, int ttbr1) {
     return tg == 2 ? 14 : tg == 1 ? 16 : 12;            /* TG0: 00 4K, 01 64K, 10 16K */
 }
 
+/* This file is built with -mgeneral-regs-only, and the walk and the TLB fill
+   call nothing in libc: hv_tlb_refill runs them from translated code without
+   saving the guest's SIMD registers, which libc's memory routines would use. */
+static HvRam *ram_of(HvMachine *m, uint64_t pa) {
+    for (int i = 0; i < m->nram; i++)
+        if (pa - m->ram[i].pa < m->ram[i].size) return &m->ram[i];
+    return NULL;
+}
+
+/* A descriptor: RAM, 8 bytes, aligned. Device memory as a page table is not supported. */
+static int read_desc(HvMachine *m, uint64_t pa, uint64_t *out) {
+    HvRam *r = ram_of(m, pa);
+    if (!r || pa + 8 - r->pa > r->size) return -1;
+    *out = __atomic_load_n((const uint64_t *)(const void *)(r->host + (pa - r->pa)), __ATOMIC_RELAXED);
+    return 0;
+}
+
 void hv_mmu_walk(HvCpu *cpu, uint64_t va, HvAccess acc, int el, HvWalk *out) {
-    memset(out, 0, sizeof *out);
+    *out = (HvWalk){0};
     uint64_t sctlr = cpu->sctlr_el1;
     if (!(sctlr & 1)) {
         /* MMU off: flat, everything allowed. Data is Device-nGnRnE, fetches Normal. */
@@ -60,7 +77,7 @@ void hv_mmu_walk(HvCpu *cpu, uint64_t va, HvAccess acc, int el, HvWalk *out) {
         int idx_bits = level == 4 - levels ? inputsize - shift : stride;
         uint64_t idx = (va >> shift) & ((1ull << idx_bits) - 1);
         uint64_t desc;
-        if (hv_phys_read(cpu->m, base + idx * 8, &desc, 8) != 0) {
+        if (read_desc(cpu->m, base + idx * 8, &desc) != 0) {
             out->fsc = 0x14 + level; /* synchronous external abort on a table walk */
             out->s1ptw = 1;
             return;
@@ -374,7 +391,7 @@ void hv_tlb_flush_va(HvCpu *cpu, uint64_t va) {
 
 static void tlb_fill(HvCpu *cpu, uint64_t va, int el, const HvWalk *w) {
     if (w->block_size < (1ull << HV_TLB_PAGE_BITS)) return; /* smaller guest pages: slow path only */
-    HvRam *ram = hv_ram_lookup(cpu->m, w->pa);
+    HvRam *ram = ram_of(cpu->m, w->pa);
     if (!ram) return;
     uint64_t page_pa = w->pa & ~PAGE_MASK;
     if (page_pa < ram->pa || page_pa + PAGE_MASK + 1 - ram->pa > ram->size) return;
@@ -489,4 +506,28 @@ const uint32_t *hv_mmu_fetch(HvCpu *cpu, uint64_t va, uint64_t *pa, uint32_t *av
     *pa = w.pa;
     *avail = (uint32_t)(left / 4);
     return p;
+}
+
+/* A TLB miss in translated code, before the full helper: walk and fill, and
+   say whether the fast path will now succeed (0) or the helper must do the
+   access (a fault, device memory, a write to a code page, an unusual spot in
+   the page). Called by hv_helper_thunk with the guest's SIMD registers live,
+   so nothing here may use them (see read_desc). flags: bit 0 write, bits 2..1
+   the TLB table (0 EL0 or unprivileged, 1 EL1, 2 EL1 with PAN), bits 8..3 bytes - 1. */
+int hv_tlb_refill(HvCpu *cpu, uint64_t va, uint32_t flags) {
+    int write = flags & 1, table = (flags >> 1) & 3;
+    uint32_t bytes = ((flags >> 3) & 63) + 1;
+    int el = table ? 1 : 0;
+    uint64_t off = va & PAGE_MASK;
+    if (off + bytes > PAGE_MASK + 1) return 1; /* crosses into the next page: the helper */
+    HvWalk w;
+    walk_begin(cpu);
+    hv_mmu_walk(cpu, va, write ? HV_ACC_WRITE : HV_ACC_READ, el, &w);
+    if (!w.fsc) tlb_fill(cpu, va, el, &w);
+    walk_end(cpu);
+    if (w.fsc) return 1;
+    HvTlbEntry *e = &cpu->tlb[table][(va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1)];
+    uint64_t tag = write ? e->write_tag : e->read_tag;
+    if (cpu->m->stats_interval) cpu->m->stats.refills++;
+    return tag != HV_TLB_INVALID && tag + HV_TLB_ADJ == (va & ~(uint64_t)PAGE_MASK) ? 0 : 1;
 }

@@ -150,7 +150,10 @@ flush:
 /* Blocks call this through hv_helper_entry. Returns 1 to leave the block. */
 static uint64_t reg_hist[65536]; /* --stats: MRS/MSR/SYS by op0:op1:CRn:CRm:op2; reads low, writes high 32 bits */
 
-uint32_t hv_helper(HvCpu *cpu, const HvHelperInfo *info) {
+uint32_t hv_helper(HvCpu *cpu, const HvHelperInfo *info_in) {
+    HvHelperInfo info_copy = *info_in;
+    info_copy.op &= 0xff; /* the rest: hv_helper_thunk's refill flags */
+    const HvHelperInfo *info = &info_copy;
     if (info->op < 12) cpu->m->stats.helper[info->op]++;
     if (cpu->m->stats_interval && (info->op == HV_OP_MRS || info->op == HV_OP_MSR || info->op == HV_OP_SYS))
         reg_hist[(info->insn >> 5) & 0xffff] += info->op == HV_OP_MRS ? 1 : 1ull << 32;
@@ -416,6 +419,7 @@ static void print_stats(HvCpu *cpu, int force) {
         fprintf(stderr, "  new code pages %.0f/s; waits: tlbi acks %.0f/s %.1f%%, device lock %.0f/s %.1f%%, translation lock %.0f/s %.1f%% (of one CPU)\n",
                 RATE(code_protects), RATE(syncs), RATE(sync_ticks) / 240000.0, RATE(dev_waits), RATE(dev_wait_ticks) / 240000.0,
                 RATE(tr_waits), RATE(tr_wait_ticks) / 240000.0);
+        fprintf(stderr, "  light refills %.0fK/s\n", RATE(refills) / 1e3);
         fprintf(stderr, "  tlb misses K/s: el0 empty %.0f el0 conflict %.0f el1 empty %.0f el1 conflict %.0f\n",
                 RATE(tlb_miss_kind[0]) / 1e3, RATE(tlb_miss_kind[1]) / 1e3, RATE(tlb_miss_kind[2]) / 1e3, RATE(tlb_miss_kind[3]) / 1e3);
         fprintf(stderr, "  slow mem causes K/s: mmio %.0f code-page write %.0f page end %.0f tlb miss %.0f other %.0f entry-but-tag %.0f\n",
