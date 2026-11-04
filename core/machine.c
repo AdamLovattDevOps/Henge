@@ -211,7 +211,11 @@ int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int
     r->host = host;
     r->readonly = readonly;
     size_t pages = (size + (1u << HV_TLB_PAGE_BITS) - 1) >> HV_TLB_PAGE_BITS;
-    r->code_pages = calloc(pages, 1);
+    r->pages_log2 = 0;
+    while ((1ull << r->pages_log2) < pages) r->pages_log2++;
+    /* A power of two, so translated code bounds-checks a page index with one shift (IC IVAU). */
+    r->code_pages = calloc((size_t)1 << r->pages_log2, 1);
+    if (!m->main_ram || size > m->main_ram->size) m->main_ram = r;
     r->page_gen = calloc(pages, sizeof *r->page_gen);
     r->whint = calloc(pages * HV_MAX_CPUS, sizeof *r->whint);
     return r->code_pages && r->page_gen && r->whint ? 0 : -1;

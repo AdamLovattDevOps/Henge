@@ -13,7 +13,8 @@ typedef struct HvRam {
     uint64_t pa, size;
     uint8_t *host;
     int readonly;
-    uint8_t *code_pages; /* one byte per 16 KB page: a translated block came from here */
+    uint8_t *code_pages; /* one byte per 16 KB page: a translated block came from here (2^pages_log2 of them) */
+    uint32_t pages_log2;
     uint32_t *page_gen;  /* per page: bumped to invalidate the blocks translated from it */
     /* Per page and CPU: the TLB slot (table << HV_TLB_BITS | index, plus 1) that
        last mapped the page writable, or HV_WHINT_MANY when it has had more than
@@ -132,6 +133,7 @@ typedef struct HvPerCpu {
 typedef struct HvMachine {
     HvRam ram[HV_MAX_RAM];
     int nram;
+    HvRam *main_ram;     /* the largest region: guest RAM */
     HvMmio mmio[HV_MAX_MMIO];
     int nmmio;
 

@@ -743,6 +743,48 @@ static int host_zva_is_64(void) {
     return known;
 }
 
+/* IC IVAU at EL1 (xnu: 100K+ a second), without the helper when the page holds
+   no translated code: look the address up like a load, find its host page, and
+   check the main RAM's code-page flags. A TLB miss, another RAM region or a
+   code page take the helper, which invalidates. */
+static void translate_ic_ivau(Emit *e, uint32_t insn, uint64_t pc) {
+    HvRam *ram = e->m->main_ram;
+    int rt = insn & 0x1f;
+    uint32_t used = 1u << rt;
+    uint8_t s[3];
+    for (int i = 0; i < 3; i++) s[i] = pick(&used);
+    int A = s[0], T = s[1], U = s[2];
+    spill(e, s, 3);
+    if (is_stolen(rt)) put(e, LDR_X(A, 28, slot_of(rt)));
+    else put(e, MOV_X(A, rt)); /* rt 31 is XZR here */
+    int el_idx = (e->flags & HV_BLOCK_PAN) ? 2 : 1;
+    put(e, UBFM_X(T, A, HV_TLB_PAGE_BITS, HV_TLB_PAGE_BITS + HV_TLB_BITS - 1));
+    put(e, ADD_LSL(T, 28, T, 5));
+    put(e, 0x91400000u | (uint32_t)((el_idx * HV_CPU_TLB_EL) >> 12) << 10 | T << 5 | T);
+    put(e, LDR_X(U, T, HV_CPU_TLB + 0)); /* read tag */
+    put(e, SUB_X(U, A, U));
+    put(e, UBFM_X(U, U, HV_TLB_PAGE_BITS, 63));
+    put(e, CBNZ_X(U));
+    put_ool(e, (Ool){.kind = OOL_SYS, .pc = pc, .insn = insn, .nrestore = 3, .restore = {A, T, U}});
+    uint32_t o1 = e->nool - 1;
+    put(e, LDR_X(U, T, HV_CPU_TLB + 24));
+    put(e, ADD_LSL(A, A, U, 0));                                   /* host address */
+    put_lit(e, U, (uint64_t)(uintptr_t)ram->host);
+    put(e, SUB_X(A, A, U));
+    put(e, UBFM_X(A, A, HV_TLB_PAGE_BITS, 63));                    /* page index in the main RAM */
+    put(e, UBFM_X(U, A, ram->pages_log2, 63));
+    put(e, CBNZ_X(U));                                             /* not in it */
+    put_ool(e, (Ool){.kind = OOL_SYS, .pc = pc, .insn = insn, .nrestore = 3, .restore = {A, T, U}});
+    uint32_t o2 = e->nool - 1;
+    put_lit(e, U, (uint64_t)(uintptr_t)ram->code_pages);
+    put(e, 0x38606800u | (uint32_t)A << 16 | (uint32_t)U << 5 | (uint32_t)U); /* ldrb wU, [xU, xA] */
+    put(e, CBNZ_X(U) & ~(1u << 31));                               /* cbnz wU: code there */
+    put_ool(e, (Ool){.kind = OOL_SYS, .pc = pc, .insn = insn, .nrestore = 3, .restore = {A, T, U}});
+    uint32_t o3 = e->nool - 1;
+    unspill(e, s, 3);
+    e->ool[o1].join = e->ool[o2].join = e->ool[o3].join = e->n;
+}
+
 static void translate_dc_zva(Emit *e, uint32_t insn, uint64_t pc) {
     int rt = insn & 0x1f;
     uint32_t used = 1u << rt;
@@ -881,6 +923,32 @@ static int translate_msr_inline(Emit *e, uint32_t insn, uint64_t pc) {
             put_ool(e, (Ool){.kind = OOL_EXIT, .pc = pc + 4});
         }
         return 1;
+    }
+    if (!imm_form && reg == (3u << 14 | 0u << 11 | 4u << 7 | 2u << 3 | 0u)) { /* MSR SPSel, Xt: bit 0 picks, at run time */
+        int rt = insn & 0x1f;
+        uint32_t flags = e->flags, to_set = 0;
+        if (rt != 31) {
+            if (is_stolen(rt)) put(e, LDR_X(7, 28, slot_of(rt)));
+            else put(e, MOV_X(7, rt));
+            to_set = e->n;
+            put(e, 0x37000007u);                                                     /* tbnz x7, #0, set (patched) */
+        }
+        for (uint32_t on = 0; on < (rt == 31 ? 1u : 2u); on++) {
+            if (on) patch_branch(&e->w[to_set], (int64_t)e->n - to_set);
+            if (!!(flags & HV_BLOCK_SPX) != on) {
+                put(e, ADD_SP_TO(6));
+                put(e, STR_X(6, 28, on ? HV_CPU_SP_EL0 : HV_CPU_SP_EL1));
+                put(e, LDR_X(6, 28, on ? HV_CPU_SP_EL1 : HV_CPU_SP_EL0));
+                put(e, 0x910000dfu);                                                 /* mov sp, x6 */
+                put(e, on ? 0x52800026u : 0x52800006u);
+                put(e, 0xb9000000u | (HV_CPU_SPSEL / 4) << 10 | 28 << 5 | 6);
+            }
+            put_lit(e, 15, pc + 4);
+            e->flags = on ? flags | HV_BLOCK_SPX : flags & ~HV_BLOCK_SPX;
+            put_ijc_jump(e);
+            e->flags = flags;
+        }
+        return 2;
     }
     if (imm_form && (field == 005 || field == 004)) { /* SPSel, PAN */
         uint32_t flags = e->flags, bit = field == 005 ? HV_BLOCK_SPX : HV_BLOCK_PAN, on = imm & 1;
@@ -1132,6 +1200,10 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
         if (crn == 7 && crm != 1 && crm != 5 && !dc_zva && !at) return 0;
         if (dc_zva && !e->slow_mem && host_zva_is_64()) {
             translate_dc_zva(e, insn, pc);
+            return 0;
+        }
+        if (crn == 7 && op1 == 3 && crm == 5 && op2 == 1 && (e->flags & HV_BLOCK_EL1) && !e->slow_mem && e->m->main_ram) {
+            translate_ic_ivau(e, insn, pc);
             return 0;
         }
         put_helper(e, pc, insn, HV_OP_SYS);
