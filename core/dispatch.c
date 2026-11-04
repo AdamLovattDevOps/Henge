@@ -173,6 +173,49 @@ flush:
     return NULL;
 }
 
+/* WFE. xnu's spin loops arm the exclusive monitor on the lock word (LDAXR)
+   and wait for it to change; leaving for the dispatcher every time made a
+   waiting CPU spin through it (a hundred thousand times a second). Wait here
+   instead: the host core sleeps in its own WFE on the host copy of the word,
+   which wakes when another core writes it (or at the event stream, about every
+   microsecond). A request for this CPU (an interrupt, a TLBI) ends the wait, and
+   so does a short timeout, so its timer and devices are seen to. Without a
+   monitor to watch it leaves at once, as before. HV_WFE_SPIN: always that. */
+static uint32_t wfe(HvCpu *cpu) {
+    static int spin = -1;
+    if (spin < 0) spin = getenv("HV_WFE_SPIN") != NULL;
+    uint64_t va = cpu->excl_addr;
+    uint32_t size = cpu->excl_size;
+    const HvTlbEntry *e = &cpu->tlb[(va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1)][hv_tlb_table(cpu, cpu->el)];
+    uint64_t page = va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
+    if (spin || va == ~0ull || (size != 1 && size != 2 && size != 4 && size != 8) || (va & (size - 1)) ||
+        e->read_tag == HV_TLB_INVALID || e->read_tag + HV_TLB_ADJ != page) {
+        __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED); /* let another CPU run: the dispatcher's way */
+        return 0;
+    }
+    const void *host = (const void *)(uintptr_t)(va + (uint64_t)e->addend);
+    uint64_t want = cpu->excl_val[0] & (size == 8 ? ~0ull : (1ull << (8 * size)) - 1);
+    uint64_t deadline = mach_absolute_time() + 24 * 50; /* 50 us at 24 MHz */
+    cpu->m->stats.wfe_waits++;
+    for (;;) {
+        uint64_t v;
+        switch (size) { /* LDAXR arms the host monitor too, so the WFE below wakes on a write */
+        case 1: { uint32_t w; __asm__ volatile("ldaxrb %w0, [%1]" : "=r"(w) : "r"(host) : "memory"); v = w; break; }
+        case 2: { uint32_t w; __asm__ volatile("ldaxrh %w0, [%1]" : "=r"(w) : "r"(host) : "memory"); v = w; break; }
+        case 4: { uint32_t w; __asm__ volatile("ldaxr %w0, [%1]" : "=r"(w) : "r"(host) : "memory"); v = w; break; }
+        default: __asm__ volatile("ldaxr %0, [%1]" : "=r"(v) : "r"(host) : "memory"); break;
+        }
+        if (v != want || __atomic_load_n(&cpu->exit_req, __ATOMIC_RELAXED)) break;
+        if (mach_absolute_time() >= deadline) {
+            __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED);
+            break;
+        }
+        __asm__ volatile("wfe" ::: "memory");
+    }
+    __asm__ volatile("clrex" ::: "memory");
+    return 0;
+}
+
 /* Blocks call this through hv_helper_entry. Returns 1 to leave the block. */
 static uint64_t reg_hist[65536]; /* --stats: MRS/MSR/SYS by op0:op1:CRn:CRm:op2; reads low, writes high 32 bits */
 
@@ -212,6 +255,8 @@ uint32_t hv_helper(HvCpu *cpu, const HvHelperInfo *info_in) {
         cpu->pc = info->pc + 4;
         cpu->exit_reason = HV_EXIT_WFI;
         return 1;
+    case HV_OP_WFE:
+        return wfe(cpu);
     case HV_OP_UNDEF:
     default:
         hv_raise_undef(cpu, info->pc);
@@ -466,6 +511,7 @@ static void print_stats(HvCpu *cpu, int force) {
                 fprintf(stderr, "\n");
             }
         }
+        fprintf(stderr, "  WFE waits in place %.0f/s\n", RATE(wfe_waits));
         fprintf(stderr, "  exit requests/s: TLBI posts %.0f, wakes %.0f (of them device work %.0f), kick all %.0f, own %.0f\n",
                 RATE(kick_src[0]), RATE(kick_src[1]), RATE(kick_src[3]), RATE(kick_src[2]), RATE(kick_src[4]));
         fprintf(stderr, "  light refills %.0fK/s, light branch-cache fills %.0fK/s, chained to other pages %.0f/s\n", RATE(refills) / 1e3,

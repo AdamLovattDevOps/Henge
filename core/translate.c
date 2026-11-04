@@ -1444,9 +1444,11 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
     }
     case HV_INSN_WAIT:
         if (((insn >> 5) & 7) == 3 || ((insn >> 12) & 0xf) == 1) put_helper(e, pc, insn, HV_OP_WFI); /* WFI, WFIT, WFET */
-        else { /* WFE: waiting for another CPU, so ask the dispatcher to let one run */
-            put(e, 0x52800026u);                                             /* movz w6, #1 */
-            put(e, 0xb9000000u | (HV_CPU_EXIT_REQ / 4) << 10 | 28 << 5 | 6); /* str w6, [x28, #exit_req] */
+        else { /* WFE: waiting for another CPU; the helper waits for the monitored word, then the block goes on */
+            put_helper(e, pc, insn, HV_OP_WFE);
+            if (e->no_ijc) put_exit(e, pc + 4);
+            else put_branch_exit(e, pc + 4, 0); /* checks exit_req: the wait may have ended for a request */
+            return 1;
         }
         put_exit(e, pc + 4);
         return 1;

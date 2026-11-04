@@ -23,6 +23,7 @@ enum {
     HV_OP_FPTRAP,      /* FP/SIMD while CPACR_EL1.FPEN traps it */
     HV_OP_CLREX,
     HV_OP_WFI,
+    HV_OP_WFE,         /* waits for the exclusive monitor's word to change (or a request); the block carries on */
 };
 
 #define HV_MAX_BLOCK_INSNS 128
