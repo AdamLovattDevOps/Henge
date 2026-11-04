@@ -311,12 +311,35 @@ static void trace_data(int write, uint64_t off, uint64_t v) {
             }
         }
     }
-    if (write && off == 0x1008 && fifo_pa && fifo_size) {
-        uint32_t from = fifo_wp, to = (uint32_t)v;
-        for (uint32_t i = from; i != to && i - from < fifo_size; ) {
-            uint32_t at = i % fifo_size, n = to - i < fifo_size - at ? to - i : fifo_size - at;
-            uint8_t *p = hv_phys_ptr(board->m, fifo_pa + at, n);
-            if (p) dump_hex("fifo", fifo_pa + at, p, n);
+    if (write && off == 0x1020 && fifo_pa) { /* a channel doorbell: its ring's new commands */
+        static uint32_t seen[16];
+        uint32_t ch = (uint32_t)v & 15;
+        uint8_t *rec = hv_phys_ptr(board->m, fifo_pa + 0x400 + 0x14 * (ch - 1), 0x14);
+        if (rec && ch) {
+            uint32_t wr, page;
+            memcpy(&wr, rec, 4), memcpy(&page, rec + 16, 4);
+            uint32_t *tbl = hv_phys_ptr(board->m, (uint64_t)page << 14, 0x4000);
+            uint32_t pages = 0;
+            while (tbl && pages < 4096 && tbl[pages]) pages++;
+            fprintf(stderr, "pvgdata ch %u wr %x table %x (%u pages)\n", ch, wr, page, pages);
+            for (uint32_t o = seen[ch], left = wr - seen[ch] > 512 ? 512 : wr - seen[ch]; pages && left;) {
+                uint32_t at = o % (pages << 14), n = 0x4000 - (at & 0x3fff);
+                if (n > left) n = left;
+                uint64_t pa = ((uint64_t)tbl[at >> 14] << 14) + (at & 0x3fff);
+                uint8_t *q = hv_phys_ptr(board->m, pa, n);
+                if (q) dump_hex("chan", pa, q, n);
+                o += n, left -= n;
+            }
+            seen[ch] = wr;
+        }
+    }
+    if (write && off == 0x1008 && shared_pa && fifo_size > 0x4000) {
+        /* The ring is the 64 KB buffer past its 16 KB control area (+1010 = 0x4000). */
+        uint32_t ring = fifo_size - 0x4000, from = fifo_wp, to = (uint32_t)v;
+        for (uint32_t i = from; i != to && i - from < ring; ) {
+            uint32_t at = i % ring, n = to - i < ring - at ? to - i : ring - at;
+            uint8_t *p = hv_phys_ptr(board->m, shared_pa + 0x4000 + at, n);
+            if (p) dump_hex("fifo", shared_pa + 0x4000 + at, p, n);
             i += n;
         }
         fifo_wp = to;
@@ -331,6 +354,17 @@ static void trace_data(int write, uint64_t off, uint64_t v) {
                 fprintf(stderr, "pvgdata shared +%04x = %08x\n", i, nv);
             }
         memcpy(shared_prev, p, sizeof shared_prev);
+        static uint8_t root_prev[0x4000];
+        uint8_t *r = fifo_pa ? hv_phys_ptr(board->m, fifo_pa, sizeof root_prev) : NULL;
+        if (r) {
+            for (uint32_t i = 0; i < sizeof root_prev; i += 4)
+                if (memcmp(r + i, root_prev + i, 4)) {
+                    uint32_t nv;
+                    memcpy(&nv, r + i, 4);
+                    fprintf(stderr, "pvgdata root +%04x = %08x\n", i, nv);
+                }
+            memcpy(root_prev, r, sizeof root_prev);
+        }
     }
 }
 

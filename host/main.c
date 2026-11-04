@@ -228,6 +228,14 @@ int main(int argc, char **argv) {
             window = 1;
             continue;
         }
+        if (!strcmp(argv[i], "--phone")) {
+            /* Test iOS's setup on the Mac: no graphics framework, split JIT mapping. */
+            use_pvg = 0;
+            setenv("HV_JIT_SPLIT", "1", 1);
+            memmove(&argv[i], &argv[i + 1], (size_t)(argc - i - 1) * sizeof *argv);
+            argc--, i--;
+            continue;
+        }
         if (!strcmp(argv[i], "--no-pvg")) {
             use_pvg = 0;
             continue;

@@ -29,7 +29,7 @@
 #define VMAPPLE_GPIO       0x20060000ull
 #define VMAPPLE_PVPANIC    0x20070000ull
 #define VMAPPLE_BDOOR      0x30000000ull
-#define VMAPPLE_GFX        0x30200000ull /* paravirtualized graphics: present but inert */
+#define VMAPPLE_GFX        0x30200000ull /* paravirtualized graphics */
 #define VMAPPLE_IOSFC      0x30210000ull
 #define VMAPPLE_AES_1      0x30220000ull
 #define VMAPPLE_AES_2      0x30230000ull
@@ -59,6 +59,7 @@ typedef struct HvVmapple {
     HvPcie *pcie;
     HvBdif *bdif;
     HvAes *aes;
+    struct HvPvgLite *pvg;   /* our own graphics device (the Mac replaces it with the framework) */
     HvVirtioBlk *aux_blk, *root_blk;
     HvVirtioNet *net;
     HvVirtioSnd *snd;
