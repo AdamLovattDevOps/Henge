@@ -703,12 +703,12 @@ static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
     uint32_t gen = __atomic_load_n(&ram->page_gen[(pa - ram->pa) >> HV_TLB_PAGE_BITS], __ATOMIC_ACQUIRE);
     /* This CPU's small cache in front of the block hash first (as the dispatcher's lookup). */
     uint32_t j = (uint32_t)((va >> 2) ^ (va >> 18) ^ ((uint64_t)flags << 13)) & ((1u << HV_JC_BITS) - 1);
-    HvBlock *b = pcs->jc[j];
-    if (!(b && b->va == va && b->pa == pa && b->flags == flags && b->gen == gen)) {
+    HvBlock *b = pcs->jc[j].va == va ? pcs->jc[j].b : NULL;
+    if (!(b && b->pa == pa && b->flags == flags && b->gen == gen)) {
         b = hv_block_find(m, hv_block_hash(va, pa, flags), va, pa, flags, gen);
         if (!b) FAIL(3);
 #undef FAIL
-        pcs->jc[j] = b;
+        pcs->jc[j].va = va, pcs->jc[j].b = b;
     }
     if (m->stats_interval) { /* what the fill replaces, as the dispatcher counts it */
         uint64_t *t = pcs->ijc + (size_t)(b->flags & (HV_IJC_TABLES - 1)) * (HV_IJC_TABLE_BYTES / 8);
@@ -721,6 +721,7 @@ static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
         }
         m->stats.light_kind[k]++;
         m->stats.ijc_light++;
+        if (!kernel) m->stats.light_region[(va - 0x180000000ull) < 0x100000000ull ? 0 : 1]++;
     }
     /* Cached only while the TLB still maps it, inside ijc_seq (see hv_ijc_fill_checked). */
     if (!hv_ijc_fill_checked(cpu, b)) return 0;

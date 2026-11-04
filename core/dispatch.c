@@ -90,15 +90,18 @@ static void block_dump(const HvBlock *b, const uint32_t *code) {
 static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, const uint32_t *code, uint32_t avail) {
     HvMachine *m = cpu->m;
     uint32_t j = (uint32_t)((va >> 2) ^ (va >> 18) ^ ((uint64_t)flags << 13)) & ((1u << HV_JC_BITS) - 1);
-    HvBlock **jc = cpu->pc_state->jc;
-    HvBlock *c = jc[j];
-    if (c && c->va == va && c->pa == pa && c->flags == flags && c->ram->page_gen[c->pg] == c->gen) return c;
+    __typeof__(cpu->pc_state->jc[0]) *jc = cpu->pc_state->jc;
+    HvBlock *c = jc[j].va == va ? jc[j].b : NULL;
+    if (c && c->pa == pa && c->flags == flags && c->ram->page_gen[c->pg] == c->gen) return c;
     uint32_t h = hash_of(va, pa, flags);
     HvRam *ram = hv_ram_lookup(m, pa);
     uint64_t pg = (pa - ram->pa) >> HV_TLB_PAGE_BITS;
     uint32_t gen = __atomic_load_n(&ram->page_gen[pg], __ATOMIC_ACQUIRE);
     HvBlock *b = find(m, h, va, pa, flags, gen);
-    if (b) return jc[j] = b;
+    if (b) {
+        jc[j].va = va, jc[j].b = b;
+        return b;
+    }
 
     if (m->flush_pending) goto flush_unlocked;
     /* Writes to this page must take the slow path from now on so we notice them:
@@ -140,7 +143,8 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
     b = find(m, h, va, pa, flags, gen); /* another CPU may have just made it: ours is dropped (its space stays used until a flush) */
     if (b) {
         pthread_mutex_unlock(&m->tr_mu);
-        return jc[j] = b;
+        jc[j].va = va, jc[j].b = b;
+        return b;
     }
     if ((uint32_t)m->nblocks >= m->max_blocks || m->flush_pending) {
         m->stats.flush_full++;
@@ -511,6 +515,7 @@ static void print_stats(HvCpu *cpu, int force) {
                 fprintf(stderr, "\n");
             }
         }
+        fprintf(stderr, "  user light fills: shared region %.0fK/s, elsewhere %.0fK/s\n", RATE(light_region[0]) / 1e3, RATE(light_region[1]) / 1e3);
         fprintf(stderr, "  WFE waits in place %.0f/s; exits chained as placed %.0f/s\n", RATE(wfe_waits), RATE(chained_early));
         fprintf(stderr, "  exit requests/s: TLBI posts %.0f, wakes %.0f (of them device work %.0f), kick all %.0f, own %.0f\n",
                 RATE(kick_src[0]), RATE(kick_src[1]), RATE(kick_src[3]), RATE(kick_src[2]), RATE(kick_src[4]));

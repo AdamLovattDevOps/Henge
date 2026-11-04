@@ -76,6 +76,7 @@ typedef struct HvStats {
     uint64_t light_kind[4];
     uint64_t light_fail[4];
     uint64_t light_walks;
+    uint64_t light_region[2]; /* user light fills: in the shared region (0x18..0x28 << 28), elsewhere */
     uint64_t chained_early;   /* exits chained as their block was placed */
     uint64_t wfe_waits;       /* WFEs that waited on the monitored word in place */
     uint64_t kind_insns[16], kind_words[16]; /* --stats: inline words by instruction kind (HvInsnKind), as translated */
@@ -143,7 +144,9 @@ typedef struct HvPerCpu {
        targets, so a TLBI for a big range elsewhere (data, nearly always) drops nothing. */
     uint64_t (*cid_chunks)[4];
     uint64_t last_fill[2];   /* page ^ salt of the last fill in each half: its filter bits are set already */
-    struct HvBlock *jc[1 << HV_JC_BITS]; /* direct-mapped cache in front of the hash */
+    /* Direct-mapped cache in front of the hash, with the VA beside the block so
+       a slot holding another block is passed over without reading it. */
+    struct { uint64_t va; struct HvBlock *b; } jc[1 << HV_JC_BITS];
     /* WFI sleeps on this; device threads, the GIC and other CPUs signal it. */
     pthread_mutex_t wake_mu;
     pthread_cond_t wake_cv;
