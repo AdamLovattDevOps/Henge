@@ -79,11 +79,12 @@ void hv_jit_finish(HvJitRegion *region, uint32_t *start, size_t words) {
     if (start && words) sys_icache_invalidate(start, words * sizeof(uint32_t));
 }
 
+/* Any thread: an even number of words (blocks stay 8-byte aligned), taken atomically. */
 uint32_t *hv_jit_reserve(HvJitRegion *region, size_t words) {
-    if (region->used + words > region->capacity) return NULL;
-    uint32_t *p = region->base + region->used;
-    region->used += words;
-    return p;
+    words = (words + 1) & ~(size_t)1;
+    size_t at = __atomic_fetch_add(&region->used, words, __ATOMIC_RELAXED);
+    if (at + words > region->capacity) return NULL; /* full: the flush resets used */
+    return region->base + at;
 }
 
 void hv_jit_reset(HvJitRegion *region) {

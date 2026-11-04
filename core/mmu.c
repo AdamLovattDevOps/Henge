@@ -366,7 +366,11 @@ void hv_ijc_drop_range(HvCpu *cpu, uint64_t va, uint64_t len, int asid) {
     uint32_t cid = (uint32_t)(salt >> 48);
     if (!cid) return; /* nothing cached for it */
     uint64_t first = va >> HV_TLB_PAGE_BITS, last = (va + len - 1) >> HV_TLB_PAGE_BITS;
-    if (last - first < 4096) {
+    if (last - first >= 4096) { /* scanning the whole set costs more than the cold start: drop the address space */
+        hv_ijc_drop_asid(cpu, (uint16_t)asid);
+        return;
+    }
+    {
         for (uint64_t p = first; p <= last; p++)
             if (ucode_has(cpu->pc_state, cid, p << HV_TLB_PAGE_BITS)) {
                 m->stats.reset_why[2]++;

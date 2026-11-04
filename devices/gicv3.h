@@ -40,6 +40,7 @@ typedef struct HvGic {
     uint8_t priority[HV_GIC_NUM_IRQS];
     uint8_t edge[HV_GIC_NUM_IRQS];   /* ICFGR: 1 = edge-triggered */
     uint64_t route[HV_GIC_NUM_IRQS];
+    uint64_t spi_on[(HV_GIC_NUM_IRQS + 63) / 64]; /* SPIs that may be enabled (a superset: hppi checks each) */
     HvGicCpu cpu[HV_MAX_CPUS];
 } HvGic;
 

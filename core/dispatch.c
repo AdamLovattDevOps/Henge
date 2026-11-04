@@ -82,7 +82,14 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
         m->stats.translate_ticks += mach_absolute_time() - t0;
         m->stats.translated_insns += nb.ninsns;
     }
-    /* ...then take it only to place and publish the block. */
+    /* ...and place it in the region (space is reserved atomically, so no lock either)... */
+    size_t used0 = m->jit.used;
+    if (hv_translate_place(m, &nb) != 0) { /* JIT region full: start over */
+        pthread_mutex_lock(&m->tr_mu);
+        m->stats.flush_full++;
+        goto flush;
+    }
+    /* ...then take the lock only to publish it. */
     if (pthread_mutex_trylock(&m->tr_mu) != 0) {
         uint64_t w0 = m->stats_interval ? mach_absolute_time() : 0;
         pthread_mutex_lock(&m->tr_mu);
@@ -101,11 +108,6 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
         goto flush;
     }
     b = &m->blocks[m->nblocks];
-    size_t used0 = m->jit.used;
-    if (hv_translate_place(m, &nb) != 0) { /* JIT region full: start over */
-        m->stats.flush_full++;
-        goto flush;
-    }
     *b = nb;
     m->stats.translations++;
     if (m->stats_interval) {

@@ -48,15 +48,27 @@ static int target_of(HvGic *g, int i) {
 /* CPU c's highest-priority pending interrupt; with `masked`, only one PMR and the running priority let through. */
 static int hppi(HvGic *g, int c, int masked) {
     int best = SPURIOUS, best_prio = 0x100;
-    for (int i = 0; i < HV_GIC_NUM_IRQS; i++) {
+    /* SGIs and PPIs, then only the SPIs that are enabled: there are 256 of them and a few are in use. */
+    for (int i = 0; i < 32; i++) {
         if (!F(g, c, enabled, i) || F(g, c, active, i) || !pending(g, c, i)) continue;
-        if (i >= 32 && target_of(g, i) != c) continue;
         if (!group_enabled(g, c, F(g, c, group, i))) continue;
         if (F(g, c, priority, i) < best_prio) {
             best = i;
             best_prio = F(g, c, priority, i);
         }
     }
+    for (int w = 0; w < (HV_GIC_NUM_IRQS + 63) / 64; w++)
+        for (uint64_t bits = g->spi_on[w]; bits; bits &= bits - 1) {
+            int i = w * 64 + __builtin_ctzll(bits);
+            if (i < 32 || i >= HV_GIC_NUM_IRQS) continue;
+            if (!g->enabled[i] || g->active[i] || !pending(g, c, i)) continue;
+            if (target_of(g, i) != c) continue;
+            if (!group_enabled(g, c, g->group[i])) continue;
+            if (g->priority[i] < best_prio) {
+                best = i;
+                best_prio = g->priority[i];
+            }
+        }
     if (best == SPURIOUS) return SPURIOUS;
     if (masked && (best_prio >= (int)(g->cpu[c].pmr & 0xff) || best_prio >= running_priority(g, c))) return SPURIOUS;
     return best;
@@ -247,8 +259,18 @@ static void bank_write(HvGic *g, int c, uint32_t off, uint32_t v, uint32_t mask,
         int bit = (v >> b) & 1;
         switch (reg) {
         case 0x080: F(g, c, group, i) = (uint8_t)bit; break;
-        case 0x100: if (bit) F(g, c, enabled, i) = 1; break;
-        case 0x180: if (bit) F(g, c, enabled, i) = 0; break;
+        case 0x100:
+            if (bit) {
+                F(g, c, enabled, i) = 1;
+                if (i >= 32) g->spi_on[i / 64] |= 1ull << (i % 64);
+            }
+            break;
+        case 0x180:
+            if (bit) {
+                F(g, c, enabled, i) = 0;
+                if (i >= 32) g->spi_on[i / 64] &= ~(1ull << (i % 64));
+            }
+            break;
         case 0x200: if (bit) F(g, c, latch, i) = 1; break;
         case 0x280: if (bit) F(g, c, latch, i) = 0; break;
         case 0x300: if (bit) F(g, c, active, i) = 1; break;

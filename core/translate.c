@@ -1377,7 +1377,6 @@ int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t a
 
 int hv_translate_place(HvMachine *m, HvBlock *b) {
     Emit *e = &E;
-    if (m->jit.used & 1) m->jit.used++;
     uint32_t *dst = hv_jit_reserve(&m->jit, e->total);
     if (!dst) return -1;
     hv_jit_write(&m->jit, dst, e->w, e->pool_at * 4);
