@@ -31,7 +31,16 @@ static void pvpanic_write(void *opaque, uint64_t off, uint64_t v, unsigned size)
         size_t n = 0;
         while (p + n < end && n < 3000 && (p[n] == '\n' || p[n] == '\t' || (p[n] >= 32 && p[n] < 127))) n++;
         if (n > 80) {
-            fprintf(stderr, "hengevm: panic text at PA %llx:\n%.*s\n", (unsigned long long)(VMAPPLE_MEM + (uint64_t)(p - b->ram)), (int)n, p);
+            /* The log goes on past NULs (backtrace, kexts): print what reads as text. */
+            char out[6001];
+            size_t k = 0;
+            for (size_t i = 0; i < 6000 && p + i < end && k < 6000; i++) {
+                uint8_t c = p[i];
+                if (c == '\n' || c == '\t' || (c >= 32 && c < 127)) out[k++] = (char)c;
+                else if (c == 0 && k && out[k - 1] != '\n') out[k++] = '\n';
+            }
+            out[k] = 0;
+            fprintf(stderr, "hengevm: panic text at PA %llx:\n%s\n", (unsigned long long)(VMAPPLE_MEM + (uint64_t)(p - b->ram)), out);
             break;
         }
         p += sizeof key - 1;

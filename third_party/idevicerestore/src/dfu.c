@@ -585,7 +585,11 @@ int dfu_enter_recovery(struct idevicerestore_client_t* client, plist_t build_ide
 				return -1;
 			}
 
-			if (dfu_send_command(client, "setenvnp boot-args rd=md0 nand-enable-reformat=1 -progress -restore") < 0) {
+			/* HengeVM: HV_RESTORE_BOOT_ARGS adds arguments (debugging: "serial=3" puts the restore kernel's log on the UART). */
+			char henge_args[512];
+			snprintf(henge_args, sizeof(henge_args), "setenvnp boot-args rd=md0 nand-enable-reformat=1 -progress -restore%s%s",
+				getenv("HV_RESTORE_BOOT_ARGS") ? " " : "", getenv("HV_RESTORE_BOOT_ARGS") ? getenv("HV_RESTORE_BOOT_ARGS") : "");
+			if (dfu_send_command(client, henge_args) < 0) {
 				mutex_unlock(&client->device_event_mutex);
 				logger(LL_ERROR, "Unable to send command to device\n");
 				irecv_close(client->dfu->client);

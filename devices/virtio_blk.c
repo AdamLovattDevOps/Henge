@@ -88,7 +88,13 @@ static int handle(HvVirtioBlk *b, HvVirtqElem *e, uint32_t *written) {
         status = S_UNSUPP;
         break;
     }
-    if (status != S_OK) __atomic_fetch_add(&b->errors, 1, __ATOMIC_RELAXED);
+    if (status != S_OK) {
+        __atomic_fetch_add(&b->errors, 1, __ATOMIC_RELAXED);
+        static int reported;
+        if (reported++ < 20)
+            fprintf(stderr, "virtio-blk %s: request type %#x sector %llu (%u bytes) -> status %u\n", b->disk->offset ? "aux" : "root",
+                    hdr.type, (unsigned long long)hdr.sector, data, status);
+    }
     hv_virtq_write(v, e, data, &status, 1);
     *written += 1;
     return 0;
@@ -157,7 +163,19 @@ static void notify(HvVirtio *v, int q) {
     int any = 0;
     while (b->submitted - b->published < HV_VBLK_RING) {
         HvVblkReq *r = &b->ring[b->submitted % HV_VBLK_RING];
-        if (hv_virtq_pop(v, q, &r->e) <= 0) break;
+        int got = hv_virtq_pop(v, q, &r->e);
+        if (got < 0) {
+            /* A chain this model cannot follow (too many segments, or outside
+               RAM): it is already taken from the ring, so it must still be
+               completed, or the guest loses that request slot for good. */
+            fprintf(stderr, "virtio-blk: broken request chain (%d segments seen), failing it\n", r->e.nseg);
+            uint8_t st = S_IOERR;
+            if (hv_virtq_writable(&r->e)) hv_virtq_write(v, &r->e, hv_virtq_writable(&r->e) - 1, &st, 1);
+            hv_virtq_push(v, q, &r->e, 1);
+            hv_virtio_interrupt(v);
+            continue;
+        }
+        if (got == 0) break;
         r->q = q;
         pthread_mutex_lock(&b->mu);
         __atomic_store_n(&b->submitted, b->submitted + 1, __ATOMIC_RELEASE);

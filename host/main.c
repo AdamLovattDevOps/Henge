@@ -152,6 +152,32 @@ static void *cpu_thread(void *unused) {
         fprintf(stderr, "hengevm: %s %llu bytes at %llx to %s\n", p ? "wrote" : "cannot dump", (unsigned long long)a->dump_len,
                 (unsigned long long)a->dump_pa, a->dump_path);
     }
+    if (getenv("HV_RAM_GREP")) { /* debugging: text lines in guest RAM with any of these words (the kernel's log buffer) */
+        HvVmapple *bd = hv_vm_board();
+        char words[512];
+        snprintf(words, sizeof words, "%s", getenv("HV_RAM_GREP"));
+        const char *w[16];
+        int nw = 0;
+        for (char *t = strtok(words, ","); t && nw < 16; t = strtok(NULL, ",")) w[nw++] = t;
+        FILE *out = fopen(getenv("HV_RAM_GREP_OUT") ? getenv("HV_RAM_GREP_OUT") : "/dev/stderr", "w");
+        uint64_t hits = 0;
+        for (uint64_t i = 0; i < bd->ram_size && out && hits < 20000;) {
+            /* a run of printable bytes ending in a newline or NUL */
+            uint64_t j = i;
+            while (j < bd->ram_size && j - i < 1024 && (bd->ram[j] >= 32 && bd->ram[j] < 127)) j++;
+            if (j - i >= 12) {
+                for (int k = 0; k < nw; k++)
+                    if (memmem(bd->ram + i, j - i, w[k], strlen(w[k]))) {
+                        fprintf(out, "%llx: %.*s\n", (unsigned long long)(0x70000000ull + i), (int)(j - i), bd->ram + i);
+                        hits++;
+                        break;
+                    }
+            }
+            i = j + 1;
+        }
+        if (out) fclose(out);
+        fprintf(stderr, "hengevm: RAM grep: %llu lines\n", (unsigned long long)hits);
+    }
     if (getenv("HV_BOOT_DISPLAY_DUMP")) { /* debugging: the boot framebuffer, raw BGRA, for the iOS view */
         HvBootDisplay bd;
         if (hv_vm_boot_display(&bd) == 0) {
@@ -180,6 +206,10 @@ static void install_progress(int step, double p, void *user) {
     last_step = step, last_pct = pct;
     if (step == HV_INSTALL_DONE) fprintf(stderr, "hengevm: install: done\n");
     else if (step == HV_INSTALL_FAILED) fprintf(stderr, "hengevm: install: failed\n");
+    if ((step == HV_INSTALL_DONE || step == HV_INSTALL_FAILED) && getenv("HV_INSTALL_STOP_AT_END")) {
+        sleep(3); /* debugging: stop the machine once the restore has a result (the exit dumps then run) */
+        hv_vm_stop();
+    }
     else fprintf(stderr, "hengevm: install: step %d %d%%\n", step, pct);
 }
 

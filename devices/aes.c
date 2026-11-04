@@ -44,7 +44,10 @@ static int has_payload(HvAes *a, uint32_t words) {
 static int cmd_key(HvAes *a) {
     uint32_t cmd = a->fifo[0];
     uint32_t sel = (cmd >> 24) & 7, ctx = (cmd >> 27) & 1, mode = (cmd >> 16) & 3;
-    if (mode > 1) return 1; /* only ECB (0) and CBC (1); drop the command */
+    if (mode > 1) { /* only ECB (0) and CBC (1); drop the command */
+        if (a->m->log) fprintf(stderr, "hengevm: aes: key command %08x asks for mode %u (not modelled)\n", cmd, mode);
+        return 1;
+    }
     a->cbc = mode == 1;
     a->encrypt = (cmd >> 20) & 1;
     if (sel) {
@@ -73,7 +76,10 @@ static int cmd_data(HvAes *a) {
     uint64_t src = a->fifo[2] | (((uint64_t)a->fifo[1] << 16) & 0xffff00000000ull);
     uint64_t dst = a->fifo[3] | (((uint64_t)a->fifo[1] << 32) & 0xffff00000000ull);
     HvAesKey *k = &a->key[key_ctx];
-    if (k->len != 16 && k->len != 24 && k->len != 32) return 1;
+    if (k->len != 16 && k->len != 24 && k->len != 32) {
+        if (a->m->log) fprintf(stderr, "hengevm: aes: data command %08x with a %u-byte key (not modelled)\n", cmd, k->len);
+        return 1;
+    }
     uint8_t *in = hv_phys_ptr(a->m, src, len), *out = hv_phys_ptr(a->m, dst, len);
     if (!in || !out) {
         if (a->m->log) fprintf(stderr, "hengevm: aes: DMA outside RAM (%llx -> %llx, %u bytes)\n",
@@ -117,6 +123,7 @@ static void fifo_process(HvAes *a) {
         done = 1;
         break;
     default:
+        if (a->m->log) fprintf(stderr, "hengevm: aes: unknown command %08x\n", a->fifo[0]);
         a->irq_status |= IRQ_INVALID_CMD;
         done = 1;
         break;
@@ -163,7 +170,9 @@ static uint64_t aes2_read(void *opaque, uint64_t off, unsigned size) {
 }
 
 static void aes2_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
-    (void)opaque, (void)off, (void)v, (void)size;
+    HvAes *a = opaque;
+    (void)size;
+    if (a->m->log) fprintf(stderr, "hengevm: aes2: write +%llx = %llx (not modelled)\n", (unsigned long long)off, (unsigned long long)v);
 }
 
 HvAes *hv_aes_create(HvMachine *m, HvGic *gic, uint64_t pa1, uint64_t pa2, int intid) {

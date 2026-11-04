@@ -252,13 +252,54 @@ static double trace_t0;
 
 static void trace(const char *dev, int write, uint64_t off, uint64_t v, unsigned size) {
     if (pvg_trace < 0) {
-        pvg_trace = getenv("HV_PVG_TRACE") != NULL;
+        pvg_trace = getenv("HV_PVG_TRACE") ? atoi(getenv("HV_PVG_TRACE")) : 0;
         trace_t0 = [NSDate timeIntervalSinceReferenceDate];
     }
     if (!pvg_trace) return;
     fprintf(stderr, "pvgtrace %.4f %s %s +%04llx = %llx (%u) pc %llx\n", [NSDate timeIntervalSinceReferenceDate] - trace_t0,
             dev, write == 2 ? "IRQ" : write ? "W" : "R", (unsigned long long)off, (unsigned long long)v, size,
             (unsigned long long)board->m->access_pc);
+}
+
+/* HV_PVG_TRACE=2 also dumps what the guest puts in the FIFO and what the
+   host writes back to the shared page (diffs at each interrupt): the data a
+   PVG stand-in for iOS would have to reproduce. */
+static uint64_t fifo_pa, shared_pa;
+static uint32_t fifo_size, fifo_wp;
+static uint8_t shared_prev[0x4000];
+
+static void dump_hex(const char *what, uint64_t pa, const uint8_t *p, uint32_t n) {
+    fprintf(stderr, "pvgdata %s pa %llx len %u:", what, (unsigned long long)pa, n);
+    for (uint32_t i = 0; i < n; i++) fprintf(stderr, "%s%02x", i % 4 ? "" : " ", p[i]);
+    fprintf(stderr, "\n");
+}
+
+static void trace_data(int write, uint64_t off, uint64_t v) {
+    if (pvg_trace < 2) return;
+    if (write && off == 0x101c) fifo_pa = v << 14;
+    if (write && off == 0x1030) shared_pa = v << 14;
+    if (write && off == 0x1004) fifo_size = (uint32_t)v;
+    if (write && off == 0x1008 && fifo_pa && fifo_size) {
+        uint32_t from = fifo_wp, to = (uint32_t)v;
+        for (uint32_t i = from; i != to && i - from < fifo_size; ) {
+            uint32_t at = i % fifo_size, n = to - i < fifo_size - at ? to - i : fifo_size - at;
+            uint8_t *p = hv_phys_ptr(board->m, fifo_pa + at, n);
+            if (p) dump_hex("fifo", fifo_pa + at, p, n);
+            i += n;
+        }
+        fifo_wp = to;
+    }
+    if (write == 2 && shared_pa) { /* an interrupt: what changed in the shared page */
+        uint8_t *p = hv_phys_ptr(board->m, shared_pa, sizeof shared_prev);
+        if (!p) return;
+        for (uint32_t i = 0; i < sizeof shared_prev; i += 4)
+            if (memcmp(p + i, shared_prev + i, 4)) {
+                uint32_t nv;
+                memcpy(&nv, p + i, 4);
+                fprintf(stderr, "pvgdata shared +%04x = %08x\n", i, nv);
+            }
+        memcpy(shared_prev, p, sizeof shared_prev);
+    }
 }
 
 static uint64_t gfx_read(void *opaque, uint64_t off, unsigned size) {
@@ -272,6 +313,7 @@ static uint64_t gfx_read(void *opaque, uint64_t off, unsigned size) {
 static void gfx_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
     (void)opaque;
     trace("gfx", 1, off, v, size);
+    trace_data(1, off, v);
     [pgdev mmioWriteAtOffset:off value:(uint32_t)v];
     if (size == 8) [pgdev mmioWriteAtOffset:off + 4 value:(uint32_t)(v >> 32)];
 }
@@ -335,6 +377,7 @@ int hv_pvg_attach(HvVmapple *b, const char *screenshot) {
             (void)vector;
             atomic_store(&pending_gfx, 1);
             trace("gfx", 2, vector, 0, 0);
+            trace_data(2, 0, 0);
             hv_machine_kick_all(board->m);
         };
         pgdev = PGCreateDeviceWithDescriptor(desc);

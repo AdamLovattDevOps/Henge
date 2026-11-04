@@ -1,5 +1,7 @@
 #include "virtio.h"
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Layout of the one BAR (BAR 4, 16 KB), as QEMU's virtio-pci lays it out. */
@@ -112,6 +114,11 @@ static uint64_t bar_read(HvPciDev *d, int bar, uint64_t off, unsigned size) {
         uint64_t r = 0;
         uint32_t o = (uint32_t)(off - DEVICE);
         if (o < v->config_len) memcpy(&r, v->config + o, size > v->config_len - o ? v->config_len - o : size);
+        static int cfg_log = -1;
+        if (cfg_log < 0) cfg_log = getenv("HV_VIRTIO_CFG_LOG") != NULL;
+        if (cfg_log) /* debugging: which device config fields the driver reads */
+            fprintf(stderr, "virtio %04x:%04x config read +%u (%u) = %llx\n", v->pci.config[0] | v->pci.config[1] << 8,
+                    v->pci.config[2] | v->pci.config[3] << 8, o, size, (unsigned long long)r);
         return r;
     }
     return 0;
@@ -157,13 +164,24 @@ void hv_virtio_interrupt(HvVirtio *v) {
 int hv_virtq_pop(HvVirtio *v, int qi, HvVirtqElem *e) {
     HvVirtq *q = &v->q[qi];
     uint16_t *avail = hv_phys_ptr(v->m, q->avail, 4 + 2u * q->size);
-    if (!avail) return -1;
+    if (!avail) return 0; /* not set up: nothing taken (-1 means an element was taken but is broken) */
     uint16_t idx = __atomic_load_n(&avail[1], __ATOMIC_ACQUIRE);
     if (q->last_avail == idx) return 0;
     /* The guest writes the ring entry (and the descriptors) before the index,
        from another core: the acquire above keeps these reads after it, or a
        stale entry (the driver fills unused ones with 0xffff) comes back. */
     uint16_t head = __atomic_load_n(&avail[2 + q->last_avail % q->size], __ATOMIC_RELAXED);
+    if (head >= q->size) {
+        /* Not written yet as far as this core can see (the driver keeps unused
+           entries at 0xffff). Taking it would complete a request that does not
+           exist (the guest panics "Adding invalid index 65535") or lose the
+           real one: leave it for the next notify or poll. */
+        static int said;
+        if (said++ < 10)
+            fprintf(stderr, "virtio %04x: avail entry %u not ready (head %u, idx %u); retrying later\n",
+                    v->pci.config[2] | v->pci.config[3] << 8, q->last_avail, head, idx);
+        return 0;
+    }
     q->last_avail++;
     e->head = head;
     e->nseg = 0;
