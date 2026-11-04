@@ -531,3 +531,63 @@ int hv_tlb_refill(HvCpu *cpu, uint64_t va, uint32_t flags) {
     if (cpu->m->stats_interval) cpu->m->stats.refills++;
     return tag != HV_TLB_INVALID && tag + HV_TLB_ADJ == (va & ~(uint64_t)PAGE_MASK) ? 0 : 1;
 }
+
+/* Put block b in this CPU's indirect-branch cache under its VA (b->va must be in
+   the half its flags say: kernel blocks, kernel VAs). */
+void hv_ijc_fill(HvCpu *cpu, HvBlock *b) {
+    HvMachine *m = cpu->m;
+    HvPerCpu *pcs = cpu->pc_state;
+    int kernel = b->flags & HV_BLOCK_EL1;
+    uint64_t *t = pcs->ijc + (size_t)(b->flags & (HV_IJC_TABLES - 1)) * (HV_IJC_TABLE_BYTES / 8);
+    uint64_t tag = b->va ^ cpu->ijc_salt[kernel];
+    uint64_t *ent = t + (size_t)hv_ijc_index(tag) * 2;
+    ent[0] = tag;
+    ent[1] = (uint64_t)(uintptr_t)b->code;
+    pcs->ijc_tables_used |= 1u << (b->flags & (HV_IJC_TABLES - 1));
+    if (!kernel) {
+        hv_ucode_add(cpu, b->va);
+        uint32_t h = (uint32_t)(b->va >> HV_TLB_PAGE_BITS) & 0xffff;
+        pcs->ijc_pages[0][h >> 6] |= 1ull << (h & 63);
+    }
+    uint32_t k = hv_ijc_key(b->va, cpu->ijc_salt[kernel]);
+    if (!(pcs->ijc_keyed[k >> 6] >> (k & 63) & 1)) {
+        pcs->ijc_keyed[k >> 6] |= 1ull << (k & 63);
+        if (++pcs->ijc_keyed_count > (1u << 17)) { /* an eighth full: start the cache and the filter over */
+            m->stats.reset_why[6]++;
+            hv_ijc_reset(cpu, 0);
+            hv_ijc_reset(cpu, 1);
+            memset(pcs->ijc_keyed, 0, sizeof pcs->ijc_keyed);
+            pcs->ijc_keyed_count = 0;
+        }
+    }
+}
+
+/* An indirect-branch cache miss in translated code, before the dispatcher: if
+   the target's block already exists (found through this CPU's TLB and the
+   block hash), cache it and return its code for the thunk to jump to; else 0
+   and the dispatcher does it. Called by hv_ijc_thunk with the guest's SIMD
+   registers live (see read_desc), so nothing that could reach libc runs: a
+   fill that would reset the cache's filters goes to the dispatcher instead.
+   flags: the block flags the branch was translated under (the target's too). */
+void *hv_ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
+    HvMachine *m = cpu->m;
+    HvPerCpu *pcs = cpu->pc_state;
+    int kernel = flags & HV_BLOCK_EL1;
+    if (!m->chain || va == m->stop_pc || (int)((va >> 55) & 1) != kernel || (va & 3)) return 0;
+    if (pcs->ijc_keyed_count >= (1u << 17) || pcs->ucode_count + 1 >= (1u << HV_UCODE_BITS) / 2) return 0;
+    int table = !kernel ? 0 : (flags & HV_BLOCK_PAN) ? 2 : 1;
+    HvTlbEntry *e = &cpu->tlb[table][(va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1)];
+    if (e->exec_tag != (va & ~(uint64_t)PAGE_MASK)) return 0;
+    const uint8_t *host = (const uint8_t *)(uintptr_t)(va + (uint64_t)e->addend);
+    HvRam *ram = NULL;
+    for (int i = 0; i < m->nram; i++)
+        if ((uint64_t)(host - m->ram[i].host) < m->ram[i].size) ram = &m->ram[i];
+    if (!ram) return 0;
+    uint64_t pa = ram->pa + (uint64_t)(host - ram->host);
+    uint32_t gen = __atomic_load_n(&ram->page_gen[(pa - ram->pa) >> HV_TLB_PAGE_BITS], __ATOMIC_ACQUIRE);
+    HvBlock *b = hv_block_find(m, hv_block_hash(va, pa, flags), va, pa, flags, gen);
+    if (!b) return 0;
+    hv_ijc_fill(cpu, b);
+    if (m->stats_interval) m->stats.ijc_light++;
+    return b->code;
+}

@@ -64,7 +64,8 @@ typedef struct HvStats {
     uint64_t dev_waits, dev_wait_ticks; /* device lock taken while another CPU held it */
     uint64_t tr_waits, tr_wait_ticks;   /* translation lock likewise */
     uint64_t words_inline, words_ool, words_pool; /* translated code size by part */
-    uint64_t refills;         /* TLB misses filled by the light path (hv_tlb_refill) */
+    uint64_t refills;
+    uint64_t ijc_light;       /* branch-cache misses resolved without the dispatcher (hv_ijc_resolve) */         /* TLB misses filled by the light path (hv_tlb_refill) */
     uint64_t code_protects;   /* pages that became code (every CPU's TLB scanned for writable entries) */
     uint64_t tlb_miss_kind[4]; /* TLB misses: EL0 empty, EL0 other page there, EL1 empty, EL1 other page there */
     uint64_t slow_why[6];     /* slow accesses by cause: MMIO, code-page write, page end, TLB miss, other, TLB entry there but mismatched */
@@ -191,6 +192,18 @@ typedef struct HvMachine {
     uint64_t *prof;
     uint32_t prof_head, prof_tail;
 } HvMachine;
+
+static inline uint32_t hv_block_hash(uint64_t va, uint64_t pa, uint32_t flags) {
+    uint64_t h = (va >> 2) ^ (pa >> 2) * 0x9e3779b97f4a7c15ull ^ flags;
+    return (uint32_t)(h ^ (h >> 29)) & (HV_BLOCK_HASH - 1);
+}
+
+/* Lock-free: blocks are only added (release store) until a flush, which stops every CPU. */
+static inline HvBlock *hv_block_find(HvMachine *m, uint32_t h, uint64_t va, uint64_t pa, uint32_t flags, uint32_t gen) {
+    for (HvBlock *b = __atomic_load_n(&m->hash[h], __ATOMIC_ACQUIRE); b; b = __atomic_load_n(&b->next, __ATOMIC_ACQUIRE))
+        if (b->va == va && b->pa == pa && b->flags == flags && b->gen == gen) return b;
+    return NULL;
+}
 
 int hv_machine_init(HvMachine *m, size_t jit_bytes);
 /* The same with JIT memory the host provides (iOS: the region a debugger granted and its writable alias). */

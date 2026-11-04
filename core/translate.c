@@ -147,9 +147,14 @@ static void put_ijc_jump(Emit *e) {
     put(e, CBNZ_X(7));
     put(e, BR_X(6));                                        /* hit: x0, x1 are the guest's */
     patch_branch(&e->w[to_miss], (int64_t)e->n - to_miss);  /* miss: x15 is the tag, so the VA is x15 ^ salt */
+    put(e, LDR_X(7, 28, salt));
+    put(e, 0xca000000u | 15 << 16 | 7 << 5 | 7);            /* eor x7, x7, x15: the VA */
+    put(e, STR_X(30, 28, HV_CPU_X(30)));
+    put(e, LDR_X(15, 28, HV_CPU_IJC_THUNK));
+    put(e, BLR_X(15));                                      /* the block exists? then the thunk goes there */
+    put(e, e->flags);
     put(e, STP_X(0, 1, 28, 0));
-    put(e, LDR_X(0, 28, salt));
-    put(e, 0xca000000u | 15 << 16 | 0 << 5 | 0);            /* eor x0, x0, x15 */
+    put(e, MOV_X(0, 7));
     uint32_t to_common = e->n;
     put(e, B_OP);
     patch_branch(&e->w[to_exit], (int64_t)e->n - to_exit);  /* exit_req: x15 is the VA */

@@ -36,6 +36,7 @@
     .globl _hv_helper_entry
     .globl _hv_helper_thunk
     .globl _hv_chain_thunk
+    .globl _hv_ijc_thunk
     .globl _hv_fp_enter
     .globl _hv_fp_leave
 
@@ -266,6 +267,52 @@ _hv_chain_thunk:
     str x0, [x28, #CPU_PC]
     ldr x1, [x28, #CPU_EXIT]
     br x1
+
+// hv_ijc_thunk: an indirect-branch cache miss, before the dispatcher. x7 = the
+// target VA, x30 = the site's flags word (guest x30 already saved). Jumps to
+// the target block if hv_ijc_resolve found it; else returns after the word,
+// with x7 still the VA. Saves only what C may clobber, as the refill does.
+_hv_ijc_thunk:
+    str x30, [x28, #CPU_REFILL_RET]
+    stp x0, x1, [x28, #0]
+    stp x2, x3, [x28, #16]
+    stp x4, x5, [x28, #32]
+    stp x8, x9, [x28, #64]
+    stp x10, x11, [x28, #80]
+    stp x12, x13, [x28, #96]
+    str x14, [x28, #112]
+    stp x16, x17, [x28, #128]
+    str x7, [x28, #0x130]   // spill[3]: free at a block's end, where these lookups are
+    mrs x15, nzcv
+    str x15, [x28, #CPU_NZCV]
+    mov x15, sp
+    str x15, [x28, #CPU_SP]
+    ldr x15, [x28, #CPU_HOST_SP]
+    mov sp, x15
+    mov x0, x28
+    mov x1, x7
+    ldr w2, [x30]
+    bl _hv_ijc_resolve
+    mov x6, x0
+    ldr x0, [x28, #CPU_SP]
+    mov sp, x0
+    ldr x0, [x28, #CPU_NZCV]
+    msr nzcv, x0
+    ldp x0, x1, [x28, #0]
+    ldp x2, x3, [x28, #16]
+    ldp x4, x5, [x28, #32]
+    ldp x8, x9, [x28, #64]
+    ldp x10, x11, [x28, #80]
+    ldp x12, x13, [x28, #96]
+    ldr x14, [x28, #112]
+    ldp x16, x17, [x28, #128]
+    ldr x7, [x28, #0x130]
+    ldr x30, [x28, #240]
+    cbz x6, 1f
+    br x6
+1:  ldr x15, [x28, #CPU_REFILL_RET]
+    add x15, x15, #4
+    br x15
 
 // hv_fp_enter(cpu): the guest's FPCR and FPSR into the host registers.
 _hv_fp_enter:

@@ -50,6 +50,9 @@ void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid); /* asid -1: every 
 void hv_ijc_drop_va(HvCpu *cpu, uint64_t va, int asid);
 /* Translated code's TLB miss: walk and fill without the full helper (see mmu.c). */
 int hv_tlb_refill(HvCpu *cpu, uint64_t va, uint32_t flags);
+struct HvBlock;
+void hv_ijc_fill(HvCpu *cpu, struct HvBlock *b);
+void *hv_ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags);
 /* Another CPU's TLBI of one page: drop target's entries for it from here. 1 if
    that is enough (no page walk of target's raced it), 0 if target must do it
    itself and be waited for. Its branch cache is still target's own business. */

@@ -13,6 +13,7 @@ extern void hv_exit(void);
 extern void hv_helper_entry(void);
 extern void hv_helper_thunk(void);
 extern void hv_chain_thunk(void);
+extern void hv_ijc_thunk(void);
 
 static int init_rest(HvMachine *m);
 
@@ -370,6 +371,7 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
     cpu->helper_routine = (uint64_t)hv_helper_entry;
     cpu->helper_thunk = (uint64_t)hv_helper_thunk;
     cpu->chain_thunk = (uint64_t)hv_chain_thunk;
+    cpu->ijc_thunk = (uint64_t)hv_ijc_thunk;
     cpu->el = 1;
     cpu->spsel = 1;
     cpu->daif = HV_PSTATE_DAIF;

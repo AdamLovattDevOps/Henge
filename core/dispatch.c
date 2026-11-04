@@ -53,21 +53,13 @@ static uint32_t block_flags(HvCpu *cpu) {
     return flags;
 }
 
-static uint32_t hash_of(uint64_t va, uint64_t pa, uint32_t flags) {
-    uint64_t h = (va >> 2) ^ (pa >> 2) * 0x9e3779b97f4a7c15ull ^ flags;
-    return (uint32_t)(h ^ (h >> 29)) & (HV_BLOCK_HASH - 1);
-}
 
 /* Finding a block is lock-free (blocks are only ever added, with a release
    store, until a flush, which stops every CPU); making one takes the
    translation lock. Returns NULL if the translations must all be dropped first
    (m->flush_pending is set: the dispatcher does that, then tries again). */
-static HvBlock *find(HvMachine *m, uint32_t h, uint64_t va, uint64_t pa, uint32_t flags, uint32_t gen) {
-    for (HvBlock *b = __atomic_load_n(&m->hash[h], __ATOMIC_ACQUIRE); b; b = __atomic_load_n(&b->next, __ATOMIC_ACQUIRE))
-        if (b->va == va && b->pa == pa && b->flags == flags && b->gen == gen) return b;
-    return NULL;
-}
-
+#define hash_of hv_block_hash
+#define find hv_block_find
 static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, const uint32_t *code, uint32_t avail) {
     HvMachine *m = cpu->m;
     uint32_t j = (uint32_t)((va >> 2) ^ (va >> 18) ^ ((uint64_t)flags << 13)) & ((1u << HV_JC_BITS) - 1);
@@ -419,7 +411,7 @@ static void print_stats(HvCpu *cpu, int force) {
         fprintf(stderr, "  new code pages %.0f/s; waits: tlbi acks %.0f/s %.1f%%, device lock %.0f/s %.1f%%, translation lock %.0f/s %.1f%% (of one CPU)\n",
                 RATE(code_protects), RATE(syncs), RATE(sync_ticks) / 240000.0, RATE(dev_waits), RATE(dev_wait_ticks) / 240000.0,
                 RATE(tr_waits), RATE(tr_wait_ticks) / 240000.0);
-        fprintf(stderr, "  light refills %.0fK/s\n", RATE(refills) / 1e3);
+        fprintf(stderr, "  light refills %.0fK/s, light branch-cache fills %.0fK/s\n", RATE(refills) / 1e3, RATE(ijc_light) / 1e3);
         fprintf(stderr, "  tlb misses K/s: el0 empty %.0f el0 conflict %.0f el1 empty %.0f el1 conflict %.0f\n",
                 RATE(tlb_miss_kind[0]) / 1e3, RATE(tlb_miss_kind[1]) / 1e3, RATE(tlb_miss_kind[2]) / 1e3, RATE(tlb_miss_kind[3]) / 1e3);
         fprintf(stderr, "  slow mem causes K/s: mmio %.0f code-page write %.0f page end %.0f tlb miss %.0f other %.0f entry-but-tag %.0f\n",
@@ -714,25 +706,7 @@ static int run_loop(HvCpu *cpu, int one) {
                 }
                 m->stats.fill_kind[kind]++;
             }
-            ent[0] = tag;
-            ent[1] = (uint64_t)(uintptr_t)b->code;
-            pcs->ijc_tables_used |= 1u << (b->flags & (HV_IJC_TABLES - 1));
-            if (!kernel) {
-                hv_ucode_add(cpu, b->va);
-                uint32_t h = (uint32_t)(b->va >> HV_TLB_PAGE_BITS) & 0xffff;
-                pcs->ijc_pages[0][h >> 6] |= 1ull << (h & 63);
-            }
-            uint32_t k = hv_ijc_key(b->va, cpu->ijc_salt[kernel]);
-            if (!(pcs->ijc_keyed[k >> 6] >> (k & 63) & 1)) {
-                pcs->ijc_keyed[k >> 6] |= 1ull << (k & 63);
-                if (++pcs->ijc_keyed_count > (1u << 17)) { /* an eighth full: start the cache and the filter over */
-                    m->stats.reset_why[6]++;
-                    hv_ijc_reset(cpu, 0);
-                    hv_ijc_reset(cpu, 1);
-                    memset(pcs->ijc_keyed, 0, sizeof pcs->ijc_keyed);
-                    pcs->ijc_keyed_count = 0;
-                }
-            }
+            hv_ijc_fill(cpu, b);
             m->stats.ijc_fills++;
         }
         /* The block before left through a chainable direct branch to this one: link them. */
