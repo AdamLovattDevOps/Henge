@@ -299,12 +299,30 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
         uint32_t chunk = 4096 - (uint32_t)(va & 4095);
         if (chunk > len) chunk = len;
         uint64_t pa;
+        int had_entry = 0;
+        if (cpu->m->stats_interval) { /* --stats: was the TLB entry there before this access? */
+            HvTlbEntry *t = &cpu->tlb[hv_tlb_table(cpu, el)][(va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1)];
+            uint64_t tag = write ? t->write_tag : t->read_tag;
+            had_entry = tag != HV_TLB_INVALID && ((va - tag) >> HV_TLB_PAGE_BITS) == 0 ? 1 :
+                        tag != HV_TLB_INVALID && ((va - tag - HV_TLB_ADJ) >> HV_TLB_PAGE_BITS) == 0 ? 2 : 0;
+            if (!had_entry) {
+                int other = t->read_tag != HV_TLB_INVALID || t->write_tag != HV_TLB_INVALID || t->exec_tag != HV_TLB_INVALID;
+                cpu->m->stats.tlb_miss_kind[(el ? 2 : 0) + other]++;
+            }
+        }
         uint32_t fsc = hv_mmu_access(cpu, va, write ? HV_ACC_WRITE : HV_ACC_READ, el, &pa);
         if (fsc) {
             hv_raise_abort(cpu, 0, va, fsc, write, fsc >= 0x14 && fsc <= 0x17, pc);
             return 1;
         }
         int rc = 0;
+        if (cpu->m->stats_interval) {
+            HvRam *ram = hv_ram_lookup(cpu->m, pa);
+            uint64_t inpage = va & ((1ull << HV_TLB_PAGE_BITS) - 1);
+            int why = !ram ? 0 : write && ram->code_pages[(pa - ram->pa) >> HV_TLB_PAGE_BITS] ? 1
+                    : inpage + len > (1ull << HV_TLB_PAGE_BITS) - HV_TLB_ADJ ? 2 : had_entry == 0 ? 3 : had_entry == 2 ? 5 : 4;
+            cpu->m->stats.slow_why[why]++;
+        }
         if (hv_phys_ptr(cpu->m, pa, chunk)) {
             rc = write ? hv_phys_write(cpu->m, pa, b, chunk) : hv_phys_read(cpu->m, pa, b, chunk);
         } else {

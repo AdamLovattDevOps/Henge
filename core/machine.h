@@ -15,6 +15,10 @@ typedef struct HvRam {
     int readonly;
     uint8_t *code_pages; /* one byte per 16 KB page: a translated block came from here */
     uint32_t *page_gen;  /* per page: bumped to invalidate the blocks translated from it */
+    /* Per page and CPU: the TLB slot (table << HV_TLB_BITS | index, plus 1) that
+       last mapped the page writable, or HV_WHINT_MANY when it has had more than
+       one. When the page becomes code only those are dropped, not a whole TLB scanned. */
+    uint32_t *whint;
 } HvRam;
 
 typedef struct HvMmio {
@@ -54,6 +58,9 @@ typedef struct HvStats {
     uint64_t blocks, translations, block_flushes;
     uint64_t flush_smc, flush_ic, flush_full;  /* why translations were dropped */
     uint64_t chained, ijc_fills, ijc_resets;
+    uint64_t code_protects;   /* pages that became code (every CPU's TLB scanned for writable entries) */
+    uint64_t tlb_miss_kind[4]; /* TLB misses: EL0 empty, EL0 other page there, EL1 empty, EL1 other page there */
+    uint64_t slow_why[6];     /* slow accesses by cause: MMIO, code-page write, page end, TLB miss, other, TLB entry there but mismatched */
     uint64_t slow_kind[12];   /* hv_mem_emulate calls by HV_MEM_* kind */
     uint64_t fill_kind[4];    /* ijc fills into an empty slot, over another live salt, over the same salt, over a dead salt */
     uint64_t reset_why[8];    /* cache drops: full flush, TLBI by ASID, TLBI user VA, TLBI kernel VA, code change, user VA in every ASID (whole user half), keyed filter full, big user range */
@@ -71,6 +78,7 @@ typedef struct HvStats {
 } HvStats;
 
 #define HV_MAX_CPUS 8
+#define HV_WHINT_MANY 0xffffffffu
 
 /* What each CPU has to itself and keeps across hv_cpu_reset (tests copy HvCpu
    structs around, so it lives here, by CPU index): its indirect-branch cache and

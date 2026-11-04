@@ -22,7 +22,7 @@ typedef struct HvTlbEntry {
 #define HV_TLB_PAGE_BITS 14
 #define HV_TLB_ADJ 15
 #define HV_TLB_INVALID 0x8080808080808080ull /* what memset(0x80) leaves */
-#define HV_TLB_BITS 12 /* 4096 entries per EL: 64 MB of 16 KB pages */
+#define HV_TLB_BITS 14 /* 16384 entries per EL: 256 MB of 16 KB pages (xnu's working set overflowed 64 MB) */
 #define HV_TLB_SIZE (1u << HV_TLB_BITS)
 
 /* Guest CPU state. While a translated block runs, host x28 points here and the

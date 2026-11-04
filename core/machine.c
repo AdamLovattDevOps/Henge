@@ -200,7 +200,8 @@ int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int
     size_t pages = (size + (1u << HV_TLB_PAGE_BITS) - 1) >> HV_TLB_PAGE_BITS;
     r->code_pages = calloc(pages, 1);
     r->page_gen = calloc(pages, sizeof *r->page_gen);
-    return r->code_pages && r->page_gen ? 0 : -1;
+    r->whint = calloc(pages * HV_MAX_CPUS, sizeof *r->whint);
+    return r->code_pages && r->page_gen && r->whint ? 0 : -1;
 }
 
 int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,

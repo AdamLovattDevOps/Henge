@@ -256,6 +256,23 @@ void hv_tlb_flush_user(HvCpu *cpu) {
 
 /* A page just got translated code: writes to it must take the slow path from now
    on, so drop just the write permission of the entries that map it. */
+static int maps_writable(const HvTlbEntry *e, const uint8_t *host_page) {
+    return e->write_tag != HV_TLB_INVALID && (const uint8_t *)(uintptr_t)(e->write_tag + HV_TLB_ADJ + e->addend) == host_page;
+}
+
+/* RAM page pg just became code: drop write permission from cpu's entries for it. */
+void hv_tlb_protect_code_page(HvCpu *cpu, HvRam *ram, uint64_t pg) {
+    uint32_t *hint = &ram->whint[pg * HV_MAX_CPUS + cpu->index];
+    uint32_t h = __atomic_exchange_n(hint, 0, __ATOMIC_SEQ_CST);
+    const uint8_t *host_page = ram->host + (pg << HV_TLB_PAGE_BITS);
+    if (h == HV_WHINT_MANY) {
+        hv_tlb_protect_code(cpu, host_page);
+    } else if (h) {
+        HvTlbEntry *e = &cpu->tlb[0][0] + (h - 1);
+        if (maps_writable(e, host_page)) e->write_tag = HV_TLB_INVALID;
+    }
+}
+
 void hv_tlb_protect_code(HvCpu *cpu, const uint8_t *host_page) {
     for (int t = 0; t < 3; t++)
         for (uint32_t i = 0; i < HV_TLB_SIZE; i++) {
@@ -383,6 +400,13 @@ static void tlb_fill(HvCpu *cpu, uint64_t va, int el, const HvWalk *w) {
        code_pages and then dropping write tags in every TLB: if that came after
        the check above, the entry written here must not stay writable. */
     if (e->write_tag != HV_TLB_INVALID) {
+        /* Say where, so that the page becoming code drops just this entry (or, if
+           this CPU now maps it writable twice, makes the protector scan). */
+        uint32_t *hint = &ram->whint[pg * HV_MAX_CPUS + cpu->index];
+        uint32_t mine = (uint32_t)(table << HV_TLB_BITS | slot) + 1, old = __atomic_load_n(hint, __ATOMIC_RELAXED);
+        const uint8_t *host_page = ram->host + (page_pa - ram->pa);
+        if (old && old != mine && old != HV_WHINT_MANY && maps_writable(&cpu->tlb[0][0] + (old - 1), host_page)) mine = HV_WHINT_MANY;
+        if (old != HV_WHINT_MANY) __atomic_store_n(hint, mine, __ATOMIC_RELAXED);
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
         if (__atomic_load_n(&ram->code_pages[pg], __ATOMIC_RELAXED)) e->write_tag = HV_TLB_INVALID;
     }

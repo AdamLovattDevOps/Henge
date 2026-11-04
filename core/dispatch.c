@@ -121,8 +121,9 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
     /* Writes to this page must now take the slow path so we notice them. */
     if (!ram->code_pages[pg]) {
         __atomic_store_n(&ram->code_pages[pg], 1, __ATOMIC_SEQ_CST); /* before the TLBs: see the end of tlb_fill */
+        m->stats.code_protects++;
         for (int i = 0; i < m->ncpus; i++) /* in every CPU's TLB, or a write from another CPU goes unnoticed */
-            if (m->cpus[i]) hv_tlb_protect_code(m->cpus[i], ram->host + (pg << HV_TLB_PAGE_BITS));
+            if (m->cpus[i]) hv_tlb_protect_code_page(m->cpus[i], ram, pg);
     }
     pthread_mutex_unlock(&m->tr_mu);
     return b;
@@ -394,6 +395,12 @@ static void print_stats(HvCpu *cpu, int force) {
                 fprintf(stderr, "    worst: va %llx pa %llx flags %x gen %u/%u\n", (unsigned long long)b->va,
                         (unsigned long long)b->pa, b->flags, b->gen, b->ram->page_gen[b->pg]);
         }
+        fprintf(stderr, "  new code pages %.0f/s\n", RATE(code_protects));
+        fprintf(stderr, "  tlb misses K/s: el0 empty %.0f el0 conflict %.0f el1 empty %.0f el1 conflict %.0f\n",
+                RATE(tlb_miss_kind[0]) / 1e3, RATE(tlb_miss_kind[1]) / 1e3, RATE(tlb_miss_kind[2]) / 1e3, RATE(tlb_miss_kind[3]) / 1e3);
+        fprintf(stderr, "  slow mem causes K/s: mmio %.0f code-page write %.0f page end %.0f tlb miss %.0f other %.0f entry-but-tag %.0f\n",
+                RATE(slow_why[0]) / 1e3, RATE(slow_why[1]) / 1e3, RATE(slow_why[2]) / 1e3, RATE(slow_why[3]) / 1e3,
+                RATE(slow_why[4]) / 1e3, RATE(slow_why[5]) / 1e3);
         fprintf(stderr, "  slow mem K/s: single %.0f pair %.0f literal %.0f ldra %.0f ordered %.0f excl %.0f cas %.0f casp %.0f atomic %.0f vec %.0f/%.0f\n",
                 RATE(slow_kind[0]) / 1e3, RATE(slow_kind[1]) / 1e3, RATE(slow_kind[2]) / 1e3, RATE(slow_kind[3]) / 1e3,
                 RATE(slow_kind[4]) / 1e3, RATE(slow_kind[5]) / 1e3, RATE(slow_kind[6]) / 1e3, RATE(slow_kind[7]) / 1e3,
@@ -410,7 +417,7 @@ static void print_stats(HvCpu *cpu, int force) {
 #undef RATE
     if (m->prof) print_profile(m);
     /* The five busiest system registers or SYS operations (reads + writes) this interval. */
-    for (int k = 0; k < 5; k++) {
+    for (int k = 0; k < 14; k++) {
         uint64_t best = 0;
         uint32_t bi = 0;
         for (uint32_t r = 0; r < 65536; r++) {

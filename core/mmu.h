@@ -5,6 +5,8 @@
 
 #include "cpu.h"
 
+struct HvRam;
+
 typedef enum { HV_ACC_READ = 0, HV_ACC_WRITE = 1, HV_ACC_EXEC = 2 } HvAccess;
 
 /* Result of a stage 1 translation for the EL1&0 regime. */
@@ -49,6 +51,7 @@ void hv_ijc_drop_va(HvCpu *cpu, uint64_t va, int asid);       /* just the cached
 void hv_ijc_drop_range(HvCpu *cpu, uint64_t va, uint64_t len, int asid);
 void hv_ucode_add(HvCpu *cpu, uint64_t va); /* a user target was cached in this page (current address space) */
 void hv_tlb_protect_code(HvCpu *cpu, const uint8_t *host_page);
+void hv_tlb_protect_code_page(HvCpu *cpu, struct HvRam *ram, uint64_t pg); /* the same, through the page's write hints */
 
 /* Translates for a C access of `len` bytes that stays inside one 16 KB page,
    filling the TLB when the page is ordinary RAM. Returns 0 and sets *pa, or the
