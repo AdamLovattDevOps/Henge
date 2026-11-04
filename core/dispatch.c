@@ -104,7 +104,7 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
         pthread_mutex_unlock(&m->tr_mu);
         return jc[j] = b;
     }
-    if (m->nblocks == HV_MAX_BLOCKS || m->flush_pending) {
+    if ((uint32_t)m->nblocks >= m->max_blocks || m->flush_pending) {
         m->stats.flush_full++;
         goto flush;
     }
@@ -407,6 +407,11 @@ static void print_stats(HvCpu *cpu, int force) {
             for (HvBlock *b = m->hash[worst]; b && k < 6; b = b->next, k++)
                 fprintf(stderr, "    worst: va %llx pa %llx flags %x gen %u/%u\n", (unsigned long long)b->va,
                         (unsigned long long)b->pa, b->flags, b->gen, b->ram->page_gen[b->pg]);
+        }
+        {
+            double tw = RATE(words_inline) + RATE(words_ool) + RATE(words_pool) + 1e-9;
+            fprintf(stderr, "  code words: inline %.0f%% out of line %.0f%% literals %.0f%%\n", 100 * RATE(words_inline) / tw,
+                    100 * RATE(words_ool) / tw, 100 * RATE(words_pool) / tw);
         }
         fprintf(stderr, "  new code pages %.0f/s; waits: tlbi acks %.0f/s %.1f%%, device lock %.0f/s %.1f%%, translation lock %.0f/s %.1f%% (of one CPU)\n",
                 RATE(code_protects), RATE(syncs), RATE(sync_ticks) / 240000.0, RATE(dev_waits), RATE(dev_wait_ticks) / 240000.0,

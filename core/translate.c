@@ -99,13 +99,6 @@ static void put_lit(Emit *e, int reg, uint64_t value) {
 }
 
 /* adr xR, <16-byte HvHelperInfo in the pool> */
-static void put_info(Emit *e, int reg, uint64_t pc, uint32_t insn, uint32_t op) {
-    e->pool[e->npool] = pc;
-    e->pool[e->npool + 1] = insn | (uint64_t)op << 32;
-    e->fix[e->nfix++] = (LitFix){e->n, FIX_ADR, e->npool};
-    e->npool += 2;
-    put(e, 0x10000000u | reg);
-}
 
 static void put_ool(Emit *e, Ool o) {
     o.at = e->n - 1; /* the branch just emitted */
@@ -189,7 +182,7 @@ static void put_branch_exit(Emit *e, uint64_t target) {
     uint32_t slot_index = ~0u;
     if ((target & ~((1ull << HV_TLB_PAGE_BITS) - 1)) == e->page) {
         slot_index = __atomic_fetch_add(&e->m->nslots, 1, __ATOMIC_RELAXED); /* translations run in parallel */
-        if (slot_index >= HV_MAX_SLOTS) slot_index = ~0u; /* out of slots until the next flush: no chaining */
+        if (slot_index >= e->m->max_slots) slot_index = ~0u; /* out of slots until the next flush: no chaining */
     }
     if (slot_index == ~0u) {
         /* Another page may be remapped under us, so look it up by VA instead of chaining. */
@@ -201,38 +194,40 @@ static void put_branch_exit(Emit *e, uint64_t target) {
     *slot = 0;
     put(e, 0xb9400000u | (HV_CPU_EXIT_REQ / 4) << 10 | 28 << 5 | 15); /* ldr w15, [x28, #exit_req] */
     uint32_t to_exit = e->n;
-    put(e, 0x35000000u | 15);                                         /* cbnz w15, exit (patched below) */
+    put(e, 0x35000000u | 15);                                         /* cbnz w15, slow (patched below) */
     /* Chaining rewrites this B to go straight to the target block (one aligned
        B may be rewritten while other CPUs run it); until then, or when the
-       target is out of B's range, it falls through to the data slot. */
+       target is out of B's range, it falls through to hv_chain_thunk. */
     if (e->nsite < MAX_OOL) {
         e->site[e->nsite].slot = slot_index;
         e->site[e->nsite++].at = e->n;
     }
     put(e, B_OP | 1);                                                 /* b next */
-    put_lit(e, 6, (uint64_t)(uintptr_t)slot);
-    put(e, LDR_X(15, 6, 0));
-    uint32_t to_unchained = e->n;
-    put(e, 0xb4000000u | 15);                                         /* cbz x15, unchained (patched below) */
-    put(e, BR_X(15));                                                 /* x0/x1 still hold guest values */
-    patch_branch(&e->w[to_unchained], (int64_t)e->n - to_unchained);
-    put(e, STR_X(6, 28, HV_CPU_LAST_STUB));                           /* x6 still holds the slot address */
     patch_branch(&e->w[to_exit], (int64_t)e->n - to_exit);
-    put(e, STP_X(0, 1, 28, 0));
-    put_lit(e, 6, target);
-    put(e, STR_X(6, 28, HV_CPU_PC));
-    put(e, LDR_X(1, 28, HV_CPU_EXIT));
-    put(e, BR_X(1));
+    put(e, STR_X(30, 28, HV_CPU_X(30)));
+    put(e, LDR_X(15, 28, HV_CPU_CHAIN_THUNK));
+    if ((e->n & 1) == 0) put(e, 0xd503201f);                         /* nop: the data starts 8-byte aligned */
+    put(e, BLR_X(15));
+    put(e, (uint32_t)(uintptr_t)slot);
+    put(e, (uint32_t)((uintptr_t)slot >> 32));
+    put(e, (uint32_t)target);
+    put(e, (uint32_t)(target >> 32));
 
 }
 
 /* Call hv_helper(cpu, info) and continue unless it leaves. */
+/* Call hv_helper: guest x30 saved, a blr to hv_helper_thunk with the
+   HvHelperInfo right after it (8-byte aligned), and x0 reloaded when it comes
+   back. Seven or eight words; host x15 is clobbered. */
 static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op) {
-    put(e, STP_X(0, 1, 28, 0));
     put(e, STR_X(30, 28, HV_CPU_X(30)));
-    put_info(e, 0, pc, insn, op);
-    put(e, LDR_X(1, 28, HV_CPU_HELPER));
-    put(e, BLR_X(1));
+    put(e, LDR_X(15, 28, HV_CPU_HELPER_THUNK));
+    if ((e->n & 1) == 0) put(e, 0xd503201f); /* nop: the info after the blr starts 8-byte aligned */
+    put(e, BLR_X(15));
+    put(e, (uint32_t)pc);
+    put(e, (uint32_t)(pc >> 32));
+    put(e, insn);
+    put(e, op);
     put(e, LDR_X(0, 28, 0));
 }
 
@@ -1266,7 +1261,7 @@ static void emit_ool(Emit *e) {
     for (uint32_t i = 0; i < e->nool; i++) {
         Ool *o = &e->ool[i];
         patch_branch(&e->w[o->at], (int64_t)e->n - o->at);
-        if (o->recheck) {
+        if (0 && o->recheck) { /* dropped: 6 words per access for ~12K helper calls a second */
             put(e, LDR_X(o->u, o->t, o->tag_off));
             put(e, SUB_X(o->u, o->addr, o->u));
             put_add_imm(e, o->u, o->u, (int64_t)o->bytes - 1 - HV_TLB_ADJ);
@@ -1311,7 +1306,13 @@ int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t a
     }
     if (!ended) put_branch_exit(e, b->va + 4ull * i);
     b->ninsns = i;
+    uint32_t inline_words = e->n;
     emit_ool(e);
+    if (m->stats_interval) {
+        m->stats.words_inline += inline_words;
+        m->stats.words_ool += e->n - inline_words;
+        m->stats.words_pool += e->npool * 2;
+    }
 
     /* Pool after the code, 8-byte aligned; blocks start 8-byte aligned. */
     if (e->n & 1) put(e, 0xd503201f);

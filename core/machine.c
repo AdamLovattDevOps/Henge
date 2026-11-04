@@ -11,6 +11,8 @@
 
 extern void hv_exit(void);
 extern void hv_helper_entry(void);
+extern void hv_helper_thunk(void);
+extern void hv_chain_thunk(void);
 
 static int init_rest(HvMachine *m);
 
@@ -27,12 +29,18 @@ int hv_machine_init_jit(HvMachine *m, void *rx, void *rw, size_t jit_bytes) {
 }
 
 static int init_rest(HvMachine *m) {
-    m->blocks = calloc(HV_MAX_BLOCKS, sizeof(HvBlock));
+    /* As many blocks as the region holds (a block is at least ~160 bytes of
+       code), so the region filling, not this table, is what flushes; two
+       chainable exits each at most. Untouched entries cost nothing. */
+    size_t bytes = m->jit.capacity * sizeof(uint32_t);
+    m->max_blocks = (uint32_t)(bytes / 160 < 4096 ? 4096 : bytes / 160);
+    m->max_slots = m->max_blocks * 2;
+    m->blocks = calloc(m->max_blocks, sizeof(HvBlock));
     if (!m->blocks) return -1;
     m->stop_pc = ~0ull;
     m->chain = 1;
-    m->slots = calloc(HV_MAX_SLOTS, sizeof *m->slots);
-    m->slot_site = calloc(HV_MAX_SLOTS, sizeof *m->slot_site);
+    m->slots = calloc(m->max_slots, sizeof *m->slots);
+    m->slot_site = calloc(m->max_slots, sizeof *m->slot_site);
     if (!m->slots || !m->slot_site) return -1;
     pthread_mutex_init(&m->big_mu, NULL);
     pthread_cond_init(&m->big_cv, NULL);
@@ -360,6 +368,8 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
     hv_ijc_switch(cpu);
     cpu->exit_routine = (uint64_t)hv_exit;
     cpu->helper_routine = (uint64_t)hv_helper_entry;
+    cpu->helper_thunk = (uint64_t)hv_helper_thunk;
+    cpu->chain_thunk = (uint64_t)hv_chain_thunk;
     cpu->el = 1;
     cpu->spsel = 1;
     cpu->daif = HV_PSTATE_DAIF;

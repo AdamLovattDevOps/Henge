@@ -23,12 +23,18 @@
 #define CPU_HELPER_RET 0x358
 #define CPU_SP 0xf8
 #define CPU_HOST_SP 0x410
+#define CPU_PC 0x100
+#define CPU_EXIT 0x110
+#define CPU_EXIT_REQ 0x3c0
+#define CPU_LAST_STUB 0x3c8
 
     .text
     .p2align 2
     .globl _hv_enter
     .globl _hv_exit
     .globl _hv_helper_entry
+    .globl _hv_helper_thunk
+    .globl _hv_chain_thunk
     .globl _hv_fp_enter
     .globl _hv_fp_leave
 
@@ -180,6 +186,39 @@ _hv_helper_entry:
     mov sp, x0
     ldr x0, [x28, #CPU_HELPER_RET]
     br x0
+
+// Shared tails of translated code, so each call site is a few words (the
+// stub's data follows its blr; blocks reach these through HvCpu, not BL, since
+// the JIT region may be further away than a BL goes).
+//
+// hv_helper_thunk: a helper call. The site did `str x30, [x28, #x30]` and
+// `blr`; x30 points at its HvHelperInfo (16 bytes), after which the block
+// resumes (`ldr x0, [x28]` there reloads guest x0).
+_hv_helper_thunk:
+    stp x0, x1, [x28]
+    mov x0, x30
+    add x30, x30, #16
+    b _hv_helper_entry
+
+// hv_chain_thunk: a chainable exit's slow side. The site did `str x30, [x28, #x30]`
+// and `blr`; x30 points at {slot address, target VA}. Follows the slot when
+// chained beyond the stub's B (out of range), else leaves for the dispatcher,
+// naming the slot (last_stub) unless an exit was asked for.
+_hv_chain_thunk:
+    mov x7, x30
+    ldr x30, [x28, #240]
+    ldr w15, [x28, #CPU_EXIT_REQ]
+    cbnz w15, 1f
+    ldr x6, [x7]
+    ldr x15, [x6]
+    cbz x15, 2f
+    br x15
+2:  str x6, [x28, #CPU_LAST_STUB]
+1:  stp x0, x1, [x28]
+    ldr x0, [x7, #8]
+    str x0, [x28, #CPU_PC]
+    ldr x1, [x28, #CPU_EXIT]
+    br x1
 
 // hv_fp_enter(cpu): the guest's FPCR and FPSR into the host registers.
 _hv_fp_enter:

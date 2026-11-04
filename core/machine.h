@@ -63,6 +63,7 @@ typedef struct HvStats {
     uint64_t syncs, sync_ticks;        /* TLBI acks waited for, and host ticks spent waiting */
     uint64_t dev_waits, dev_wait_ticks; /* device lock taken while another CPU held it */
     uint64_t tr_waits, tr_wait_ticks;   /* translation lock likewise */
+    uint64_t words_inline, words_ool, words_pool; /* translated code size by part */
     uint64_t code_protects;   /* pages that became code (every CPU's TLB scanned for writable entries) */
     uint64_t tlb_miss_kind[4]; /* TLB misses: EL0 empty, EL0 other page there, EL1 empty, EL1 other page there */
     uint64_t slow_why[6];     /* slow accesses by cause: MMIO, code-page write, page end, TLB miss, other, TLB entry there but mismatched */
@@ -141,6 +142,7 @@ typedef struct HvMachine {
     HvBlock *hash[HV_BLOCK_HASH];
     HvBlock *blocks;
     int nblocks;
+    uint32_t max_blocks, max_slots; /* sized from the JIT region (machine.c) */
     int flush_pending;   /* set by helpers; the dispatcher flushes once the block has left */
 
     void *gic;
