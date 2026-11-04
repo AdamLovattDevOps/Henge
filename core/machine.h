@@ -75,7 +75,11 @@ typedef struct HvStats {
     uint64_t slow_kind[12];   /* hv_mem_emulate calls by HV_MEM_* kind */
     uint64_t light_kind[4];
     uint64_t light_fail[4];
-    uint64_t light_walks;     /* of hv_ijc_resolve's lookups, ones that walked for the target page */   /* hv_ijc_resolve could not: chaining off/odd target, filters full, no TLB entry, block not made yet */   /* the same for hv_ijc_resolve's fills */
+    uint64_t light_walks;
+    uint64_t posted_kind[4];
+    uint64_t race_kind[3];    /* remote drops that raced: walk under way, cache fill under way, either during the drop */  /* TLBIs other CPUs had to do themselves: a page or small range that raced, a big range, the rest (ASID, all) */
+    uint64_t range_spared;    /* big user-range TLBIs that needed no cached targets dropped */
+    uint64_t tlb_range_flushes; /* and that dropped only the TLB entries in the range */     /* of hv_ijc_resolve's lookups, ones that walked for the target page */   /* hv_ijc_resolve could not: chaining off/odd target, filters full, no TLB entry, block not made yet */   /* the same for hv_ijc_resolve's fills */
     uint64_t fill_kind[4];    /* ijc fills into an empty slot, over another live salt, over the same salt, over a dead salt */
     uint64_t reset_why[8];    /* cache drops: full flush, TLBI by ASID, TLBI user VA, TLBI kernel VA, code change, user VA in every ASID (whole user half), keyed filter full, big user range */
     uint64_t why[6];          /* dispatcher entries by cause: chain fill, kick, exception/sysreg, interrupt, cached target, cache miss */
@@ -132,6 +136,10 @@ typedef struct HvPerCpu {
        entries instead of the whole address space's. Emptied with the user half. */
     uint64_t *ucode;
     uint32_t ucode_count;
+    /* Per user id: which 32 MB chunks of its VA (hashed into 256) have cached
+       targets, so a TLBI for a big range elsewhere (data, nearly always) drops nothing. */
+    uint64_t (*cid_chunks)[4];
+    uint64_t last_fill[2];   /* page ^ salt of the last fill in each half: its filter bits are set already */
     struct HvBlock *jc[1 << HV_JC_BITS]; /* direct-mapped cache in front of the hash */
     /* WFI sleeps on this; device threads, the GIC and other CPUs signal it. */
     pthread_mutex_t wake_mu;

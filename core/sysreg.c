@@ -354,7 +354,7 @@ void hv_tlbi_apply(HvCpu *cpu, uint32_t op1, uint32_t crn, uint32_t crm, uint32_
             /* Reserved granule or a big range: drop that half. */
             if ((va >> 55) & 1 || !shift) hv_tlb_flush(cpu);
             else {
-                hv_tlb_flush_user(cpu);
+                hv_tlb_flush_user_range(cpu, va, len);
                 hv_tlb_stash_drop(cpu, all_asids ? -1 : (int)(xt >> 48));
                 cpu->m->stats.reset_why[7]++;
                 hv_ijc_drop_range(cpu, va, len, all_asids ? -1 : (int)(xt >> 48));
@@ -425,12 +425,35 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
                cache lookup and chained exit checks exit_req first). */
             int by_va = crn == 8 && op1 == 0 && (crm == 1 || crm == 3) && (op2 & 1);
             uint64_t va = (uint64_t)((int64_t)((xt & 0xfffffffffffull) << 20) >> 8);
+            int asid = op2 == 3 || op2 == 7 ? -1 : (int)(xt >> 48);
+            /* A small range (RVAE1IS and kin): page by page, the same way. */
+            uint64_t npages = 0;
+            int by_range = crn == 8 && op1 == 0 && (crm == 2 || crm == 5) && (op2 & 1);
+            if (by_range && ((xt >> 46) & 3) == 2) { /* 16 KB granule, as xnu uses */
+                npages = (((xt >> 39) & 31) + 1) << (5 * ((xt >> 44) & 3) + 1);
+                va = (uint64_t)((int64_t)((xt & 0x1fffffffffull) << (64 - 37)) >> (64 - 37 - 14));
+                if (npages > 32) npages = 0;
+            } else if (by_va) {
+                npages = 1;
+            }
             uint64_t seq[HV_MAX_CPUS] = {0};
             for (int i = 0; i < m->ncpus; i++) {
                 HvCpu *c = m->cpus[i];
                 if (!c || c == cpu) continue;
-                /* Done from here entirely if it can be; else c does it, and we wait. */
-                if (by_va && hv_tlbi_drop_remote_va(c, va, op2 == 3 || op2 == 7 ? -1 : (int)(xt >> 48))) continue;
+                /* Done from here entirely if it can be; else c does it, and we wait.
+                   A drop that raced a page walk or cache fill of c's (they are
+                   short) is tried again a few times first. */
+                int done = npages > 0, why = !npages ? (by_range ? 1 : 2) : 0;
+                for (uint64_t p = 0; done && p < npages; p++) {
+                    uint64_t pva = va + (p << HV_TLB_PAGE_BITS);
+                    int r = 0;
+                    for (int t = 0; t < 4 && (r = hv_tlbi_drop_remote_va(c, pva, asid)) == 0; t++)
+                        for (int s = 0; s < 64; s++) __asm__ volatile("yield");
+                    done = r == 1;
+                    if (r < 0) why = 3;
+                }
+                if (done) continue;
+                m->stats.posted_kind[why]++;
                 seq[i] = hv_cpu_post_tlbi(c, op1, crn, crm, op2, xt);
             }
             for (int i = 0; i < m->ncpus; i++)

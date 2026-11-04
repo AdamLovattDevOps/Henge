@@ -33,6 +33,7 @@ void hv_mmu_walk(HvCpu *cpu, uint64_t va, HvAccess acc, int el, HvWalk *out);
 void hv_tlb_flush(HvCpu *cpu);
 void hv_tlb_flush_va(HvCpu *cpu, uint64_t va);
 void hv_tlb_flush_user(HvCpu *cpu);
+void hv_tlb_flush_user_range(HvCpu *cpu, uint64_t va, uint64_t len);
 void hv_tlb_switch_user(HvCpu *cpu, uint64_t old_ttbr0, uint64_t new_ttbr0); /* a process switch */
 void hv_tlb_stash_drop(HvCpu *cpu, int asid); /* asid -1: all */
 /* Empty the indirect-branch cache for all user (0) or for kernel (1) VAs. */
@@ -59,7 +60,9 @@ void *hv_ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags);
 /* Another CPU's TLBI of one page: drop target's entries for it from here. 1 if
    that is enough (no page walk of target's raced it), 0 if target must do it
    itself and be waited for. Its branch cache is still target's own business. */
-int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid); /* asid -1: all */       /* just the cached branch targets in the page */
+/* asid -1: all. 1: done; 0: raced the target's own page walk or cache fill
+   (try again); -1: the target has to do it itself. */
+int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid);       /* just the cached branch targets in the page */
 void hv_ijc_drop_range(HvCpu *cpu, uint64_t va, uint64_t len, int asid);
 void hv_ucode_add(HvCpu *cpu, uint64_t va); /* a user target was cached in this page (current address space) */
 void hv_tlb_protect_code(HvCpu *cpu, const uint8_t *host_page);

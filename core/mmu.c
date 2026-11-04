@@ -170,6 +170,7 @@ static uint32_t ucode_slot(uint64_t key) {
 }
 
 static void ucode_clear(HvPerCpu *m) {
+    if (m) m->last_fill[0] = 0;
     if (m && m->ucode) memset(m->ucode, 0, (sizeof *m->ucode) << HV_UCODE_BITS);
     if (m) m->ucode_count = 0;
 }
@@ -204,11 +205,14 @@ void hv_ucode_add(HvCpu *cpu, uint64_t va) {
 /* A user id no tag in the tables uses yet; when they run out, empty the user tables and start over. */
 static uint16_t fresh_cid(HvCpu *cpu) {
     if (cpu->next_cid == 0 || cpu->next_cid > 0xffff) {
+        if (cpu->pc_state && cpu->pc_state->cid_chunks) memset(cpu->pc_state->cid_chunks, 0, 65536 * sizeof *cpu->pc_state->cid_chunks);
+        if (cpu->pc_state) cpu->pc_state->last_fill[0] = cpu->pc_state->last_fill[1] = 0;
         ijc_clear(cpu, 0);
         ucode_clear(cpu->pc_state);
         memset(cpu->asid_cid, 0, sizeof cpu->asid_cid);
         cpu->next_cid = 1;
     }
+    if (cpu->pc_state && cpu->pc_state->cid_chunks) memset(cpu->pc_state->cid_chunks[cpu->next_cid], 0, sizeof cpu->pc_state->cid_chunks[0]);
     return (uint16_t)cpu->next_cid++;
 }
 
@@ -233,6 +237,7 @@ void hv_ijc_drop_asid(HvCpu *cpu, uint16_t asid) {
 }
 
 void hv_ijc_reset(HvCpu *cpu, int kernel) {
+    if (cpu->pc_state) cpu->pc_state->last_fill[0] = cpu->pc_state->last_fill[1] = 0;
     if (cpu->m) {
         cpu->m->stats.ijc_resets++;
         memset(cpu->pc_state->ijc_pages[kernel], 0, sizeof cpu->pc_state->ijc_pages[kernel]);
@@ -271,6 +276,25 @@ void hv_tlb_flush_user(HvCpu *cpu) {
             uint64_t tag = e->read_tag != HV_TLB_INVALID ? e->read_tag + HV_TLB_ADJ : e->exec_tag != HV_TLB_INVALID ? e->exec_tag : e->write_tag + HV_TLB_ADJ;
             if (e->read_tag != HV_TLB_INVALID || e->exec_tag != HV_TLB_INVALID || e->write_tag != HV_TLB_INVALID) if (!((tag >> 55) & 1)) memset(e, 0x80, sizeof *e);
         }
+}
+
+/* A TLBI for a big user range: only the user entries filled since the last
+   flush that fall in it (all of them if there were too many to list). */
+void hv_tlb_flush_user_range(HvCpu *cpu, uint64_t va, uint64_t len) {
+    uint32_t n = cpu->nuser_fills;
+    if (n > HV_USER_FILLS) {
+        hv_tlb_flush_user(cpu);
+        return;
+    }
+    if (cpu->m) cpu->m->stats.tlb_range_flushes++;
+    uint64_t lo = va & 0x00ffffffffffffffull;
+    for (uint32_t k = 0; k < n; k++) {
+        HvTlbEntry *e = &cpu->tlb[0][0] + cpu->user_fills[k];
+        if (e->read_tag == HV_TLB_INVALID && e->exec_tag == HV_TLB_INVALID && e->write_tag == HV_TLB_INVALID) continue;
+        uint64_t tag = e->read_tag != HV_TLB_INVALID ? e->read_tag + HV_TLB_ADJ : e->exec_tag != HV_TLB_INVALID ? e->exec_tag : e->write_tag + HV_TLB_ADJ;
+        if ((tag >> 55) & 1) continue; /* the slot holds a kernel page by now */
+        if (((tag & 0x00ffffffffffffffull) - lo) < len) memset(e, 0x80, sizeof *e); /* tagged addresses: by the low 56 bits */
+    }
 }
 
 /* A page just got translated code: writes to it must take the slow path from now
@@ -377,6 +401,16 @@ void hv_ijc_drop_range(HvCpu *cpu, uint64_t va, uint64_t len, int asid) {
     uint32_t cid = (uint32_t)(salt >> 48);
     if (!cid) return; /* nothing cached for it */
     uint64_t first = va >> HV_TLB_PAGE_BITS, last = (va + len - 1) >> HV_TLB_PAGE_BITS;
+    {   /* nothing cached in the chunks the range covers: nothing to drop */
+        uint64_t c0 = va >> 25, c1 = (va + len - 1) >> 25;
+        int any = c1 - c0 >= 255;
+        for (uint64_t c = c0; !any && c <= c1; c++)
+            any = cpu->pc_state->cid_chunks[cid][(c & 255) >> 6] >> (c & 63) & 1;
+        if (!any) {
+            m->stats.range_spared++;
+            return;
+        }
+    }
     if (last - first >= 4096) { /* scanning the whole set costs more than the cold start: drop the address space */
         hv_ijc_drop_asid(cpu, (uint16_t)asid);
         return;
@@ -474,9 +508,9 @@ uint32_t hv_mmu_access(HvCpu *cpu, uint64_t va, HvAccess acc, int el, uint64_t *
 int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid) {
     HvPerCpu *p = target->pc_state;
     uint32_t s1 = __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST);
-    if (s1 & 1) return 0; /* mid-walk: it may be about to fill from the old table */
+    if (s1 & 1) { target->m->stats.race_kind[0]++; return 0; } /* mid-walk: it may be about to fill from the old table */
     uint32_t c1 = __atomic_load_n(&p->ijc_seq, __ATOMIC_SEQ_CST);
-    if (c1 & 1) return 0; /* caching a block it may have looked up through the old mapping */
+    if (c1 & 1) { target->m->stats.race_kind[1]++; return 0; } /* caching a block it may have looked up through the old mapping */
     if (!((va >> 55) & 1)) stash_drop(p, asid);
     uint32_t idx = (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1);
     for (int t = 0; t < 3; t++) { /* the slot whatever its tag byte, as hv_tlb_flush_va_asid does */
@@ -489,10 +523,12 @@ int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid) {
     /* Its cached branch targets in the page too: a cache fill checks the TLB
        entry first (hv_ijc_fill_checked), so one after this sees it gone, and one
        during it changed ijc_seq. */
-    if (!ijc_drop_va(target, va, asid, 1)) return 0;
+    if (!ijc_drop_va(target, va, asid, 1)) return -1; /* only target can do it: no use trying again */
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    return __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST) == s1 && /* no fill in between */
-           __atomic_load_n(&p->ijc_seq, __ATOMIC_SEQ_CST) == c1;
+    int ok = __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST) == s1 && /* no fill in between */
+             __atomic_load_n(&p->ijc_seq, __ATOMIC_SEQ_CST) == c1;
+    if (!ok) target->m->stats.race_kind[2]++;
+    return ok;
 }
 
 const uint32_t *hv_mmu_fetch(HvCpu *cpu, uint64_t va, uint64_t *pa, uint32_t *avail) {
@@ -573,10 +609,15 @@ void hv_ijc_fill(HvCpu *cpu, HvBlock *b) {
     ent[0] = tag;
     ent[1] = (uint64_t)(uintptr_t)b->code;
     pcs->ijc_tables_used |= 1u << (b->flags & (HV_IJC_TABLES - 1));
+    /* The filters below are per page: the next fill is mostly in the same one. */
+    uint64_t pkey = (b->va & ~(uint64_t)PAGE_MASK) ^ cpu->ijc_salt[kernel] ^ 1;
+    if (pcs->last_fill[kernel] == pkey) return;
     if (!kernel) {
         hv_ucode_add(cpu, b->va);
         uint32_t h = (uint32_t)(b->va >> HV_TLB_PAGE_BITS) & 0xffff;
         pcs->ijc_pages[0][h >> 6] |= 1ull << (h & 63);
+        uint32_t ch = (uint32_t)(b->va >> 25) & 255, cid = (uint32_t)(cpu->ijc_salt[0] >> 48); /* the id after any reset in ucode_add */
+        pcs->cid_chunks[cid][ch >> 6] |= 1ull << (ch & 63);
     }
     uint32_t k = hv_ijc_key(b->va, cpu->ijc_salt[kernel]);
     if (!(pcs->ijc_keyed[k >> 6] >> (k & 63) & 1)) {
@@ -589,6 +630,7 @@ void hv_ijc_fill(HvCpu *cpu, HvBlock *b) {
             pcs->ijc_keyed_count = 0;
         }
     }
+    pcs->last_fill[kernel] = (b->va & ~(uint64_t)PAGE_MASK) ^ cpu->ijc_salt[kernel] ^ 1; /* the salt after any reset above */
 }
 
 /* An indirect-branch cache miss in translated code, before the dispatcher: if
@@ -626,11 +668,7 @@ int hv_ijc_fill_checked(HvCpu *cpu, HvBlock *b) {
 static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags);
 
 void *hv_ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
-    HvPerCpu *p = cpu->pc_state;
-    __atomic_add_fetch(&p->ijc_seq, 1, __ATOMIC_SEQ_CST);
-    void *r = ijc_resolve(cpu, va, flags);
-    __atomic_add_fetch(&p->ijc_seq, 1, __ATOMIC_RELEASE);
-    return r;
+    return ijc_resolve(cpu, va, flags);
 }
 
 static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
@@ -682,7 +720,8 @@ static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
         m->stats.light_kind[k]++;
         m->stats.ijc_light++;
     }
-    hv_ijc_fill(cpu, b);
+    /* Cached only while the TLB still maps it, inside ijc_seq (see hv_ijc_fill_checked). */
+    if (!hv_ijc_fill_checked(cpu, b)) return 0;
     return b->code;
 }
 
