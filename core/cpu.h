@@ -58,12 +58,14 @@ typedef struct HvCpu {
     uint64_t esr_el1;        /* 0x3b0 */
     uint64_t far_el1;        /* 0x3b8 */
     uint32_t exit_req;       /* 0x3c0: set (by another thread too) to make chained blocks leave */
-    uint32_t pad1;
+    uint32_t el0_cnt;        /* 0x3c4: CNTKCTL_EL1 bits 1..0 (EL0VCTEN, EL0PCTEN), for translated counter reads */
     uint64_t last_stub;      /* 0x3c8: slot of the unchained exit just taken, or 0 */
     uint64_t ijc;            /* 0x3d0: indirect-branch cache, HV_IJC_TABLES tables of {tag, entry} */
     uint64_t ijc_salt[2];    /* 0x3d8: tags are VA ^ salt, [0] for user (EL0) tables, [1] kernel (see hv_ijc_* in mmu.c) */
     uint64_t miss_site;      /* 0x3e8: --stats: guest PC of the branch whose cache lookup just missed */
-    uint64_t pad0[2];        /* keeps the TLB at 0x400 */
+    uint64_t excl_addr;      /* 0x3f0: exclusive monitor: guest VA, or ~0 when clear */
+    uint32_t excl_size;      /* 0x3f8: bytes LDXR read in C (and saved in excl_val), 0 if translated code set the monitor */
+    uint32_t pad0;           /* keeps the TLB at 0x400 */
     /* 0x400: [0] EL0 and unprivileged accesses, [1] EL1, [2] EL1 with PSTATE.PAN set,
        so toggling PAN (the kernel does it around every user copy) flushes nothing. */
     HvTlbEntry tlb[3][HV_TLB_SIZE];
@@ -73,11 +75,10 @@ typedef struct HvCpu {
     uint32_t el;
     uint32_t spsel;
 
-    /* Exclusive monitor, emulated: STXR succeeds by compare-and-swap against the
-       value LDXR saw, the way QEMU does it. */
-    uint64_t excl_addr;      /* guest VA, or ~0 when clear */
+    /* Exclusive monitor (with excl_addr and excl_size above). One CPU: translated
+       LDXR/STXR only compare the address. The C path (pairs, slow memory) makes
+       STXR a compare-and-swap against the value LDXR saw, the way QEMU does it. */
     uint64_t excl_val[2];
-    uint32_t excl_size;
 
     uint64_t tcr_el1;
     uint64_t ttbr0_el1;
@@ -107,6 +108,7 @@ typedef struct HvCpu {
        its ASID a fresh id. Ids only grow until they run out, then the tables
        are cleared. */
     uint16_t asid_cid[65536];
+    uint16_t cid_asid[65536]; /* --stats: the ASID a user id was given to (to tell live tags from dead ones) */
     uint32_t next_cid, kernel_gen;
 
     /* Generic timer: physical and virtual. The counter is host time scaled to 24 MHz. */
@@ -143,16 +145,20 @@ typedef struct HvCpu {
 #define HV_CPU_ESR_EL1     0x3b0
 #define HV_CPU_FAR_EL1     0x3b8
 #define HV_CPU_EXIT_REQ    0x3c0
+#define HV_CPU_EL0_CNT     0x3c4
 #define HV_CPU_LAST_STUB   0x3c8
 #define HV_CPU_IJC         0x3d0
 #define HV_CPU_IJC_SALT    0x3d8
 #define HV_CPU_MISS_SITE   0x3e8
+#define HV_CPU_EXCL_ADDR   0x3f0
+#define HV_CPU_EXCL_SIZE   0x3f8
 #define HV_CPU_TLB         0x400
 
 /* Indirect-branch cache: one table per block-flags value, 64K entries of 16 bytes,
    indexed by ((va ^ va >> 16) >> 2) so code at the same offset in different pages spreads out. */
-#define HV_IJC_BITS 16
+#define HV_IJC_BITS 18
 #define HV_IJC_TABLES 16
+#define HV_UCODE_BITS 18
 #define HV_IJC_TABLE_BYTES ((1u << HV_IJC_BITS) * 16)
 #define HV_CPU_TLB_EL      (HV_TLB_SIZE * 32)
 
@@ -174,6 +180,9 @@ _Static_assert(offsetof(HvCpu, far_el1) == HV_CPU_FAR_EL1, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, exit_req) == HV_CPU_EXIT_REQ, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, last_stub) == HV_CPU_LAST_STUB, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, ijc_salt) == HV_CPU_IJC_SALT, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, excl_addr) == HV_CPU_EXCL_ADDR, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, el0_cnt) == HV_CPU_EL0_CNT, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, excl_size) == HV_CPU_EXCL_SIZE, "HvCpu layout");
 _Static_assert(sizeof(HvTlbEntry) == 32, "TLB entries are indexed with lsl #5");
 
 /* Why the last block returned to the dispatcher. */

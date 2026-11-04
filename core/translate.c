@@ -22,7 +22,7 @@ typedef struct {
     uint32_t at, kind, idx;
 } LitFix;
 
-enum { OOL_EXIT, OOL_SLOW, OOL_SYS };
+enum { OOL_EXIT, OOL_SLOW, OOL_SYS, OOL_MRS };
 
 typedef struct {
     uint32_t at;        /* the branch that jumps here */
@@ -465,10 +465,55 @@ static void translate_branch_reg(Emit *e, uint32_t insn, uint64_t pc) {
    address and then the host address, T and U index the TLB and then stand in
    for x18/x28 operands. A miss goes out of line to hv_mem_emulate, which does
    the whole instruction (writeback included) and comes back to the join. */
+static void translate_mem(Emit *e, uint32_t insn, uint64_t pc);
+
+/* LDXR/LDAXR and STXR/STLXR (not the pairs). There is one CPU, so the monitor
+   is just the address: LDXR is a plain load that records it, STXR a plain
+   store if it is still the recorded one. Exceptions and CLREX clear it, so an
+   interrupt between the two makes the STXR fail and the guest retry, as on
+   hardware. The access itself goes through the ordinary fast path. */
+static void translate_excl(Emit *e, uint32_t insn, uint64_t pc) {
+    uint32_t size = insn >> 30;
+    int rn = (insn >> 5) & 0x1f, rt = insn & 0x1f, rs = (insn >> 16) & 0x1f;
+    int load = (insn >> 22) & 1;
+    int a = rn;
+    if (rn == 31 || is_stolen(rn)) {
+        put(e, LDR_X(15, 28, slot_of(rn)));
+        a = 15;
+    }
+    if (load) {
+        put(e, STR_X(a, 28, HV_CPU_EXCL_ADDR));
+        put(e, STR_X(31, 28, HV_CPU_EXCL_SIZE)); /* xzr: set by translated code */
+        translate_mem(e, size << 30 | 0x39400000u | (uint32_t)rn << 5 | (uint32_t)rt, pc); /* ldr{b,h} rt, [rn] */
+        return;
+    }
+    put(e, LDR_X(6, 28, HV_CPU_EXCL_ADDR));
+    put(e, 0xca000000u | (uint32_t)a << 16 | 6 << 5 | 6); /* eor x6, x6, xa */
+    uint32_t to_fail = e->n;
+    put(e, CBNZ_X(6));
+    put(e, 0x92800006u);                                   /* movn x6, #0: clear */
+    put(e, STR_X(6, 28, HV_CPU_EXCL_ADDR));
+    translate_mem(e, size << 30 | 0x39000000u | (uint32_t)rn << 5 | (uint32_t)rt, pc); /* str{b,h} rt, [rn] */
+    put_const_to(e, rs, 0);
+    uint32_t to_done = e->n;
+    put(e, B_OP);
+    patch_branch(&e->w[to_fail], (int64_t)e->n - to_fail);
+    put(e, 0x92800006u);
+    put(e, STR_X(6, 28, HV_CPU_EXCL_ADDR));
+    put_const_to(e, rs, 1);
+    patch_branch(&e->w[to_done], (int64_t)e->n - to_done);
+}
+
 static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
     HvMemOp op;
     if (hv_mem_decode(insn, &op) != 0) {
         put_helper(e, pc, insn, HV_OP_UNDEF);
+        return;
+    }
+    static int c_excl = -1; /* HV_C_EXCL: keep every exclusive on the C path (debugging) */
+    if (c_excl < 0) c_excl = getenv("HV_C_EXCL") != NULL;
+    if (op.kind == HV_MEM_EXCL && op.bytes == 1u << op.size && !e->slow_mem && !c_excl) {
+        translate_excl(e, insn, pc);
         return;
     }
     if (e->slow_mem || op.kind == HV_MEM_EXCL || op.kind == HV_MEM_CASP) {
@@ -757,13 +802,49 @@ static void put_pstate_bit(Emit *e, int rt, int bit, int read) {
     unspill(e, s, 3);
 }
 
-static int translate_sysreg_inline(Emit *e, uint32_t insn) {
+/* The guest's counter is the host's mach_absolute_time (CNTVOFF is 0): the
+   counter register the commpage names plus the commpage's offset, read the way
+   libsystem does. EL0 reads check CNTKCTL_EL1's enables and trap through the
+   helper when they are off. */
+#define COMMPAGE_TIMEBASE_OFFSET 0xfffffc088ull
+#define COMMPAGE_TIMEBASE_TYPE   0xfffffc090ull
+static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical) {
+    static int type = -1;
+    if (type < 0) type = *(volatile uint8_t *)(uintptr_t)COMMPAGE_TIMEBASE_TYPE;
+    if (type == 0) return 0; /* the kernel's own path: leave it to the helper */
+    int rt = insn & 0x1f;
+    if (rt == 31) return 1;
+    if (!(e->flags & HV_BLOCK_EL1)) {
+        put(e, 0xb9400000u | (HV_CPU_EL0_CNT / 4) << 10 | 28 << 5 | 6); /* ldr w6, [x28, #el0_cnt] */
+        put(e, 0x36000000u | (physical ? 0u : 1u) << 19 | 6);         /* tbz w6, #enable, helper (patched) */
+        put_ool(e, (Ool){.kind = OOL_MRS, .pc = pc, .insn = insn});
+    }
+    uint32_t slow = e->nool - 1;
+    int el0 = !(e->flags & HV_BLOCK_EL1);
+    int r = is_stolen(rt) ? 15 : rt;
+    if (type == 1) put(e, 0xd5033fdfu);                                  /* isb; then CNTVCT_EL0 */
+    put(e, (type == 1 ? 0xd53be040u : type == 2 ? 0xd53be0c0u : 0xd53cfac0u) | (uint32_t)r);
+    put_lit(e, 6, COMMPAGE_TIMEBASE_OFFSET);
+    put(e, LDR_X(6, 6, 0));
+    put(e, ADD_LSL(r, r, 6, 0));
+    if (r != rt) put(e, STR_X(r, 28, slot_of(rt)));
+    if (el0) e->ool[slow].join = e->n;
+    return 1;
+}
+
+static int translate_sysreg_inline(Emit *e, uint32_t insn, uint64_t pc) {
     if (((insn >> 19) & 3) == 0) return 0; /* MSR (immediate) */
     int read = (insn >> 21) & 1, rt = insn & 0x1f;
     uint32_t reg = (insn >> 5) & 0xffff;
     int el1 = (e->flags & HV_BLOCK_EL1) != 0, spx = (e->flags & HV_BLOCK_SPX) != 0;
     int fp_ok = !(e->flags & HV_BLOCK_FPOFF);
     switch (reg) {
+    case SR(3, 3, 14, 0, 2): /* CNTVCT_EL0 */
+    case SR(3, 3, 14, 0, 6): /* CNTVCTSS_EL0 */
+    case SR(3, 3, 14, 0, 1): /* CNTPCT_EL0 */
+    case SR(3, 3, 14, 0, 5): /* CNTPCTSS_EL0 */
+        if (!read) return 0;
+        return translate_counter(e, insn, pc, reg == SR(3, 3, 14, 0, 1) || reg == SR(3, 3, 14, 0, 5));
     case SR(3, 3, 4, 2, 0): /* NZCV */
         put_native_sysreg(e, insn, read);
         return 1;
@@ -861,7 +942,7 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
         translate_mem(e, insn, pc);
         return 0;
     case HV_INSN_SYSREG:
-        if (translate_sysreg_inline(e, insn)) return 0;
+        if (translate_sysreg_inline(e, insn, pc)) return 0;
         if (((insn >> 21) & 1) && ((insn >> 19) & 3)) { /* MRS */
             put_helper(e, pc, insn, HV_OP_MRS);
             return 0;
@@ -900,9 +981,35 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
                 put_ool(e, (Ool){.kind = OOL_EXIT, .pc = pc + 4});
                 return 0;
             }
+            if (!imm_form && reg == SR(3, 0, 4, 2, 0) && (e->flags & HV_BLOCK_EL1) && !e->no_ijc) {
+                /* MSR SPSel, Xt at EL1: bit 0 of Xt picks the next block's flags, so pick the
+                   cache at run time (the immediate form knows it now). */
+                int rt = insn & 0x1f, r = rt;
+                if (rt != 31 && is_stolen(rt)) {
+                    put(e, LDR_X(15, 28, slot_of(rt)));
+                    r = 15;
+                }
+                uint32_t flags = e->flags, to_set = 0;
+                if (rt != 31) {
+                    to_set = e->n;
+                    put(e, 0x37000000u | (uint32_t)r); /* tbnz xr, #0, set (patched below) */
+                }
+                for (int set = 0; set < (rt == 31 ? 1 : 2); set++) {
+                    if (set) patch_branch(&e->w[to_set], (int64_t)e->n - to_set);
+                    put(e, STP_X(0, 1, 28, 0));
+                    put_lit(e, 0, pc + 4);
+                    put(e, STR_X(0, 28, HV_CPU_PC));
+                    e->flags = set ? flags | HV_BLOCK_SPX : flags & ~HV_BLOCK_SPX;
+                    put_ijc_jump(e);
+                    e->flags = flags;
+                }
+                return 1;
+            }
+            /* TTBR0 (a process switch) and SCTLR carry on too: the indirect-branch
+               cache reads the new salt at run time, and a change that matters to
+               chained exits sets exit_req. */
             if (!imm_form && reg != SR(3, 0, 1, 0, 2) && reg != SR(3, 0, 4, 2, 3) && reg != SR(3, 0, 4, 2, 0) &&
-                reg != SR(3, 0, 1, 0, 0) && reg != SR(3, 0, 2, 0, 0) && reg != SR(3, 0, 2, 0, 1) && reg != SR(3, 0, 2, 0, 2) &&
-                !e->no_ijc) {
+                reg != SR(3, 0, 2, 0, 1) && reg != SR(3, 0, 2, 0, 2) && !e->no_ijc) {
                 put_branch_exit(e, pc + 4);
                 return 1;
             }
@@ -952,6 +1059,7 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
         return 1;
     case HV_INSN_EXCEPTION:
         put_helper(e, pc, insn, HV_OP_EXCEPTION);
+        if ((insn & 0xffe0001f) == 0xd4000002 && (e->flags & HV_BLOCK_EL1)) return 0; /* HVC returns like a call */
         put_exit(e, pc + 4);
         return 1;
     case HV_INSN_ERET:
@@ -991,7 +1099,7 @@ static void emit_ool(Emit *e) {
             e->cur_pc = o->site;
             put_branch_exit(e, o->pc); /* only branches use OOL exits */
         } else {
-            put_helper(e, o->pc, o->insn, o->kind == OOL_SYS ? HV_OP_SYS : HV_OP_MEM);
+            put_helper(e, o->pc, o->insn, o->kind == OOL_SYS ? HV_OP_SYS : o->kind == OOL_MRS ? HV_OP_MRS : HV_OP_MEM);
             put(e, B_OP);
             patch_branch(&e->w[e->n - 1], (int64_t)o->join - (e->n - 1));
         }

@@ -46,6 +46,8 @@ void hv_ijc_drop_asid(HvCpu *cpu, uint16_t asid);
 void hv_ijc_switch(HvCpu *cpu);
 void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid); /* asid -1: every address space */
 void hv_ijc_drop_va(HvCpu *cpu, uint64_t va, int asid);       /* just the cached branch targets in the page */
+void hv_ijc_drop_range(HvCpu *cpu, uint64_t va, uint64_t len, int asid);
+void hv_ucode_add(HvCpu *cpu, uint64_t va); /* a user target was cached in this page (current address space) */
 void hv_tlb_protect_code(HvCpu *cpu, const uint8_t *host_page);
 
 /* Translates for a C access of `len` bytes that stays inside one 16 KB page,

@@ -187,7 +187,10 @@ static int write_reg(HvCpu *cpu, uint32_t reg, uint64_t v) {
     case R(3, 0, 1, 0, 0): { /* SCTLR: xnu flips the PAC enables (EnIA/IB/DA/DB) on every process switch */
         uint64_t changed = cpu->sctlr_el1 ^ v;
         cpu->sctlr_el1 = v;
-        if (changed & (1u | 1u << 19 | 1u << 24 | 1u << 25)) hv_tlb_flush(cpu); /* M, WXN, E0E, EE: what translations depend on */
+        if (changed & (1u | 1u << 19 | 1u << 24 | 1u << 25)) { /* M, WXN, E0E, EE: what translations depend on */
+            hv_tlb_flush(cpu);
+            __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED); /* the block's chained exit must not follow the old mapping */
+        }
         return 0;
     }
     case R(3, 0, 1, 0, 1): cpu->actlr_el1 = v; return 0;
@@ -222,7 +225,7 @@ static int write_reg(HvCpu *cpu, uint32_t reg, uint64_t v) {
     case R(3, 0, 13, 0, 4): cpu->tpidr_el1 = v; return 0;
     case R(3, 3, 13, 0, 2): cpu->tpidr_el0 = v; return 0;
     case R(3, 3, 13, 0, 3): cpu->tpidrro_el0 = v; return 0;
-    case R(3, 0, 14, 1, 0): cpu->cntkctl_el1 = v; return 0;
+    case R(3, 0, 14, 1, 0): cpu->cntkctl_el1 = v; cpu->el0_cnt = (uint32_t)(v & 3); return 0;
     case R(2, 0, 0, 2, 2): cpu->mdscr_el1 = v; return 0;
     case R(3, 2, 0, 0, 0): cpu->csselr_el1 = v & 0xf; return 0;
     case R(3, 3, 14, 2, 0): cpu->cntp_cval = counter() + (uint64_t)(int64_t)(int32_t)v; break;
@@ -370,8 +373,7 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
                 else {
                     hv_tlb_flush_user(cpu);
                     cpu->m->stats.reset_why[7]++;
-                    if (all_asids) hv_ijc_reset(cpu, 0);
-                    else hv_ijc_drop_asid(cpu, (uint16_t)(xt >> 48));
+                    hv_ijc_drop_range(cpu, va, len, all_asids ? -1 : (int)(xt >> 48));
                 }
             } else {
                 uint64_t first = va & ~((1ull << HV_TLB_PAGE_BITS) - 1);

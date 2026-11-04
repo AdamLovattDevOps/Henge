@@ -18,4 +18,6 @@ void hv_enter(HvCpu *cpu, void *block);
 void hv_fp_enter(HvCpu *cpu);
 void hv_fp_leave(HvCpu *cpu);
 
+void hv_debug_el0_in_kernel(HvCpu *cpu, const char *what);
+
 #endif

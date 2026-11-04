@@ -17,10 +17,11 @@ int hv_machine_init(HvMachine *m, size_t jit_bytes) {
     m->stop_pc = ~0ull;
     m->chain = 1;
     m->ijc = calloc(HV_IJC_TABLES * HV_IJC_TABLE_BYTES / 8, 8);
+    m->ucode = calloc(1u << HV_UCODE_BITS, 8);
     m->slots = calloc(HV_MAX_SLOTS, sizeof *m->slots);
     pthread_mutex_init(&m->wake_mu, NULL);
     pthread_cond_init(&m->wake_cv, NULL);
-    return m->ijc && m->slots ? 0 : -1;
+    return m->ijc && m->slots && m->ucode ? 0 : -1;
 }
 
 void hv_machine_wake(HvMachine *m) {

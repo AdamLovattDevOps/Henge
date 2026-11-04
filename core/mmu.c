@@ -140,10 +140,53 @@ static int current_asid(HvCpu *cpu) {
     return (cpu->tcr_el1 >> 22) & 1 ? -1 : (int)(cpu->ttbr0_el1 >> 48);
 }
 
+/* ---- the (user id, page) set ---- */
+
+static uint64_t ucode_key(uint32_t cid, uint64_t va) {
+    return ((uint64_t)cid << 40 | ((va >> HV_TLB_PAGE_BITS) & 0xffffffffffull)) + 1; /* never 0, the empty slot */
+}
+
+static uint32_t ucode_slot(uint64_t key) {
+    return (uint32_t)((key * 0x9e3779b97f4a7c15ull) >> (64 - HV_UCODE_BITS));
+}
+
+static void ucode_clear(HvMachine *m) {
+    if (m && m->ucode) memset(m->ucode, 0, (sizeof *m->ucode) << HV_UCODE_BITS);
+    if (m) m->ucode_count = 0;
+}
+
+static int ucode_has(HvMachine *m, uint32_t cid, uint64_t va) {
+    uint64_t key = ucode_key(cid, va);
+    for (uint32_t i = ucode_slot(key);; i = (i + 1) & ((1u << HV_UCODE_BITS) - 1)) {
+        if (m->ucode[i] == key) return 1;
+        if (!m->ucode[i]) return 0;
+    }
+}
+
+void hv_ucode_add(HvCpu *cpu, uint64_t va) {
+    HvMachine *m = cpu->m;
+    uint32_t cid = (uint32_t)(cpu->ijc_salt[0] >> 48);
+    if (!m || !cid) return;
+    uint64_t key = ucode_key(cid, va);
+    uint32_t i = ucode_slot(key);
+    for (; m->ucode[i]; i = (i + 1) & ((1u << HV_UCODE_BITS) - 1))
+        if (m->ucode[i] == key) return;
+    if (m->ucode_count >= (1u << HV_UCODE_BITS) / 2) { /* half full: start the user half over */
+        hv_ijc_reset(cpu, 0);
+        hv_ijc_switch(cpu);
+        cid = (uint32_t)(cpu->ijc_salt[0] >> 48);
+        key = ucode_key(cid, va);
+        i = ucode_slot(key);
+    }
+    m->ucode[i] = key;
+    m->ucode_count++;
+}
+
 /* A user id no tag in the tables uses yet; when they run out, empty the user tables and start over. */
 static uint16_t fresh_cid(HvCpu *cpu) {
     if (cpu->next_cid == 0 || cpu->next_cid > 0xffff) {
         ijc_clear(cpu, 0);
+        ucode_clear(cpu->m);
         memset(cpu->asid_cid, 0, sizeof cpu->asid_cid);
         cpu->next_cid = 1;
     }
@@ -156,7 +199,10 @@ void hv_ijc_switch(HvCpu *cpu) {
         cpu->ijc_salt[0] = (uint64_t)fresh_cid(cpu) << 48;
         return;
     }
-    if (!cpu->asid_cid[asid]) cpu->asid_cid[asid] = fresh_cid(cpu);
+    if (!cpu->asid_cid[asid]) {
+        cpu->asid_cid[asid] = fresh_cid(cpu);
+        cpu->cid_asid[cpu->asid_cid[asid]] = (uint16_t)asid;
+    }
     cpu->ijc_salt[0] = (uint64_t)cpu->asid_cid[asid] << 48;
 }
 
@@ -182,6 +228,7 @@ void hv_ijc_reset(HvCpu *cpu, int kernel) {
         return;
     }
     memset(cpu->asid_cid, 0, sizeof cpu->asid_cid);
+    ucode_clear(cpu->m); /* every user id is new now */
     hv_ijc_switch(cpu);
 }
 
@@ -248,8 +295,7 @@ void hv_ijc_drop_va(HvCpu *cpu, uint64_t va, int asid) {
             drop = m->ijc_pages[0][h >> 6] >> (h & 63) & 1;
         } else {
             uint64_t salt = current_asid(cpu) < 0 ? cpu->ijc_salt[0] : (uint64_t)cpu->asid_cid[asid] << 48;
-            uint32_t k = hv_ijc_key(va, salt);
-            drop = (salt >> 48) && (m->ijc_keyed[k >> 6] >> (k & 63) & 1);
+            drop = (salt >> 48) && ucode_has(m, (uint32_t)(salt >> 48), va);
         }
         if (drop) {
             m->stats.reset_why[kernel ? 3 : 2]++;
@@ -268,6 +314,39 @@ void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid) {
     for (int el = 0; el < 3; el++) {
         HvTlbEntry *e = &cpu->tlb[el][idx];
         memset(e, 0x80, sizeof *e);
+    }
+}
+
+/* A TLBI by range too big to do page by page in the TLB (which then drops its
+   user half): forget cached branch targets only in the range's code pages. */
+void hv_ijc_drop_range(HvCpu *cpu, uint64_t va, uint64_t len, int asid) {
+    HvMachine *m = cpu->m;
+    if (!m) return;
+    if (asid < 0) { /* every address space */
+        m->stats.reset_why[5]++;
+        hv_ijc_reset(cpu, 0);
+        return;
+    }
+    uint64_t salt = current_asid(cpu) < 0 ? cpu->ijc_salt[0] : (uint64_t)cpu->asid_cid[asid] << 48;
+    uint32_t cid = (uint32_t)(salt >> 48);
+    if (!cid) return; /* nothing cached for it */
+    uint64_t first = va >> HV_TLB_PAGE_BITS, last = (va + len - 1) >> HV_TLB_PAGE_BITS;
+    if (last - first < 4096) {
+        for (uint64_t p = first; p <= last; p++)
+            if (ucode_has(m, cid, p << HV_TLB_PAGE_BITS)) {
+                m->stats.reset_why[2]++;
+                ijc_clear_page(cpu, p << HV_TLB_PAGE_BITS, 0, salt);
+            }
+        return;
+    }
+    for (uint32_t i = 0; i < 1u << HV_UCODE_BITS; i++) {
+        uint64_t k = m->ucode[i];
+        if (!k || (k - 1) >> 40 != cid) continue;
+        uint64_t p = (k - 1) & 0xffffffffffull;
+        if (p >= (first & 0xffffffffffull) && p <= (last & 0xffffffffffull)) {
+            m->stats.reset_why[2]++;
+            ijc_clear_page(cpu, p << HV_TLB_PAGE_BITS, 0, salt);
+        }
     }
 }
 

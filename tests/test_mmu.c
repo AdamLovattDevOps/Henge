@@ -223,6 +223,7 @@ int main(void) {
             m.ijc_keyed[k >> 6] |= 1ull << (k & 63);
             uint32_t h = (uint32_t)(vas[i] >> 14) & 0xffff;
             m.ijc_pages[0][h >> 6] |= 1ull << (h & 63);
+            hv_ucode_add(&cpu, vas[i]);
         }
         m.ijc_tables_used |= 1;
         hv_tlb_flush_va_asid(&cpu, 0x100004000ull, 7);

@@ -107,6 +107,10 @@ uint32_t hv_helper(HvCpu *cpu, const HvHelperInfo *info) {
     switch (info->op) {
     case HV_OP_MEM:
         cpu->m->stat_slow_mem++;
+        if (cpu->m->stats_interval) { /* --stats: which kinds of access take the slow path */
+            HvMemOp op;
+            if (hv_mem_decode(info->insn, &op) == 0 && op.kind < 12) cpu->m->stats.slow_kind[op.kind]++;
+        }
         return hv_mem_emulate(cpu, info->insn, info->pc);
     case HV_OP_MRS:
         return hv_sysreg_mrs(cpu, info->insn, info->pc);
@@ -131,7 +135,15 @@ uint32_t hv_helper(HvCpu *cpu, const HvHelperInfo *info) {
         return 1;
     case HV_OP_UNDEF:
     default:
-        if (!cpu->el && ((info->pc >> 55) & 1)) { /* EL0 in kernel code: which block is this? */
+        hv_raise_undef(cpu, info->pc);
+        return 1;
+    }
+}
+
+/* Debugging: EL0 is running a block translated from kernel code. Which block, and how did we get here? */
+void hv_debug_el0_in_kernel(HvCpu *cpu, const char *what) {
+    {
+        {
             HvMachine *m = cpu->m;
             uint32_t *host = (uint32_t *)(uintptr_t)cpu->helper_ret; /* the block's blr into hv_helper_entry */
             int lo = 0, hi = m->nblocks - 1;
@@ -146,10 +158,18 @@ uint32_t hv_helper(HvCpu *cpu, const HvHelperInfo *info) {
                     (unsigned long long)m->stats.block_flushes, (unsigned long long)cpu->last_stub,
                     (unsigned long long)cpu->miss_site);
             for (int k = 15; k >= 0; k--) fprintf(stderr, " %llx", (unsigned long long)m->stats.recent[(m->stats.nrecent - 1 - k) & 15]);
-            fprintf(stderr, "\n");
+            fprintf(stderr, "\n  (%s) el changes, oldest first:\n", what);
+            for (int k = 15; k >= 0; k--) {
+                uint32_t i = (m->stats.nelchg - 1 - k) & 15;
+                if (m->stats.elchg[i].kind == 9)
+                    fprintf(stderr, "    eret at %llx from el%u to %llx spsr %llx\n", (unsigned long long)m->stats.elchg[i].from,
+                            m->stats.elchg[i].el, (unsigned long long)m->stats.elchg[i].to, (unsigned long long)m->stats.elchg[i].spsr);
+                else
+                    fprintf(stderr, "    exception type %u esr %llx from el%u pc %llx (spsr %llx)\n", m->stats.elchg[i].kind,
+                            (unsigned long long)m->stats.elchg[i].to, m->stats.elchg[i].el,
+                            (unsigned long long)m->stats.elchg[i].from, (unsigned long long)m->stats.elchg[i].spsr);
+            }
         }
-        hv_raise_undef(cpu, info->pc);
-        return 1;
     }
 }
 
@@ -325,6 +345,12 @@ static void print_stats(HvCpu *cpu, int force) {
                 fprintf(stderr, "    worst: va %llx pa %llx flags %x gen %u/%u\n", (unsigned long long)b->va,
                         (unsigned long long)b->pa, b->flags, b->gen, b->ram->page_gen[b->pg]);
         }
+        fprintf(stderr, "  slow mem K/s: single %.0f pair %.0f literal %.0f ldra %.0f ordered %.0f excl %.0f cas %.0f casp %.0f atomic %.0f vec %.0f/%.0f\n",
+                RATE(slow_kind[0]) / 1e3, RATE(slow_kind[1]) / 1e3, RATE(slow_kind[2]) / 1e3, RATE(slow_kind[3]) / 1e3,
+                RATE(slow_kind[4]) / 1e3, RATE(slow_kind[5]) / 1e3, RATE(slow_kind[6]) / 1e3, RATE(slow_kind[7]) / 1e3,
+                RATE(slow_kind[8]) / 1e3, RATE(slow_kind[9]) / 1e3, RATE(slow_kind[10]) / 1e3);
+        fprintf(stderr, "  ijc fills into: empty %.0fK/s, live other salt %.0fK/s, dead salt %.0fK/s, same salt %.0fK/s\n",
+                RATE(fill_kind[0]) / 1e3, RATE(fill_kind[1]) / 1e3, RATE(fill_kind[3]) / 1e3, RATE(fill_kind[2]) / 1e3);
         fprintf(stderr, "  misses at: RET %.0fK/s, BR/BLR %.0fK/s, B/BL %.0fK/s, conditional %.0fK/s, MSR %.0fK/s, other %.0fK/s, unknown %.0fK/s\n",
                 RATE(miss_kind[0]) / 1e3, RATE(miss_kind[1]) / 1e3, RATE(miss_kind[2]) / 1e3, RATE(miss_kind[3]) / 1e3,
                 RATE(miss_kind[4]) / 1e3, RATE(miss_kind[5]) / 1e3, RATE(miss_kind[6]) / 1e3);
@@ -406,6 +432,8 @@ static int run(HvCpu *cpu, int one) {
     uint64_t last_fault = ~0ull, prev_pc = 0;
     HvBlock *prev_b = NULL;
     uint64_t *pending_chain = NULL;
+    uint64_t chain_pc = 0;    /* where that exit was going, and in which state */
+    uint32_t chain_flags = 0;
     uint32_t last_reason = HV_EXIT_BRANCH;
     for (;;) {
         if (m->flush_pending) {
@@ -440,6 +468,10 @@ static int run(HvCpu *cpu, int one) {
         uint32_t avail;
         const uint32_t *code = hv_mmu_fetch(cpu, cpu->pc, &pa, &avail);
         if (!code) { /* the instruction abort was taken */
+            /* The pc is the vector now, not the branch target: the exit that got
+               here must not be chained to whatever runs next (that put EL0 code
+               on a path straight into the kernel's vector code). */
+            pending_chain = NULL;
             if (cpu->pc == last_fault) return HV_EXIT_FAULT_LOOP;
             last_fault = cpu->pc;
             continue;
@@ -476,6 +508,10 @@ static int run(HvCpu *cpu, int one) {
                         fprintf(stderr, "ijc cached-miss kinds: ijc site %llu, after ISB %llu, after MSR %llu, other %llu\n",
                                 (unsigned long long)hist[0], (unsigned long long)hist[1], (unsigned long long)hist[2],
                                 (unsigned long long)hist[3]);
+                    static uint64_t msrs;
+                    if (k == 2 && ++msrs % 20000 == 0)
+                        fprintf(stderr, "ijc cached-miss msr: S%u_%u_C%u_C%u_%u\n", 2 + ((before >> 19) & 1), (before >> 16) & 7,
+                                (before >> 12) & 15, (before >> 8) & 15, (before >> 5) & 7);
                     static uint64_t others;
                     if (k == 3 && ++others % 50000 == 0 && shown < 60) {
                         shown++;
@@ -492,10 +528,21 @@ static int run(HvCpu *cpu, int one) {
                             (unsigned long long)prev_pc, prev_b ? prev_b->flags : 0, prev_b ? prev_b->ninsns : 0, last, last_reason);
                 }
             }
+            if (m->stats_interval) { /* what the fill replaces: nothing (cold), another salt's entry, or another target */
+                uint64_t old = ent[0];
+                int kind = !old ? 0 : (old >> 48) != (tag >> 48) ? 1 : 2;
+                if (kind == 1) { /* another salt: is it still in use, or dead (dropped address space, reset)? */
+                    uint32_t c = (uint32_t)(old >> 48);
+                    int alive = kernel ? (c ^ 0xffff) == cpu->kernel_gen : cpu->asid_cid[cpu->cid_asid[c]] == c;
+                    if (!alive) kind = 3;
+                }
+                m->stats.fill_kind[kind]++;
+            }
             ent[0] = tag;
             ent[1] = (uint64_t)(uintptr_t)b->code;
             m->ijc_tables_used |= 1u << (b->flags & (HV_IJC_TABLES - 1));
             if (!kernel) {
+                hv_ucode_add(cpu, b->va);
                 uint32_t h = (uint32_t)(b->va >> HV_TLB_PAGE_BITS) & 0xffff;
                 m->ijc_pages[0][h >> 6] |= 1ull << (h & 63);
             }
@@ -513,7 +560,8 @@ static int run(HvCpu *cpu, int one) {
             m->stats.ijc_fills++;
         }
         /* The block before left through a chainable direct branch to this one: link them. */
-        if (pending_chain && !m->trace) chain(m, pending_chain, b);
+        /* Only if nothing in between (an abort, an interrupt) sent the CPU elsewhere. */
+        if (pending_chain && !m->trace && b->va == chain_pc && b->flags == chain_flags) chain(m, pending_chain, b);
         pending_chain = NULL;
         if (m->trace) fprintf(stderr, "block %llx el%u\n", (unsigned long long)cpu->pc, cpu->el);
         if (m->log >= 4 && host_pointer_check(cpu, prev_pc)) return HV_EXIT_UNSUPPORTED;
@@ -546,7 +594,11 @@ static int run(HvCpu *cpu, int one) {
         if (m->stats_interval && (m->stats.blocks & 0xffff) == 0) print_stats(cpu, 0);
         hv_enter(cpu, b->code);
 
-        if (cpu->exit_reason == HV_EXIT_BRANCH && cpu->last_stub && m->chain) pending_chain = (uint64_t *)cpu->last_stub;
+        if (cpu->exit_reason == HV_EXIT_BRANCH && cpu->last_stub && m->chain) {
+            pending_chain = (uint64_t *)cpu->last_stub;
+            chain_pc = cpu->pc;
+            chain_flags = block_flags(cpu); /* the exiting block's state (a block ends where its state changes) */
+        }
         last_reason = cpu->exit_reason;
         switch (cpu->exit_reason) {
         case HV_EXIT_BRANCH:

@@ -54,10 +54,14 @@ typedef struct HvStats {
     uint64_t blocks, translations, block_flushes;
     uint64_t flush_smc, flush_ic, flush_full;  /* why translations were dropped */
     uint64_t chained, ijc_fills, ijc_resets;
+    uint64_t slow_kind[12];   /* hv_mem_emulate calls by HV_MEM_* kind */
+    uint64_t fill_kind[4];    /* ijc fills into an empty slot, over another live salt, over the same salt, over a dead salt */
     uint64_t reset_why[8];    /* cache drops: full flush, TLBI by ASID, TLBI user VA, TLBI kernel VA, code change, user VA in every ASID (whole user half), keyed filter full, big user range */
     uint64_t why[6];          /* dispatcher entries by cause: chain fill, kick, exception/sysreg, interrupt, cached target, cache miss */
     uint64_t miss_kind[7];    /* cache misses by the branch that missed: RET, BR/BLR, B/BL, conditional, MSR, other, unknown */
     uint64_t recent[16];      /* debugging: the last blocks the dispatcher entered (pc | el) */
+    struct { uint64_t from, to, spsr; uint32_t kind, el; } elchg[16]; /* debugging: last exception entries (kind = type) and ERETs (kind 9) */
+    uint32_t nelchg;
     uint64_t nrecent;
     uint64_t translate_ticks, translated_insns, translated_words; /* time spent translating, guest and host code size */
     uint64_t retrans_va, retrans_vapa; /* translations of a VA (and VA+PA) translated before: diagnostics */
@@ -112,6 +116,11 @@ typedef struct HvMachine {
     uint64_t ijc_keyed[1 << 14];
     uint32_t ijc_keyed_count;
     uint32_t ijc_tables_used; /* bit per flags value whose table was ever filled */
+    /* Exactly which (user id, user page) pairs have cached targets: a hash set,
+       so unmapping a big range of one address space drops only its code pages'
+       entries instead of the whole address space's. Emptied with the user half. */
+    uint64_t *ucode;
+    uint32_t ucode_count;
     int stats_interval;  /* seconds between --stats lines, 0 = off */
     /* Device threads (disk I/O, graphics) wake the CPU out of WFI with hv_machine_wake. */
     pthread_mutex_t wake_mu;

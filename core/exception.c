@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "machine.h"
+#include "dispatch.h"
 #include "mmu.h"
 
 /* Only EL0 and EL1 exist for the guest; HengeVM plays EL2 (PSCI over HVC, as
@@ -43,6 +44,12 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
     if (type == HV_EXC_SYNC) cpu->m->stats.exceptions++;
     else cpu->m->stats.interrupts++;
     uint64_t spsr = hv_pstate_get(cpu);
+    {
+        HvStats *st = &cpu->m->stats;
+        uint32_t k = st->nelchg++ & 15;
+        st->elchg[k].from = ret, st->elchg[k].spsr = spsr, st->elchg[k].kind = (uint32_t)type, st->elchg[k].el = cpu->el;
+        st->elchg[k].to = esr;
+    }
     if (cpu->m->trace || cpu->m->log >= 2)
         fprintf(stderr, "exception type %d esr %08x far %llx from pc %llx el%u\n", type, esr, (unsigned long long)far,
                 (unsigned long long)ret, cpu->el);
@@ -70,6 +77,8 @@ void hv_raise_sync(HvCpu *cpu, uint32_t ec, uint32_t iss, uint64_t far, uint64_t
 }
 
 void hv_raise_undef(HvCpu *cpu, uint64_t pc) {
+    static int reported;
+    if (cpu->el == 0 && ((pc >> 55) & 1) && reported++ < 3) hv_debug_el0_in_kernel(cpu, "undef");
     if (cpu->m->log) {
         uint32_t insn = 0;
         uint64_t pa;
@@ -87,6 +96,12 @@ void hv_raise_abort(HvCpu *cpu, int insn, uint64_t va, uint32_t fsc, int wnr, in
 }
 
 void hv_eret(HvCpu *cpu) {
+    if (cpu->m) {
+        HvStats *st = &cpu->m->stats;
+        uint32_t k = st->nelchg++ & 15;
+        st->elchg[k].from = cpu->pc, st->elchg[k].to = cpu->elr_el1, st->elchg[k].spsr = cpu->spsr_el1;
+        st->elchg[k].kind = 9, st->elchg[k].el = cpu->el;
+    }
     cpu->pc = cpu->elr_el1;
     hv_pstate_set(cpu, cpu->spsr_el1);
     cpu->excl_addr = ~0ull;
@@ -164,10 +179,11 @@ int hv_exception_insn(HvCpu *cpu, uint32_t insn, uint64_t pc) {
         hv_take_exception(cpu, HV_EXC_SYNC, HV_EC_SVC64 << 26 | 1u << 25 | imm16, 0, 0, pc + 4);
         return 1;
     }
-    if (opc == 0 && ll == 2 && cpu->el == 1) { /* HVC: the hypervisor's PSCI */
+    if (opc == 0 && ll == 2 && cpu->el == 1) { /* HVC: the hypervisor's PSCI and vmapple's PAC calls */
         cpu->x[0] = psci(cpu, cpu->x[0]);
+        if (!cpu->halted) return 0; /* like a call: the block carries on (xnu makes one per context switch) */
         cpu->pc = pc + 4;
-        cpu->exit_reason = cpu->halted ? HV_EXIT_HALT : HV_EXIT_BRANCH;
+        cpu->exit_reason = HV_EXIT_HALT;
         return 1;
     }
     if (opc == 1 && ll == 0) { /* BRK */
