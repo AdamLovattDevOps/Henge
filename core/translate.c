@@ -269,6 +269,11 @@ static uint64_t cross_addend(Emit *e, uint64_t target) {
     if (off < 0) off = getenv("HV_NO_XCHAIN") != NULL;
     HvCpu *cpu = hv_self;
     if (off || !cpu || e->no_ijc || !e->m->chain) return 0;
+    /* This CPU's TLB first: an entry there is the mapping now. */
+    int table = !(e->flags & HV_BLOCK_EL1) ? 0 : (e->flags & HV_BLOCK_PAN) ? 2 : 1;
+    const HvTlbEntry *te = &cpu->tlb[(target >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1)][table];
+    uint64_t tpage = target & ~((1ull << HV_TLB_PAGE_BITS) - 1);
+    if (te->exec_tag == tpage) return (uint64_t)te->addend;
     HvWalk w;
     hv_mmu_walk(cpu, target, HV_ACC_EXEC, (e->flags & HV_BLOCK_EL1) ? 1 : 0, &w);
     if (w.fsc || w.block_size < (1ull << HV_TLB_PAGE_BITS)) return 0;
