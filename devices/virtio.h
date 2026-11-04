@@ -9,7 +9,7 @@
    virtqueues, INTx interrupts. Requests are handled synchronously when the
    driver notifies. */
 #define HV_VIRTQ_MAX 4
-#define HV_VIRTQ_MAX_SIZE 256
+#define HV_VIRTQ_MAX_SIZE 1024
 #define HV_VIRTQ_MAX_SEGS 128
 
 #define HV_VIRTIO_F_VERSION_1 (1ull << 32)

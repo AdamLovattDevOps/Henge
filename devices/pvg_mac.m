@@ -279,6 +279,27 @@ static void trace_data(int write, uint64_t off, uint64_t v) {
     if (write && off == 0x101c) fifo_pa = v << 14;
     if (write && off == 0x1030) shared_pa = v << 14;
     if (write && off == 0x1004) fifo_size = (uint32_t)v;
+    if (write && off == 0x1008 && pvg_trace >= 3) { /* find the FIFO: diff 2 MB around both pages between doorbells */
+        static uint8_t *snap[2];
+        static int n;
+        uint64_t bases[2] = {fifo_pa, shared_pa};
+        n++;
+        for (int k = 0; k < 2 && bases[k]; k++) {
+            uint64_t lo = bases[k] > (1u << 20) ? bases[k] - (1u << 20) : bases[k];
+            uint8_t *p = hv_phys_ptr(board->m, lo, 2u << 20);
+            if (!p) continue;
+            if (snap[k] && n <= 4) {
+                for (uint32_t i = 0; i < (2u << 20); i += 4)
+                    if (memcmp(p + i, snap[k] + i, 4)) {
+                        uint32_t nv;
+                        memcpy(&nv, p + i, 4);
+                        fprintf(stderr, "pvgfind %d near %s: pa %llx = %08x\n", n, k ? "1030" : "101c", (unsigned long long)(lo + i), nv);
+                    }
+            }
+            if (!snap[k]) snap[k] = malloc(2u << 20);
+            memcpy(snap[k], p, 2u << 20);
+        }
+    }
     if (write && off == 0x1008) { /* the first doorbells: what both registered pages hold */
         static int shown;
         if (shown++ < 12) {
