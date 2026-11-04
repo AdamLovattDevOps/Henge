@@ -864,6 +864,19 @@ static int run_loop(HvCpu *cpu, int one) {
         }
         if (cpu->pc == m->stop_pc) return HV_EXIT_HALT;
 
+        if (m->log && cpu->el && (cpu->sctlr_el1 & 1) && !((cpu->pc >> 55) & 1) && cpu->pc >= 0x100000000ull) { /* EL1 at a user address: how did we get here? */
+            static int reported;
+            if (reported++ < 4) {
+                fprintf(stderr, "hengevm: el1 at user pc %llx: previous block %llx flags %x (%u insns), exit reason %u, why %d, "
+                                "miss site %llx, elr %llx spsr %llx x30 %llx, fast resumes %llu\n  recent:",
+                        (unsigned long long)cpu->pc, (unsigned long long)prev_pc, prev_b ? prev_b->flags : 0, prev_b ? prev_b->ninsns : 0,
+                        last_reason, why, (unsigned long long)cpu->miss_site, (unsigned long long)cpu->elr_el1,
+                        (unsigned long long)cpu->spsr_el1, (unsigned long long)cpu->x[30], (unsigned long long)m->stats.fast_resumes);
+                for (int k = 0; k < 16; k++)
+                    fprintf(stderr, " %llx", (unsigned long long)m->stats.recent[(m->stats.nrecent + k) & 15]);
+                fprintf(stderr, "\n");
+            }
+        }
         if (m->log && !cpu->el && ((cpu->pc >> 55) & 1)) { /* EL0 can never run kernel code: say how we got here */
             static int reported;
             if (reported++ < 4)

@@ -130,7 +130,7 @@ typedef struct TestProgram {
 static inline int compare_cpus(const char *name, const HvCpu *want, const HvCpu *got) {
     int diffs = 0;
     for (int i = 0; i < 31; i++)
-        if (want->x[i] != got->x[i]) {
+        if (want->x[i] != got->x[i] && i != 18) { /* the host's x18 is the platform's: macOS may clear it when it preempts the native run */
             printf("  %s: x%d native %016llx jit %016llx\n", name, i, (unsigned long long)want->x[i],
                    (unsigned long long)got->x[i]);
             diffs++;
