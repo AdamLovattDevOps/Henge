@@ -516,6 +516,8 @@ static void print_stats(HvCpu *cpu, int force) {
             }
         }
         fprintf(stderr, "  user light fills: shared region %.0fK/s, elsewhere %.0fK/s\n", RATE(light_region[0]) / 1e3, RATE(light_region[1]) / 1e3);
+        fprintf(stderr, "  code-page protects/s: none %.0f, one entry %.0f, whole-TLB scans %.0f\n", RATE(protect_kind[0]),
+                RATE(protect_kind[1]), RATE(protect_kind[2]));
         fprintf(stderr, "  WFE waits in place %.0f/s; exits chained as placed %.0f/s\n", RATE(wfe_waits), RATE(chained_early));
         fprintf(stderr, "  exit requests/s: TLBI posts %.0f, wakes %.0f (of them device work %.0f), kick all %.0f, own %.0f\n",
                 RATE(kick_src[0]), RATE(kick_src[1]), RATE(kick_src[3]), RATE(kick_src[2]), RATE(kick_src[4]));

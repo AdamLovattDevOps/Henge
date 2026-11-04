@@ -16,10 +16,11 @@ typedef struct HvRam {
     uint8_t *code_pages; /* one byte per 16 KB page: a translated block came from here (2^pages_log2 of them) */
     uint32_t pages_log2;
     uint32_t *page_gen;  /* per page: bumped to invalidate the blocks translated from it */
-    /* Per page and CPU: the TLB slot (table << HV_TLB_BITS | index, plus 1) that
-       last mapped the page writable, or HV_WHINT_MANY when it has had more than
-       one. When the page becomes code only those are dropped, not a whole TLB scanned. */
-    uint32_t *whint;
+    /* Per page and CPU: up to three TLB entries (slot << 2 | table, plus 1;
+       16 bits each) that mapped the page writable, or HV_WHINT_MANY when there
+       were more. When the page becomes code only those are dropped, not a whole
+       TLB scanned. */
+    uint64_t *whint;
 } HvRam;
 
 typedef struct HvMmio {
@@ -76,6 +77,7 @@ typedef struct HvStats {
     uint64_t light_kind[4];
     uint64_t light_fail[4];
     uint64_t light_walks;
+    uint64_t protect_kind[3]; /* a page becoming code, per CPU: not mapped writable, one entry, scan */
     uint64_t light_region[2]; /* user light fills: in the shared region (0x18..0x28 << 28), elsewhere */
     uint64_t chained_early;   /* exits chained as their block was placed */
     uint64_t wfe_waits;       /* WFEs that waited on the monitored word in place */
@@ -100,7 +102,7 @@ typedef struct HvStats {
 } HvStats;
 
 #define HV_MAX_CPUS 8
-#define HV_WHINT_MANY 0xffffffffu
+#define HV_WHINT_MANY (1ull << 63) /* whint: more than three; else up to three TLB codes + 1, 16 bits each */
 
 /* What each CPU has to itself and keeps across hv_cpu_reset (tests copy HvCpu
    structs around, so it lives here, by CPU index): its indirect-branch cache and

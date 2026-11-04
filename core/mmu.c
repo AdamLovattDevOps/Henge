@@ -305,13 +305,18 @@ static int maps_writable(const HvTlbEntry *e, const uint8_t *host_page) {
 
 /* RAM page pg just became code: drop write permission from cpu's entries for it. */
 void hv_tlb_protect_code_page(HvCpu *cpu, HvRam *ram, uint64_t pg) {
-    uint32_t *hint = &ram->whint[pg * HV_MAX_CPUS + cpu->index];
-    uint32_t h = __atomic_exchange_n(hint, 0, __ATOMIC_SEQ_CST);
+    uint64_t *hint = &ram->whint[pg * HV_MAX_CPUS + cpu->index];
+    uint64_t h = __atomic_exchange_n(hint, 0, __ATOMIC_SEQ_CST);
     const uint8_t *host_page = ram->host + (pg << HV_TLB_PAGE_BITS);
-    if (h == HV_WHINT_MANY) {
+    if (cpu->m) cpu->m->stats.protect_kind[h & HV_WHINT_MANY ? 2 : h ? 1 : 0]++;
+    if (h & HV_WHINT_MANY) {
         hv_tlb_protect_code(cpu, host_page);
-    } else if (h) {
-        HvTlbEntry *e = &cpu->tlb[0][0] + (h - 1);
+        return;
+    }
+    for (int k = 0; k < 3; k++) {
+        uint64_t c = h >> (16 * k) & 0xffff;
+        if (!c) continue;
+        HvTlbEntry *e = &cpu->tlb[0][0] + (c - 1);
         if (maps_writable(e, host_page)) e->write_tag = HV_TLB_INVALID;
     }
 }
@@ -448,11 +453,21 @@ static void stash_drop(HvPerCpu *p, int asid);
 static void write_guard(HvCpu *cpu, HvRam *ram, uint64_t pg, uint32_t code, HvTlbEntry *e) {
     /* Say where, so that the page becoming code drops just this entry (or, if
        this CPU now maps it writable twice, makes the protector scan). */
-    uint32_t *hint = &ram->whint[pg * HV_MAX_CPUS + cpu->index];
-    uint32_t mine = code + 1, old = __atomic_load_n(hint, __ATOMIC_RELAXED);
+    uint64_t *hint = &ram->whint[pg * HV_MAX_CPUS + cpu->index];
+    uint64_t mine = code + 1, old = __atomic_load_n(hint, __ATOMIC_RELAXED), now = old;
     const uint8_t *host_page = ram->host + (pg << HV_TLB_PAGE_BITS);
-    if (old && old != mine && old != HV_WHINT_MANY && maps_writable(&cpu->tlb[0][0] + (old - 1), host_page)) mine = HV_WHINT_MANY;
-    if (old != HV_WHINT_MANY) __atomic_store_n(hint, mine, __ATOMIC_RELAXED);
+    if (!(old & HV_WHINT_MANY)) {
+        /* Up to three entries: this one, in a free place or one whose entry maps
+           something else by now; beyond that the protector scans. */
+        int have = 0, place = -1;
+        for (int k = 0; k < 3; k++) {
+            uint64_t c = old >> (16 * k) & 0xffff;
+            if (c == mine) have = 1;
+            else if (place < 0 && (!c || !maps_writable(&cpu->tlb[0][0] + (c - 1), host_page))) place = k;
+        }
+        if (!have) now = place >= 0 ? (old & ~(0xffffull << (16 * place))) | mine << (16 * place) : HV_WHINT_MANY;
+        if (now != old) __atomic_store_n(hint, now, __ATOMIC_RELAXED);
+    }
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     if (__atomic_load_n(&ram->code_pages[pg], __ATOMIC_RELAXED)) e->write_tag = HV_TLB_INVALID;
 }
