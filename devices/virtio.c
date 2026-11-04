@@ -91,6 +91,11 @@ static void common_write(HvVirtio *v, uint64_t off, uint64_t val, unsigned size)
     case 0x16: v->qsel = (uint16_t)val; break;
     case 0x18:
         if (q && val && val <= HV_VIRTQ_MAX_SIZE && !(val & (val - 1))) q->size = (uint16_t)val;
+        else if (q) /* the driver would index its rings by a size we do not use: say so */
+            fprintf(stderr, "virtio %04x: queue %u size %llu refused (max %d)\n", v->pci.config[2] | v->pci.config[3] << 8,
+                    v->qsel, (unsigned long long)val, HV_VIRTQ_MAX_SIZE);
+        if (getenv("HV_VIRTIO_CFG_LOG"))
+            fprintf(stderr, "virtio %04x: queue %u size %llu\n", v->pci.config[2] | v->pci.config[3] << 8, v->qsel, (unsigned long long)val);
         break;
     case 0x1c: if (q) q->enabled = val & 1; break;
     case 0x20: case 0x24: if (q) set64(&q->desc, off, val, size); break;
@@ -183,6 +188,13 @@ int hv_virtq_pop(HvVirtio *v, int qi, HvVirtqElem *e) {
         return 0;
     }
     q->last_avail++;
+    if (q->out[head]) {
+        static int said;
+        if (said++ < 10)
+            fprintf(stderr, "virtio %04x q%d: head %u taken again while still outstanding\n",
+                    v->pci.config[2] | v->pci.config[3] << 8, qi, head);
+    }
+    q->out[head] = 1;
     e->head = head;
     e->nseg = 0;
     uint64_t table = q->desc;
@@ -215,6 +227,16 @@ int hv_virtq_pop(HvVirtio *v, int qi, HvVirtqElem *e) {
 
 void hv_virtq_push(HvVirtio *v, int qi, const HvVirtqElem *e, uint32_t written) {
     HvVirtq *q = &v->q[qi];
+    if (e->head >= q->size || !q->out[e->head]) {
+        /* Not something the driver gave us (or given back already): pushing it
+           would corrupt its free list. */
+        static int said;
+        if (said++ < 10)
+            fprintf(stderr, "virtio %04x q%d: completion of head %u that is not outstanding (dropped)\n",
+                    v->pci.config[2] | v->pci.config[3] << 8, qi, e->head);
+        return;
+    }
+    q->out[e->head] = 0;
     uint8_t *used = hv_phys_ptr(v->m, q->used, 4 + 8u * q->size);
     if (!used) return;
     uint16_t idx;

@@ -86,6 +86,19 @@ void hv_raise_undef(HvCpu *cpu, uint64_t pc) {
         uint64_t pa;
         if (!hv_mmu_access(cpu, pc, HV_ACC_EXEC, cpu->el, &pa)) hv_phys_read(cpu->m, pa, &insn, 4);
         fprintf(stderr, "undefined: pc %llx insn %08x el%u\n", (unsigned long long)pc, insn, cpu->el);
+        if (cpu->el == 1) { /* a kernel assert: its backtrace, from the frame pointers (lr first) */
+            fprintf(stderr, "  backtrace: lr %llx", (unsigned long long)(cpu->x[30] | 0xffffff8000000000ull));
+            uint64_t fp = cpu->x[29];
+            for (int i = 0; i < 24 && fp; i++) {
+                uint64_t fr[2], fpa;
+                if (hv_mmu_access(cpu, fp, HV_ACC_READ, 1, &fpa) || hv_phys_read(cpu->m, fpa, fr, 16)) break;
+                uint64_t ret = fr[1] | 0xffffff8000000000ull; /* strip the PAC bits */
+                fprintf(stderr, " %llx", (unsigned long long)ret);
+                if (fr[0] <= fp) break;
+                fp = fr[0];
+            }
+            fprintf(stderr, "\n  vbar %llx\n", (unsigned long long)cpu->vbar_el1);
+        }
     }
     hv_raise_sync(cpu, HV_EC_UNKNOWN, 0, 0, pc);
 }

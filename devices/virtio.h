@@ -17,6 +17,7 @@
 typedef struct HvVirtq {
     uint16_t size, enabled, last_avail;
     uint64_t desc, avail, used;
+    uint8_t out[HV_VIRTQ_MAX_SIZE]; /* heads taken and not yet completed (a completion twice corrupts the driver) */
 } HvVirtq;
 
 typedef struct HvVirtqSeg {
