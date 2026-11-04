@@ -118,38 +118,49 @@ static void put_ool(Emit *e, Ool o) {
    the cache). A hit reloads guest x0 and x1, which the hash used as scratch,
    and enters the block directly: no block has a prologue. Tags are VA ^ salt;
    the salt changes when mappings or code do. */
+/* Jump to the guest VA in host x15 through the indirect-branch cache for this
+   block's flags. Guest x0/x1 stay in their registers on the hit path, and
+   nothing is stored: the target block just runs. A miss (or exit_req) saves
+   x0/x1 and pc and leaves for the dispatcher, which fills the cache. */
 static void put_ijc_jump(Emit *e) {
     if (e->no_ijc) {
+        put(e, STP_X(0, 1, 28, 0));
+        put(e, MOV_X(0, 15));
+        put(e, STR_X(0, 28, HV_CPU_PC));
         put(e, LDR_X(1, 28, HV_CPU_EXIT));
         put(e, BR_X(1));
         return;
     }
     put(e, 0xb9400000u | (HV_CPU_EXIT_REQ / 4) << 10 | 28 << 5 | 6); /* ldr w6, [x28, #exit_req] */
     uint32_t to_exit = e->n;
-    put(e, 0x35000000u | 6);                                /* cbnz w6, exit (patched below) */
+    put(e, 0x35000000u | 6);                                /* cbnz w6, exit (x15 still the VA) */
     /* The tag, VA ^ salt, also picks the slot (hv_ijc_index), so each address
        space's copy of shared library code gets its own slots. */
-    put(e, LDR_X(15, 28, HV_CPU_IJC_SALT + 8 * (e->flags & HV_BLOCK_EL1)));
-    put(e, 0xca000000u | 0 << 16 | 15 << 5 | 15);           /* eor x15, x15, x0: the tag */
-    put(e, LDR_X(6, 28, HV_CPU_IJC));
-    uint64_t table = (uint64_t)(e->flags & (HV_IJC_TABLES - 1)) * HV_IJC_TABLE_BYTES;
-    if (table) {
-        put(e, 0xd2a00000u | (uint32_t)(table >> 16) << 5 | 7); /* movz x7, #table >> 16, lsl #16 */
-        put(e, ADD_LSL(6, 6, 7, 0));
-    }
+    uint32_t salt = HV_CPU_IJC_SALT + 8 * (e->flags & HV_BLOCK_EL1);
+    put(e, LDR_X(6, 28, salt));
+    put(e, 0xca000000u | 6 << 16 | 15 << 5 | 15);           /* eor x15, x15, x6: the tag */
     put(e, 0xca400000u | 15 << 16 | 16 << 10 | 15 << 5 | 7); /* eor x7, x15, x15, lsr #16 */
     put(e, 0xca400000u | 15 << 16 | 46 << 10 | 7 << 5 | 7);  /* eor x7, x7, x15, lsr #46 */
     put(e, UBFM_X(7, 7, 2, 2 + HV_IJC_BITS - 1));           /* ubfx x7, x7, #2, #bits */
+    put(e, LDR_X(6, 28, HV_CPU_IJC_TAB + 8 * (e->flags & (HV_IJC_TABLES - 1))));
     put(e, ADD_LSL(6, 6, 7, 4));
     put(e, LDP_X(7, 6, 6, 0));                              /* x7 = tag, x6 = entry */
     put(e, 0xca000000u | 15 << 16 | 7 << 5 | 7);            /* eor x7, x7, x15 */
     uint32_t to_miss = e->n;
     put(e, CBNZ_X(7));
-    put(e, LDP_X(0, 1, 28, 0));                             /* guest x0, x1 */
-    put(e, BR_X(6));                                        /* hit */
-    patch_branch(&e->w[to_miss], (int64_t)e->n - to_miss);
-    patch_branch(&e->w[to_exit], (int64_t)e->n - to_exit);
-    put_lit(e, 1, e->cur_pc);                               /* miss: say where, for --stats */
+    put(e, BR_X(6));                                        /* hit: x0, x1 are the guest's */
+    patch_branch(&e->w[to_miss], (int64_t)e->n - to_miss);  /* miss: x15 is the tag, so the VA is x15 ^ salt */
+    put(e, STP_X(0, 1, 28, 0));
+    put(e, LDR_X(0, 28, salt));
+    put(e, 0xca000000u | 15 << 16 | 0 << 5 | 0);            /* eor x0, x0, x15 */
+    uint32_t to_common = e->n;
+    put(e, B_OP);
+    patch_branch(&e->w[to_exit], (int64_t)e->n - to_exit);  /* exit_req: x15 is the VA */
+    put(e, STP_X(0, 1, 28, 0));
+    put(e, MOV_X(0, 15));
+    patch_branch(&e->w[to_common], (int64_t)e->n - to_common);
+    put(e, STR_X(0, 28, HV_CPU_PC));
+    put_lit(e, 1, e->cur_pc);                               /* say where, for --stats */
     put(e, STR_X(1, 28, HV_CPU_MISS_SITE));
     put(e, LDR_X(1, 28, HV_CPU_EXIT));
     put(e, BR_X(1));
@@ -176,9 +187,7 @@ static void put_exit(Emit *e, uint64_t target) {
 static void put_branch_exit(Emit *e, uint64_t target) {
     if ((target & ~((1ull << HV_TLB_PAGE_BITS) - 1)) != e->page || e->m->nslots == HV_MAX_SLOTS) {
         /* Another page may be remapped under us, so look it up by VA instead of chaining. */
-        put(e, STP_X(0, 1, 28, 0));
-        put_lit(e, 0, target);
-        put(e, STR_X(0, 28, HV_CPU_PC));
+        put_lit(e, 15, target);
         put_ijc_jump(e);
         return;
     }
@@ -463,11 +472,8 @@ static void translate_branch_reg(Emit *e, uint32_t insn, uint64_t pc) {
     uint32_t opc = (insn >> 21) & 3;
     int rn = (insn >> 5) & 0x1f;
     if (opc == 2 && ((insn >> 11) & 0x1f) == 1) rn = 30; /* RETAA, RETAB: the Rn field is all ones, the target is x30 */
-    put(e, STP_X(0, 1, 28, 0));
-    if (is_stolen(rn)) put(e, LDR_X(0, 28, slot_of(rn)));
-    else if (rn == 31) put(e, 0xd2800000u);                 /* movz x0, #0 */
-    else if (rn != 0) put(e, MOV_X(0, rn));
-    put(e, STR_X(0, 28, HV_CPU_PC));
+    if (is_stolen(rn)) put(e, LDR_X(15, 28, slot_of(rn)));
+    else put(e, MOV_X(15, rn));                             /* 31 is XZR here */
     if (opc == 1) put_lit(e, 30, pc + 4);                   /* BLR: after reading Rn */
     put_ijc_jump(e);
 }
@@ -991,9 +997,7 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
             uint32_t bit = op1 == 0 && op2 == 5 ? HV_BLOCK_SPX : op1 == 0 && op2 == 4 ? HV_BLOCK_PAN : 0;
             if (bit) {
                 uint32_t flags = e->flags;
-                put(e, STP_X(0, 1, 28, 0));
-                put_lit(e, 0, pc + 4);
-                put(e, STR_X(0, 28, HV_CPU_PC));
+                put_lit(e, 15, pc + 4);
                 e->flags = imm ? flags | bit : flags & ~bit;
                 put_ijc_jump(e);
                 e->flags = flags;
@@ -1032,9 +1036,7 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
                 }
                 for (int set = 0; set < (rt == 31 ? 1 : 2); set++) {
                     if (set) patch_branch(&e->w[to_set], (int64_t)e->n - to_set);
-                    put(e, STP_X(0, 1, 28, 0));
-                    put_lit(e, 0, pc + 4);
-                    put(e, STR_X(0, 28, HV_CPU_PC));
+                    put_lit(e, 15, pc + 4);
                     e->flags = set ? flags | HV_BLOCK_SPX : flags & ~HV_BLOCK_SPX;
                     put_ijc_jump(e);
                     e->flags = flags;
