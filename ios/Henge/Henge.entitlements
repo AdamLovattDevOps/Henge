@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Lets StikDebug (or Henge's built-in StikJIT helper) attach. On iOS 26 and
+	     later only an attached debugger can give an app executable memory. -->
+	<key>get-task-allow</key>
+	<true/>
+	<!-- For the routes that need no trap servicer (TrollStore, jailbreaks, before
+	     iOS 26). Banned on TrollStore under PPL/TXM: strip it for a .tipa. -->
+	<key>dynamic-codesigning</key>
+	<true/>
+	<!-- Recommended, not required: the guest's RAM and the JIT region on top of
+	     the app itself. Without it the guest is sized to what is left. -->
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+	<!-- Guest RAM plus the JIT region's two mappings sit past the default address-space cap. -->
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+</dict>
+</plist>
