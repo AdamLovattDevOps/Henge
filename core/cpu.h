@@ -64,9 +64,11 @@ typedef struct HvCpu {
     uint64_t ijc_salt[2];    /* 0x3d8: tags are VA ^ salt, [0] for user (EL0) tables, [1] kernel (see hv_ijc_* in mmu.c) */
     uint64_t miss_site;      /* 0x3e8: --stats: guest PC of the branch whose cache lookup just missed */
     uint64_t excl_addr;      /* 0x3f0: exclusive monitor: guest VA, or ~0 when clear */
-    uint32_t excl_size;      /* 0x3f8: bytes LDXR read in C (and saved in excl_val), 0 if translated code set the monitor */
-    uint32_t pad0;           /* keeps the TLB at 0x400 */
-    /* 0x400: [0] EL0 and unprivileged accesses, [1] EL1, [2] EL1 with PSTATE.PAN set,
+    uint32_t excl_size;      /* 0x3f8: bytes the LDXR read */
+    uint32_t pad0;
+    uint64_t excl_val[2];    /* 0x400: what it read (a pair's two halves) */
+    uint64_t pad2[6];        /* keeps the TLB at 0x440 */
+    /* 0x440: [0] EL0 and unprivileged accesses, [1] EL1, [2] EL1 with PSTATE.PAN set,
        so toggling PAN (the kernel does it around every user copy) flushes nothing. */
     HvTlbEntry tlb[3][HV_TLB_SIZE];
 
@@ -75,10 +77,9 @@ typedef struct HvCpu {
     uint32_t el;
     uint32_t spsel;
 
-    /* Exclusive monitor (with excl_addr and excl_size above). One CPU: translated
-       LDXR/STXR only compare the address. The C path (pairs, slow memory) makes
-       STXR a compare-and-swap against the value LDXR saw, the way QEMU does it. */
-    uint64_t excl_val[2];
+    /* The exclusive monitor is excl_addr, excl_size and excl_val above: STXR is a
+       compare-and-swap against the value the LDXR saw, the way QEMU does it, so
+       another CPU's store in between makes it fail. */
 
     uint64_t tcr_el1;
     uint64_t ttbr0_el1;
@@ -122,6 +123,7 @@ typedef struct HvCpu {
     uint64_t icount;         /* blocks entered, for tests and stats */
     int halted;              /* SYSTEM_OFF / SYSTEM_RESET / guest panic: the machine stops */
     int off;                 /* PSCI: powered off (a secondary not started yet, or CPU_OFF) until CPU_ON */
+    int parked_off;          /* off, and its thread is waiting (so CPU_ON may reset it) */
 } HvCpu;
 
 #define HV_CPU_X(n)        ((n) * 8)
@@ -155,7 +157,8 @@ typedef struct HvCpu {
 #define HV_CPU_MISS_SITE   0x3e8
 #define HV_CPU_EXCL_ADDR   0x3f0
 #define HV_CPU_EXCL_SIZE   0x3f8
-#define HV_CPU_TLB         0x400
+#define HV_CPU_EXCL_VAL    0x400
+#define HV_CPU_TLB         0x440
 
 /* Indirect-branch cache: one table per block-flags value, 64K entries of 16 bytes,
    indexed by ((va ^ va >> 16) >> 2) so code at the same offset in different pages spreads out. */
@@ -186,6 +189,7 @@ _Static_assert(offsetof(HvCpu, ijc_salt) == HV_CPU_IJC_SALT, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, excl_addr) == HV_CPU_EXCL_ADDR, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, el0_cnt) == HV_CPU_EL0_CNT, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, excl_size) == HV_CPU_EXCL_SIZE, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, excl_val) == HV_CPU_EXCL_VAL, "HvCpu layout");
 _Static_assert(sizeof(HvTlbEntry) == 32, "TLB entries are indexed with lsl #5");
 
 /* Why the last block returned to the dispatcher. */

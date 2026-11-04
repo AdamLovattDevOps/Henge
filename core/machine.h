@@ -98,7 +98,22 @@ typedef struct HvPerCpu {
     pthread_mutex_t wake_mu;
     pthread_cond_t wake_cv;
     int wake_pending;
+    /* Work other CPUs ask of this one (only the owner may touch its TLB and
+       branch cache while it runs). Posting bumps req_seq; the owner does the
+       work at its next dispatcher entry and publishes ack_seq. */
+    pthread_mutex_t req_mu;
+    uint32_t req_flags;          /* HV_REQ_* */
+    uint32_t nreq;
+    struct { uint32_t op1, crn, crm, op2; uint64_t xt; } req[64]; /* TLBIs to apply */
+    uint64_t req_seq, ack_seq;
+    /* active: inside the dispatcher loop (0 while parked: WFI, powered off, at a
+       flush barrier). tlb_live: active and not itself waiting for acks, i.e. it
+       may be using TLB entries right now. */
+    int active, tlb_live;
 } HvPerCpu;
+
+#define HV_REQ_TLB_ALL 1u   /* drop the whole TLB and branch cache */
+#define HV_REQ_IJC_RESET 2u /* drop the branch cache (code changed) */
 
 typedef struct HvMachine {
     HvRam ram[HV_MAX_RAM];
@@ -140,6 +155,14 @@ typedef struct HvMachine {
     /* With more than one CPU, only the holder of this runs guest code (a fair
        ticket lock, handed over at every kick and while a CPU sleeps). */
     int big_lock_on;
+    /* Devices, the GIC and the ICC registers: one CPU at a time (recursive). */
+    pthread_mutex_t dev_mu;
+    /* Translating and inserting blocks, the JIT region and the slots. */
+    pthread_mutex_t tr_mu;
+    /* Stopping every CPU to flush all translations. */
+    pthread_mutex_t stw_mu;
+    pthread_cond_t stw_cv;
+    int stw_active;
     pthread_mutex_t big_mu;
     pthread_cond_t big_cv;
     uint64_t big_next, big_serving;
@@ -169,6 +192,17 @@ int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len);
 
 void hv_cpu_reset(HvCpu *cpu, HvMachine *m); /* CPU 0 */
 void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index);
+/* The CPU this thread runs (NULL outside the dispatcher: tests, devices). */
+extern __thread HvCpu *hv_self;
+void hv_dev_lock(HvMachine *m);
+void hv_dev_unlock(HvMachine *m);
+/* Ask another CPU to apply a TLBI (or HV_REQ_* work); returns the sequence to wait for. */
+uint64_t hv_cpu_post_tlbi(HvCpu *target, uint32_t op1, uint32_t crn, uint32_t crm, uint32_t op2, uint64_t xt);
+uint64_t hv_cpu_post(HvCpu *target, uint32_t flags);
+/* Wait until target has done everything up to seq (or is parked, and will before it runs). */
+void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq);
+/* The owner: do what other CPUs asked. */
+void hv_cpu_process_requests(HvCpu *cpu);
 void hv_big_lock(HvMachine *m);
 void hv_big_unlock(HvMachine *m);
 /* Let a waiting CPU run (the lock is held again on return). */

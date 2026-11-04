@@ -101,7 +101,7 @@ static void pvg_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
                            (unsigned long long)v, size);
 }
 
-static uint64_t tick(HvMachine *m, HvCpu *cpu) {
+static uint64_t tick_locked(HvMachine *m, HvCpu *cpu) {
     HvVmapple *b = m->tick_opaque;
     uint64_t deadline = hv_timer_update(b->gic, cpu);
     if (cpu->index != 0) return deadline; /* the others only have their own timers to look after */
@@ -114,6 +114,14 @@ static uint64_t tick(HvMachine *m, HvCpu *cpu) {
     hv_virtio_input_poll(b->mouse);
     hv_virtio_snd_poll(b->snd);
     return deadline; /* every GIC state change already updated the CPU's lines */
+}
+
+/* Devices and the GIC are shared by the CPUs: one at a time. */
+static uint64_t tick(HvMachine *m, HvCpu *cpu) {
+    hv_dev_lock(m);
+    uint64_t deadline = tick_locked(m, cpu);
+    hv_dev_unlock(m);
+    return deadline;
 }
 
 int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size, HvDisk *root, HvDisk *aux,

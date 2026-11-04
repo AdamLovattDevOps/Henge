@@ -1,5 +1,6 @@
 #include "exception.h"
 
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -144,15 +145,22 @@ static uint64_t psci(HvCpu *cpu, uint64_t fn) {
         HvCpu *t = cpu_by_mpidr(cpu->m, cpu->x[1]);
         if (!t) return (uint64_t)-2;                         /* INVALID_PARAMETERS */
         if (!t->off) return (uint64_t)-4;                    /* ALREADY_ON */
+        while (!__atomic_load_n(&t->parked_off, __ATOMIC_SEQ_CST)) sched_yield(); /* still on its way out of CPU_OFF */
         uint64_t mpidr = t->mpidr, entry = cpu->x[2], context = cpu->x[3];
         if ((uint32_t)fn == 0x84000003) entry = (uint32_t)entry, context = (uint32_t)context;
-        /* As at reset: EL1h, MMU and caches off, everything masked. */
+        /* As at reset: EL1h, MMU and caches off, everything masked. Its thread
+           waits on wake_mu, so it cannot see the CPU half reset. */
+        pthread_mutex_lock(&t->pc_state->wake_mu);
+        HvPerCpu *pcs = t->pc_state;
         hv_cpu_reset_index(t, cpu->m, t->index);
         t->mpidr = mpidr;
         t->pc = entry;
         t->x[0] = context;
+        t->parked_off = 1;
         __atomic_store_n(&t->off, 0, __ATOMIC_RELEASE);
-        hv_cpu_wake(t);
+        pcs->wake_pending = 1;
+        pthread_cond_signal(&pcs->wake_cv);
+        pthread_mutex_unlock(&pcs->wake_mu);
         return 0;
     }
     case 0x84000004: case 0xc4000004: {                      /* AFFINITY_INFO: 0 on, 1 off */

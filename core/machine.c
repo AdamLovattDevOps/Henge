@@ -1,10 +1,12 @@
 #include "machine.h"
 
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "mmu.h"
+#include "sysreg.h"
 
 extern void hv_exit(void);
 extern void hv_helper_entry(void);
@@ -20,6 +22,13 @@ int hv_machine_init(HvMachine *m, size_t jit_bytes) {
     if (!m->slots) return -1;
     pthread_mutex_init(&m->big_mu, NULL);
     pthread_cond_init(&m->big_cv, NULL);
+    pthread_mutexattr_t ra;
+    pthread_mutexattr_init(&ra);
+    pthread_mutexattr_settype(&ra, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&m->dev_mu, &ra);
+    pthread_mutex_init(&m->tr_mu, NULL);
+    pthread_mutex_init(&m->stw_mu, NULL);
+    pthread_cond_init(&m->stw_cv, NULL);
     for (int i = 0; i < HV_MAX_CPUS; i++) { /* untouched pages cost nothing, so every CPU gets its tables now */
         HvPerCpu *p = &m->percpu[i];
         p->ijc = calloc(HV_IJC_TABLES * HV_IJC_TABLE_BYTES / 8, 8);
@@ -27,8 +36,85 @@ int hv_machine_init(HvMachine *m, size_t jit_bytes) {
         if (!p->ijc || !p->ucode) return -1;
         pthread_mutex_init(&p->wake_mu, NULL);
         pthread_cond_init(&p->wake_cv, NULL);
+        pthread_mutex_init(&p->req_mu, NULL);
     }
     return 0;
+}
+
+__thread HvCpu *hv_self;
+
+void hv_dev_lock(HvMachine *m) {
+    pthread_mutex_lock(&m->dev_mu);
+}
+
+void hv_dev_unlock(HvMachine *m) {
+    pthread_mutex_unlock(&m->dev_mu);
+}
+
+static uint64_t post_locked_done(HvCpu *target, HvPerCpu *p) {
+    uint64_t seq = __atomic_add_fetch(&p->req_seq, 1, __ATOMIC_SEQ_CST);
+    pthread_mutex_unlock(&p->req_mu);
+    __atomic_store_n(&target->exit_req, 1, __ATOMIC_SEQ_CST);
+    return seq;
+}
+
+uint64_t hv_cpu_post_tlbi(HvCpu *target, uint32_t op1, uint32_t crn, uint32_t crm, uint32_t op2, uint64_t xt) {
+    HvPerCpu *p = target->pc_state;
+    pthread_mutex_lock(&p->req_mu);
+    if (p->nreq < sizeof p->req / sizeof p->req[0]) {
+        p->req[p->nreq].op1 = op1, p->req[p->nreq].crn = crn, p->req[p->nreq].crm = crm, p->req[p->nreq].op2 = op2;
+        p->req[p->nreq].xt = xt;
+        p->nreq++;
+    } else {
+        p->req_flags |= HV_REQ_TLB_ALL; /* too many queued: drop everything instead */
+    }
+    return post_locked_done(target, p);
+}
+
+uint64_t hv_cpu_post(HvCpu *target, uint32_t flags) {
+    HvPerCpu *p = target->pc_state;
+    pthread_mutex_lock(&p->req_mu);
+    p->req_flags |= flags;
+    return post_locked_done(target, p);
+}
+
+void hv_cpu_process_requests(HvCpu *cpu) {
+    HvPerCpu *p = cpu->pc_state;
+    uint64_t seq = __atomic_load_n(&p->req_seq, __ATOMIC_ACQUIRE);
+    if (seq == __atomic_load_n(&p->ack_seq, __ATOMIC_RELAXED)) return;
+    static __thread struct { uint32_t op1, crn, crm, op2; uint64_t xt; } q[64];
+    pthread_mutex_lock(&p->req_mu);
+    seq = p->req_seq;
+    uint32_t flags = p->req_flags, n = p->nreq;
+    memcpy(q, p->req, n * sizeof q[0]);
+    p->req_flags = 0;
+    p->nreq = 0;
+    pthread_mutex_unlock(&p->req_mu);
+    if (flags & HV_REQ_TLB_ALL) {
+        hv_tlb_flush(cpu);
+    } else {
+        for (uint32_t i = 0; i < n; i++) hv_tlbi_apply(cpu, q[i].op1, q[i].crn, q[i].crm, q[i].op2, q[i].xt);
+    }
+    if (flags & HV_REQ_IJC_RESET) {
+        hv_ijc_reset(cpu, 0);
+        hv_ijc_reset(cpu, 1);
+    }
+    __atomic_store_n(&p->ack_seq, seq, __ATOMIC_RELEASE);
+}
+
+void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
+    HvPerCpu *t = target->pc_state, *s = self ? self->pc_state : NULL;
+    if (s) __atomic_store_n(&s->tlb_live, 0, __ATOMIC_SEQ_CST); /* others need not wait for this one meanwhile */
+    for (uint32_t spins = 0;; spins++) {
+        if (__atomic_load_n(&t->ack_seq, __ATOMIC_ACQUIRE) >= seq) break;
+        if (!__atomic_load_n(&t->tlb_live, __ATOMIC_SEQ_CST)) break; /* parked: it does the work before it runs again */
+        if (self) hv_cpu_process_requests(self);
+        if (spins > 200) sched_yield();
+    }
+    if (s) {
+        __atomic_store_n(&s->tlb_live, 1, __ATOMIC_SEQ_CST);
+        hv_cpu_process_requests(self); /* anything that came in while we were not live */
+    }
 }
 
 void hv_big_lock(HvMachine *m) {
@@ -128,14 +214,21 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
        retranslated the next time it is looked up. The block running now may
        finish with the old code, as it would with a real instruction pipeline. */
     r->code_pages[pg] = 0;
-    r->page_gen[pg]++;
+    __atomic_add_fetch(&r->page_gen[pg], 1, __ATOMIC_SEQ_CST);
     m->stats.flush_smc++;
-    /* The indirect-branch cache may lead into the stale blocks: start it over. */
-    for (int i = 0; i < m->ncpus; i++)
-        if (m->cpus[i]) {
-            hv_ijc_reset(m->cpus[i], 0);
-            hv_ijc_reset(m->cpus[i], 1);
+    /* The indirect-branch cache may lead into the stale blocks: start it over,
+       here at once and on the other CPUs before they next leave a block (their
+       cache lookups and chained exits check exit_req first). */
+    for (int i = 0; i < m->ncpus; i++) {
+        HvCpu *c = m->cpus[i];
+        if (!c) continue;
+        if (!hv_self || c == hv_self) {
+            hv_ijc_reset(c, 0);
+            hv_ijc_reset(c, 1);
+        } else {
+            hv_cpu_post(c, HV_REQ_IJC_RESET);
         }
+    }
     m->stats.reset_why[4]++;
     /* Make a running chain leave (chains stay patched: see chain() in dispatch.c). */
     hv_machine_kick_all(m);
@@ -164,7 +257,9 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
     }
     HvMmio *d = hv_mmio_lookup(m, pa);
     if (!d || len > 8) return -1;
+    hv_dev_lock(m);
     uint64_t v = d->read ? d->read(d->opaque, pa - d->pa, len) : 0;
+    hv_dev_unlock(m);
     memcpy(buf, &v, len);
     if (m->log >= 3)
         fprintf(stderr, "mmio read  %s+%llx size %u = %llx pc %llx\n", d->name, (unsigned long long)(pa - d->pa), len,
@@ -197,7 +292,9 @@ int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
     if (m->log >= 3)
         fprintf(stderr, "mmio write %s+%llx size %u = %llx pc %llx\n", d->name, (unsigned long long)(pa - d->pa), len,
                 (unsigned long long)v, (unsigned long long)m->access_pc);
+    hv_dev_lock(m);
     if (d->write) d->write(d->opaque, pa - d->pa, v, len);
+    hv_dev_unlock(m);
     return 0;
 }
 

@@ -379,6 +379,13 @@ static void tlb_fill(HvCpu *cpu, uint64_t va, int el, const HvWalk *w) {
         e->write_tag = HV_TLB_INVALID;
     if (cpu->m->watch_pa && (cpu->m->watch_pa & ~PAGE_MASK) == page_pa) e->write_tag = HV_TLB_INVALID;
     e->exec_tag = w->x ? page_va : HV_TLB_INVALID;
+    /* Another CPU may have just translated code from this page, setting
+       code_pages and then dropping write tags in every TLB: if that came after
+       the check above, the entry written here must not stay writable. */
+    if (e->write_tag != HV_TLB_INVALID) {
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        if (__atomic_load_n(&ram->code_pages[pg], __ATOMIC_RELAXED)) e->write_tag = HV_TLB_INVALID;
+    }
 }
 
 uint32_t hv_mmu_access(HvCpu *cpu, uint64_t va, HvAccess acc, int el, uint64_t *pa) {

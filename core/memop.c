@@ -527,9 +527,7 @@ static int do_exclusive(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint
     uint64_t mask = esize == 8 ? ~0ull : (1ull << (esize * 8)) - 1;
     uint64_t n0 = gpr(cpu, op->rt) & mask, n1 = pair ? gpr(cpu, op->rt2) & mask : 0;
     int ok = 0;
-    if (cpu->excl_addr == va && cpu->excl_size == 0) { /* translated LDXR set it: no value to compare */
-        ok = host ? (memcpy(host, &n0, esize), 1) : !hv_phys_write(cpu->m, pa, &n0, esize);
-    } else if (cpu->excl_addr == va && cpu->excl_size == bytes) {
+    if (cpu->excl_addr == va && cpu->excl_size == bytes) {
         if (!host) {
             ok = !hv_phys_write(cpu->m, pa, &n0, esize) && (!pair || !hv_phys_write(cpu->m, pa + esize, &n1, esize));
         } else if (!pair) {

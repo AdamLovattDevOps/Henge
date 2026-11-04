@@ -259,7 +259,7 @@ int main(int argc, char **argv) {
     m.chain = !no_chain && brk == ~0ull; /* breakpoints need every block to come back */
     if (ncpus < 1) ncpus = 1;
     if (ncpus > HV_MAX_CPUS) ncpus = HV_MAX_CPUS;
-    m.big_lock_on = ncpus > 1;
+    m.big_lock_on = ncpus > 1 && getenv("HV_BIG_LOCK"); /* debugging: one CPU in guest code at a time */
     HvCfgParams cfg = {.nr_cpus = (uint32_t)ncpus, .ecid = ecid, .seed = seed, .mac_en0 = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01}};
     static const uint8_t mac[6] = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01};
     if (hv_vmapple_create(&board, &m, &cpu, ram_mb << 20, &disk, &aux, &cfg, mac) != 0 ||

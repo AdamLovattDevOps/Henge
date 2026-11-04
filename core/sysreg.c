@@ -142,7 +142,9 @@ static int read_reg(HvCpu *cpu, uint32_t reg, uint64_t *v) {
     }
     /* GIC CPU interface (ICC_*_EL1): CRn 12, CRm 8..12, and ICC_PMR_EL1. */
     if (reg == R(3, 0, 4, 6, 0) || ((reg >> 14) == 3 && ((reg >> 11) & 7) == 0 && ((reg >> 7) & 15) == 12 && ((reg >> 3) & 15) >= 8)) {
+        hv_dev_lock(m);
         *v = m->icc_read ? m->icc_read(m, cpu, reg) : 0;
+        hv_dev_unlock(m);
         return 0;
     }
     /* The rest of the ID space reads as zero; so do debug and PMU registers. */
@@ -247,7 +249,9 @@ other:
         return 0;
     if (reg == R(3, 0, 4, 6, 0) ||
         ((reg >> 14) == 3 && ((reg >> 11) & 7) == 0 && ((reg >> 7) & 15) == 12 && ((reg >> 3) & 15) >= 8)) {
+        hv_dev_lock(m);
         if (m->icc_write) m->icc_write(m, cpu, reg, v);
+        hv_dev_unlock(m);
         return 0;
     }
     /* Debug and PMU registers: ignored. */
@@ -324,8 +328,8 @@ int hv_sysreg_msr(HvCpu *cpu, uint32_t insn, uint64_t pc) {
 }
 
 /* One TLBI, applied to one CPU's TLB and indirect-branch cache. */
-static void tlbi(HvCpu *cpu, uint32_t op1, uint32_t crn, uint32_t crm, uint32_t op2, uint64_t xt, uint64_t pc) {
-    (void)crn;
+void hv_tlbi_apply(HvCpu *cpu, uint32_t op1, uint32_t crn, uint32_t crm, uint32_t op2, uint64_t xt) {
+    uint64_t pc = cpu->pc;
     /* VAE1, VAAE1, VALE1, VAALE1 (and their IS/OS forms) name one page:
        Xt[43:0] is VA[55:12]. Everything else (all, by ASID, ranges) drops it all. */
     int by_va = crn == 8 && op1 == 0 && (crm == 1 || crm == 3 || crm == 7) && (op2 & 1);
@@ -402,13 +406,18 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
     }
     if (crn == 8 || crn == 9) { /* TLBI */
         if (cpu->el == 0) return undefined(cpu, pc);
-        /* The shareable forms (IS, OS: CRm 1, 2, 3, 5) reach every CPU. With the
-           big lock the others are parked, so their TLBs can be changed from here. */
+        /* The shareable forms (IS, OS: CRm 1, 2, 3, 5) reach every CPU: each does
+           it to its own TLB, and this one waits until they have (a TLBI has
+           finished for everyone once the DSB after it completes). */
         HvMachine *m = cpu->m;
+        hv_tlbi_apply(cpu, op1, crn, crm, op2, xt);
         int broadcast = (crm == 1 || crm == 2 || crm == 3 || crm == 5) && m && m->ncpus > 1;
-        for (int i = 0; i < (broadcast ? m->ncpus : 1); i++) {
-            HvCpu *c = broadcast ? m->cpus[i] : cpu;
-            if (c) tlbi(c, op1, crn, crm, op2, xt, pc);
+        if (broadcast) {
+            uint64_t seq[HV_MAX_CPUS] = {0};
+            for (int i = 0; i < m->ncpus; i++)
+                if (m->cpus[i] && m->cpus[i] != cpu) seq[i] = hv_cpu_post_tlbi(m->cpus[i], op1, crn, crm, op2, xt);
+            for (int i = 0; i < m->ncpus; i++)
+                if (seq[i]) hv_cpu_sync(cpu, m->cpus[i], seq[i]);
         }
         return 0;
     }

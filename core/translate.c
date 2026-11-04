@@ -466,16 +466,23 @@ static void translate_branch_reg(Emit *e, uint32_t insn, uint64_t pc) {
    for x18/x28 operands. A miss goes out of line to hv_mem_emulate, which does
    the whole instruction (writeback included) and comes back to the join. */
 static void translate_mem(Emit *e, uint32_t insn, uint64_t pc);
+static void put_load_field(Emit *e, int rt, uint32_t off);
+static void put_store_field(Emit *e, int rt, uint32_t off);
 
-/* LDXR/LDAXR and STXR/STLXR (not the pairs). There is one CPU, so the monitor
-   is just the address: LDXR is a plain load that records it, STXR a plain
-   store if it is still the recorded one. Exceptions and CLREX clear it, so an
-   interrupt between the two makes the STXR fail and the guest retry, as on
-   hardware. The access itself goes through the ordinary fast path. */
+/* LDXR/LDAXR and STXR/STLXR (not the pairs), the way QEMU does them: LDXR is
+   an ordinary load that records the address, size and value; STXR, if the
+   address still matches, is a compare-and-swap of that value (CASAL, through
+   the ordinary fast path), and succeeds if memory still held it. Another CPU's
+   store in between makes it fail, and so does an exception (which clears the
+   address), as on hardware; only an ABA change goes unnoticed. */
 static void translate_excl(Emit *e, uint32_t insn, uint64_t pc) {
     uint32_t size = insn >> 30;
     int rn = (insn >> 5) & 0x1f, rt = insn & 0x1f, rs = (insn >> 16) & 0x1f;
     int load = (insn >> 22) & 1;
+    if (!load && (rs == 31 || rs == rt || rs == rn)) { /* the status register is the CAS's compare value: keep these in C */
+        put_helper(e, pc, insn, HV_OP_MEM);
+        return;
+    }
     int a = rn;
     if (rn == 31 || is_stolen(rn)) {
         put(e, LDR_X(15, 28, slot_of(rn)));
@@ -483,23 +490,34 @@ static void translate_excl(Emit *e, uint32_t insn, uint64_t pc) {
     }
     if (load) {
         put(e, STR_X(a, 28, HV_CPU_EXCL_ADDR));
-        put(e, STR_X(31, 28, HV_CPU_EXCL_SIZE)); /* xzr: set by translated code */
+        put(e, 0x52800006u | (1u << size) << 5);                /* movz w6, #bytes */
+        put(e, 0xb9000000u | (HV_CPU_EXCL_SIZE / 4) << 10 | 28 << 5 | 6); /* str w6, [x28, #excl_size] */
         translate_mem(e, size << 30 | 0x39400000u | (uint32_t)rn << 5 | (uint32_t)rt, pc); /* ldr{b,h} rt, [rn] */
+        put_store_field(e, rt, HV_CPU_EXCL_VAL);
         return;
     }
     put(e, LDR_X(6, 28, HV_CPU_EXCL_ADDR));
     put(e, 0xca000000u | (uint32_t)a << 16 | 6 << 5 | 6); /* eor x6, x6, xa */
     uint32_t to_fail = e->n;
     put(e, CBNZ_X(6));
-    put(e, 0x92800006u);                                   /* movn x6, #0: clear */
+    put(e, 0x92800006u);                                   /* movn x6, #0: the monitor clears either way */
     put(e, STR_X(6, 28, HV_CPU_EXCL_ADDR));
-    translate_mem(e, size << 30 | 0x39000000u | (uint32_t)rn << 5 | (uint32_t)rt, pc); /* str{b,h} rt, [rn] */
+    put_load_field(e, rs, HV_CPU_EXCL_VAL);                /* rs = the value LDXR saw */
+    translate_mem(e, size << 30 | 0x08e0fc00u | (uint32_t)rs << 16 | (uint32_t)rn << 5 | (uint32_t)rt, pc); /* casal */
+    /* rs now holds what memory held: success if that is what LDXR saw. */
+    if (is_stolen(rs)) put(e, LDR_X(7, 28, slot_of(rs)));
+    else put(e, MOV_X(7, rs));
+    put(e, LDR_X(6, 28, HV_CPU_EXCL_VAL));
+    put(e, 0xca000000u | 7 << 16 | 6 << 5 | 6);            /* eor x6, x6, x7 */
+    uint32_t to_lost = e->n;
+    put(e, CBNZ_X(6));
     put_const_to(e, rs, 0);
     uint32_t to_done = e->n;
     put(e, B_OP);
     patch_branch(&e->w[to_fail], (int64_t)e->n - to_fail);
     put(e, 0x92800006u);
     put(e, STR_X(6, 28, HV_CPU_EXCL_ADDR));
+    patch_branch(&e->w[to_lost], (int64_t)e->n - to_lost);
     put_const_to(e, rs, 1);
     patch_branch(&e->w[to_done], (int64_t)e->n - to_done);
 }
