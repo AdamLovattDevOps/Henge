@@ -265,7 +265,23 @@ static void *fast_resume(HvCpu *cpu) {
 /* Blocks call this through hv_helper_entry. Returns 1 to leave the block. */
 static uint64_t reg_hist[65536]; /* --stats: MRS/MSR/SYS by op0:op1:CRn:CRm:op2; reads low, writes high 32 bits */
 
+static uint32_t helper(HvCpu *cpu, const HvHelperInfo *info_in);
+
 uint32_t hv_helper(HvCpu *cpu, const HvHelperInfo *info_in) {
+    uint32_t r = helper(cpu, info_in);
+    /* An exception just taken (an abort, an undefined instruction, a trap): its
+       vector's block, as after an SVC. */
+    if (r && cpu->exit_reason == HV_EXIT_EXCEPTION) {
+        void *code = fast_resume(cpu);
+        if (code) {
+            cpu->helper_ret = (uint64_t)(uintptr_t)code;
+            return 0;
+        }
+    }
+    return r;
+}
+
+static uint32_t helper(HvCpu *cpu, const HvHelperInfo *info_in) {
     HvHelperInfo info_copy = *info_in;
     info_copy.op &= 0xff; /* the rest: hv_helper_thunk's refill flags */
     const HvHelperInfo *info = &info_copy;
@@ -287,15 +303,7 @@ uint32_t hv_helper(HvCpu *cpu, const HvHelperInfo *info_in) {
     case HV_OP_SYS:
         return hv_sysreg_sys(cpu, info->insn, info->pc);
     case HV_OP_EXCEPTION: {
-        int r = hv_exception_insn(cpu, info->insn, info->pc);
-        if (r && (info->insn & 0xffe0001fu) == 0xd4000001u) { /* SVC: into the vector's block directly */
-            void *code = fast_resume(cpu);
-            if (code) {
-                cpu->helper_ret = (uint64_t)(uintptr_t)code;
-                return 0;
-            }
-        }
-        return r;
+        return hv_exception_insn(cpu, info->insn, info->pc); /* SVC: see hv_helper */
     }
     case HV_OP_ERET: {
         hv_eret(cpu);
