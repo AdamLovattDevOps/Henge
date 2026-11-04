@@ -15,6 +15,11 @@ struct HengeApp: App {
         JITBootstrap.installTrapGuard()
         try? AVAudioSession.sharedInstance().setCategory(.playback, options: [.mixWithOthers])
         Machines.shared.collectImports()
+        // The display question: does this iOS have Apple's paravirtualized graphics at all?
+        for path in ["/System/Library/Frameworks/ParavirtualizedGraphics.framework/ParavirtualizedGraphics",
+                     "/System/Library/PrivateFrameworks/ParavirtualizedGraphics.framework/ParavirtualizedGraphics"] {
+            HengeLog.log("app", "\(path): \(dlopen(path, RTLD_LAZY) != nil ? "present" : "absent")")
+        }
     }
 
     var body: some Scene {

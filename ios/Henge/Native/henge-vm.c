@@ -8,6 +8,10 @@
 #include "henge-ios-jit.h"
 #include "net_slirp.h"
 #include "vm.h"
+#include "install.h"
+
+#include <fcntl.h>
+#include <unistd.h>
 
 HENGE_EXPORT HengeDualMapping *henge_ios_jit_get_mapping(void);
 
@@ -39,6 +43,61 @@ int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t e
     state = 1;
     hv_vm_start(1, on_exit);
     return 0;
+}
+
+static volatile int install_step = -1;
+static volatile double install_progress;
+
+static void on_install_progress(int step, double p, void *user) {
+    (void)user;
+    install_step = step;
+    install_progress = p;
+    static int last = -1, lastpct = -1;
+    int pct = (int)(p * 100);
+    if (step != last || pct / 10 != lastpct / 10) {
+        fprintf(stderr, "henge: install step %d %d%%\n", step, pct);
+        last = step, lastpct = pct;
+    }
+}
+
+int henge_vm_install(const char *rom, const char *disk, const char *aux, uint64_t ecid, const char *ipsw,
+                     const char *workdir, uint64_t ram_mb, int cpus, char *err, size_t errlen) {
+    if (state) {
+        snprintf(err, errlen, "A machine has already run in this session. Quit Henge and open it again to start another.");
+        return -1;
+    }
+    HengeDualMapping *jit = henge_ios_jit_get_mapping();
+    if (!jit || !jit->rw_addr) {
+        snprintf(err, errlen, "Henge has no JIT region. Turn on JIT first.");
+        return -1;
+    }
+    HvVmConfig c = {.rom = rom, .disk = disk, .aux = aux, .ecid = ecid, .ram_mb = ram_mb, .ncpus = cpus, .log = 1,
+                    .installer = 1, .no_sound = 1, .jit_rx = jit->rx_addr, .jit_rw = jit->rw_addr, .jit_bytes = jit->size};
+    fprintf(stderr, "henge: installing %s with %d CPUs, %llu MB RAM\n", ipsw, cpus, (unsigned long long)ram_mb);
+    if (hv_vm_create(&c, err, errlen) != 0) return -1;
+    install_step = 0;
+    install_progress = 0;
+    if (hv_install_start(hv_vm_board()->vusb, ipsw, workdir, ecid, on_install_progress, NULL) != 0) {
+        snprintf(err, errlen, "The installer could not start.");
+        return -1;
+    }
+    state = 1;
+    hv_vm_start(1, on_exit);
+    return 0;
+}
+
+int henge_install_step(void) { return install_step; }
+double henge_install_progress(void) { return install_progress; }
+
+/* VZMacAuxiliaryStorage's new file: a 64-byte header, the rest zero (32 MB + 16 KB). */
+int henge_make_aux(const char *path) {
+    static const unsigned char header[24] = {0xa5, 0xd5, 0xb3, 0xfe, 0x97, 0xad, 0x1d, 0x27, 1, 0, 0, 0, 0, 0, 0, 0,
+                                             1, 0, 0, 0, 0, 0, 0, 0};
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return -1;
+    int ok = write(fd, header, sizeof header) == (ssize_t)sizeof header && ftruncate(fd, 33570816) == 0;
+    close(fd);
+    return ok ? 0 : -1;
 }
 
 int henge_vm_state(void) { return state; }

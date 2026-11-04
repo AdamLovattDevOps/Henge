@@ -12,11 +12,6 @@
 
 #include "curl/curl.h"
 
-struct curl_slist_shim {
-    char *data;
-    struct curl_slist_shim *next;
-};
-
 typedef struct {
     char *url, *useragent;
     const void *postfields;

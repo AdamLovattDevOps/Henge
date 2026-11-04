@@ -56,6 +56,9 @@ targets:
           - "$(inherited)"
           # The engine (make ios-lib) and what its network needs (scripts/fetch_deps.sh).
           - "-lhengevm"
+          # The installer (tools/build_ios_restore.sh): libirecovery, usbmuxd, idevicerestore and their libraries.
+          - "-lhengerestore"
+          - "-lz"
           - "-lslirp"
           - "-lglib-2.0"
           - "-lintl"
@@ -79,8 +82,17 @@ targets:
           set -e
           cd "$SRCROOT/.."
           make ios-lib
+          ./tools/build_ios_restore.sh
         basedOnDependencyAnalysis: false
     postBuildScripts:
+      - name: Bundle the boot ROM
+        # The virtual Mac's ROM, from this Mac's Virtualization.framework (Apple's, not
+        # in the repository): installing on the iPhone needs it, as VZ's installer does.
+        script: |
+          set -e
+          ROM=/System/Library/Frameworks/Virtualization.framework/Versions/A/Resources/AVPBooter.vmapple2.bin
+          cp "$ROM" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/AVPBooter.vmapple2.bin"
+        basedOnDependencyAnalysis: false
       - name: Embed StikJIT
         # As in Husk: the helper links StikJIT; it lives in the app's Frameworks
         # with a minimal Info.plist (installd refuses one without), signed here.

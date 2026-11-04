@@ -223,10 +223,27 @@ static void run(Xfer *x) {
     }
     uint8_t ep = t->endpoint;
     int in = (ep & 0x80) != 0, ix = ep_index(ep);
+    int acks = 1; /* responses that end this transfer */
     if (!in) {
-        if (hv_vusb_send(g_usb, HV_VUSB_REQ_DATA, ep, t->buffer, (uint32_t)t->length) != 0) {
-            complete(x, LIBUSB_TRANSFER_NO_DEVICE, 0);
+        /* On a real bus the data goes in packets and fills the device's
+           posted reads one after another; here each request is one read,
+           which must fit the guest's buffer (16 KB, usbmux's receive size; a
+           bigger one panics the guest's driver). So send it in pieces. */
+        static int chunk;
+        if (!chunk) chunk = getenv("HV_USB_OUT_CHUNK") ? atoi(getenv("HV_USB_OUT_CHUNK")) : 16384;
+        acks = 0;
+        if (t->length == 0) { /* a zero-length packet: this link delimits transfers itself */
+            complete(x, LIBUSB_TRANSFER_COMPLETED, 0);
             return;
+        }
+        for (int off = 0; off < t->length || (off == 0 && t->length == 0); off += chunk) {
+            int n = t->length - off < chunk ? t->length - off : chunk;
+            if (hv_vusb_send(g_usb, HV_VUSB_REQ_DATA, ep, t->buffer + off, (uint32_t)n) != 0) {
+                complete(x, LIBUSB_TRANSFER_NO_DEVICE, 0);
+                return;
+            }
+            acks++;
+            if (t->length == 0) break;
         }
     } else {
         pthread_mutex_lock(&g_mu);
@@ -266,6 +283,7 @@ static void run(Xfer *x) {
                 st = LIBUSB_TRANSFER_ERROR;
             }
             free(m.data);
+            if (st == LIBUSB_TRANSFER_COMPLETED && --acks > 0) continue; /* more pieces to be taken */
             complete(x, st, n);
             return;
         }

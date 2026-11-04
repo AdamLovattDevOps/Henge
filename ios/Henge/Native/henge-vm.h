@@ -9,6 +9,19 @@
    (henge_ios_jit_prewarm), and starts it. 0, or -1 with a reason in err. */
 int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
                   int cpus, char *err, size_t errlen);
+/* Installs macOS from an IPSW onto a new machine (blank disk and auxiliary
+   storage): boots the ROM in DFU mode and runs the restore over its USB port,
+   as Virtualization.framework's installer does. workdir is scratch space.
+   0, or -1 with a reason in err; progress below. */
+int henge_vm_install(const char *rom, const char *disk, const char *aux, uint64_t ecid, const char *ipsw,
+                     const char *workdir, uint64_t ram_mb, int cpus, char *err, size_t errlen);
+/* The restore's step (0 detect, 1 prepare, 2 system image, 3 verify, 4 firmware,
+   6 FUD, 7 personalized images; 100 done, 101 failed) and how far it is (0..1). */
+int henge_install_step(void);
+double henge_install_progress(void);
+/* Writes a blank auxiliary storage file (what VZMacAuxiliaryStorage makes). 0 or -1. */
+int henge_make_aux(const char *path);
+
 /* 0 not started, 1 running, 2 stopped. */
 int henge_vm_state(void);
 /* Why it stopped (an HV_EXIT_* name), once state is 2. */

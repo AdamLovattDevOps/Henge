@@ -122,6 +122,13 @@ final class Machines: ObservableObject {
         importing = nil
     }
 
+    /// A machine made here (the installer), already in its directory.
+    func add(_ mac: VirtualMac) {
+        all.removeAll { $0.id == mac.id }
+        all.append(mac)
+        save()
+    }
+
     func update(_ mac: VirtualMac) {
         guard let i = all.firstIndex(where: { $0.id == mac.id }) else { return }
         all[i] = mac
@@ -137,8 +144,10 @@ final class Machines: ObservableObject {
     private var listURL: URL { Self.root.appendingPathComponent("machines.json") }
 
     /// Disk images are tens of gigabytes: keep them out of iCloud and computer backups.
-    private func excludeFromBackup() {
-        var url = Self.root
+    private func excludeFromBackup() { Self.excludeFromBackup(Self.root) }
+
+    nonisolated static func excludeFromBackup(_ dir: URL) {
+        var url = dir
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
         try? url.setResourceValues(values)

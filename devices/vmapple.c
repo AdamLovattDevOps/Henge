@@ -22,6 +22,20 @@ static void pvpanic_write(void *opaque, uint64_t off, uint64_t v, unsigned size)
     HvVmapple *b = opaque;
     b->panic_events = v;
     fprintf(stderr, "hengevm: guest reported a panic (pvpanic event %llx)\n", (unsigned long long)v);
+    /* The panic text, wherever the kernel formatted it (pram is not always
+       where the log ends up, e.g. in the restore OS). */
+    const char key[] = "panic(cpu ";
+    for (uint8_t *p = b->ram, *end = b->ram + b->ram_size; p && p < end;) {
+        p = memmem(p, (size_t)(end - p), key, sizeof key - 1);
+        if (!p) break;
+        size_t n = 0;
+        while (p + n < end && n < 3000 && (p[n] == '\n' || p[n] == '\t' || (p[n] >= 32 && p[n] < 127))) n++;
+        if (n > 80) {
+            fprintf(stderr, "hengevm: panic text at PA %llx:\n%.*s\n", (unsigned long long)(VMAPPLE_MEM + (uint64_t)(p - b->ram)), (int)n, p);
+            break;
+        }
+        p += sizeof key - 1;
+    }
     if (v & 1)
         for (int i = 0; i < b->ncpus; i++) b->cpu[i].halted = 4;
 }

@@ -6,6 +6,8 @@ struct HomeView: View {
     @ObservedObject private var jit = JITCoordinator.shared
     @Binding var running: VirtualMac?
     @State private var picking = false
+    @State private var installing = false
+    @ObservedObject private var installer = Installer.shared
     @State private var jitReady = JITBootstrap.ready
 
     var body: some View {
@@ -19,6 +21,12 @@ struct HomeView: View {
                                                        : "Bringing in \(name)…")
                     }
                     if let error = machines.lastError { note(error) }
+                    if installer.busy {
+                        Button { installing = true } label: {
+                            progress("Installing \(installer.machineName)… (tap to see)")
+                        }
+                        .buttonStyle(.plain)
+                    }
                     if machines.all.isEmpty {
                         welcome
                     } else {
@@ -33,6 +41,7 @@ struct HomeView: View {
             }
             .background(Stone.page.ignoresSafeArea())
             .toolbar(.hidden, for: .navigationBar)
+            .sheet(isPresented: $installing) { InstallView() }
             .fileImporter(isPresented: $picking, allowedContentTypes: [.folder]) { result in
                 if case let .success(url) = result { machines.importFolder(url) }
             }
@@ -52,14 +61,17 @@ struct HomeView: View {
                 .font(.stone(34))
                 .foregroundStyle(Stone.text)
             Spacer()
-            Button { picking = true } label: {
+            Menu {
+                Button { installing = true } label: { Label("Install macOS…", systemImage: "arrow.down.circle") }
+                Button { picking = true } label: { Label("Bring in a Mac from a computer…", systemImage: "folder") }
+            } label: {
                 Image(systemName: "plus")
                     .font(.system(size: 18, weight: .semibold))
                     .foregroundStyle(Stone.text)
                     .frame(width: 40, height: 40)
                     .background(Stone.raised, in: Circle())
             }
-            .accessibilityLabel("Bring in a Mac")
+            .accessibilityLabel("Add a Mac")
         }
     }
 
@@ -95,10 +107,12 @@ struct HomeView: View {
             Text("A Mac, in the circle")
                 .font(.stone(26))
                 .foregroundStyle(Stone.text)
-            Text("Make the Mac on your computer first (HengeVM or Henge), export it with tools/export_ios.sh, and drop the folder on Henge in Finder, or tap + and choose it in Files.")
+            Text("Tap + and choose Install macOS: Henge downloads it from Apple and installs it right here. Or bring in a Mac made on a computer (tools/export_ios.sh).")
                 .font(.body)
                 .foregroundStyle(Stone.dim)
                 .fixedSize(horizontal: false, vertical: true)
+            Button { installing = true } label: { Text("Install macOS").frame(maxWidth: .infinity) }
+                .buttonStyle(.borderedProminent)
         }
         .padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)

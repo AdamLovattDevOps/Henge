@@ -25,6 +25,8 @@
 #include <config.h>
 #endif
 #include <stdio.h>
+#include <time.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -177,13 +179,23 @@ int asr_send(asr_client_t asr, plist_t data)
 
 int asr_send_buffer(asr_client_t asr, const void* data, size_t size)
 {
-	uint32_t bytes = 0;
-	idevice_error_t device_error = IDEVICE_E_SUCCESS;
-
-	device_error = idevice_connection_send(asr->connection, data, size, &bytes);
-	if (device_error != IDEVICE_E_SUCCESS || bytes != size) {
-		logger(LL_ERROR, "Unable to send data to ASR. Sent %u of %zu bytes.\n", bytes, size);
-		return -1;
+	/* HengeVM: the restore OS writes to a disk that may be slower than the
+	   link (an emulated Mac on a phone), so its receive window can stay shut
+	   for a while; a short send is not an error until nothing moves for
+	   10 minutes (upstream gives up on the first one). */
+	size_t done = 0;
+	time_t last = time(NULL);
+	while (done < size) {
+		uint32_t bytes = 0;
+		idevice_error_t device_error = idevice_connection_send(asr->connection, (const char*)data + done, (uint32_t)(size - done), &bytes);
+		done += bytes;
+		if (bytes) last = time(NULL);
+		if (done == size) break;
+		if ((device_error != IDEVICE_E_SUCCESS && device_error != IDEVICE_E_TIMEOUT && device_error != IDEVICE_E_UNKNOWN_ERROR) || time(NULL) - last > 600) {
+			logger(LL_ERROR, "Unable to send data to ASR. Sent %zu of %zu bytes (error %d).\n", done, size, device_error);
+			return -1;
+		}
+		usleep(20000);
 	}
 
 	return 0;

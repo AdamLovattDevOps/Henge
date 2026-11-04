@@ -13,3 +13,17 @@
 #define HAVE_RESTORE_E_RECEIVE_TIMEOUT 1
 #define PACKAGE_URL "https://libimobiledevice.org"
 #define PACKAGE_BUGREPORT "https://github.com/libimobiledevice"
+#define HAVE_STRNDUP 1
+#define HAVE_STPCPY 1
+#define HAVE_VASPRINTF 1
+#define HAVE_ASPRINTF 1
+#define HAVE_GMTIME_R 1
+#define HAVE_TIMEGM 1
+#define HAVE_MEMMEM 1
+#define HAVE_STRCASECMP 1
+#define HAVE_GETIFADDRS 1
+#define HAVE_FVISIBILITY 1
+#define HAVE_SO_NOSIGPIPE 1
+#define HAVE_PTHREAD 1
+#define HAVE_NET_IF_DL_H 1
+#define HAVE_STPNCPY 1

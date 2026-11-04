@@ -39,7 +39,10 @@
 // we're using 3 * 16384 to optimize for the fragmentation
 // this results in three URBs per full transfer, 32 USB packets each
 // if there are ZLP issues this should make them show up easily too
-#define USB_MTU (3 * 16384)
+/* HengeVM: on the virtual Mac's USB port each transfer is delivered as one
+   read on the device side, which posts 16 KB buffers, so a transfer may not
+   be bigger than that (upstream sends 3 * 16384 and lets the bus split it). */
+#define USB_MTU 16384
 
 #define USB_PACKET_SIZE 512
 
