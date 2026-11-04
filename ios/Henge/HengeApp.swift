@@ -25,7 +25,6 @@ struct HengeApp: App {
     var body: some Scene {
         WindowGroup {
             RootView()
-                .tint(Stone.copper)
                 .onOpenURL { url in HengeLog.log("app", "opened with \(url.absoluteString)") } // henge:// back from LocalDevVPN
         }
     }

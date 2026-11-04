@@ -42,8 +42,8 @@ MUXD_SRC = $(wildcard third_party/usbmuxd/src/*.c)
 IDR_SRC = $(wildcard third_party/idevicerestore/src/*.c)
 RESTORE_OBJ = $(patsubst third_party/%.c,$(RB)/%.o,$(IRECV_SRC) $(MUXD_SRC) $(IDR_SRC))
 
-$(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/audio_mac.o $(B)/vm.o $(B)/usb_host.o $(B)/libusb_shim.o $(B)/install.o $(RESTORE_OBJ)
-	$(CC) $(CFLAGS) host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/audio_mac.o $(B)/vm.o $(B)/usb_host.o $(B)/libusb_shim.o $(B)/install.o $(RESTORE_OBJ) $(RESTORE_LIBS) $(SLIRP_LIBS) -framework AudioToolbox -framework ParavirtualizedGraphics -framework Metal \
+$(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/audio_mac.o $(B)/vm.o $(B)/usb_host.o $(B)/mac-restore/libhengerestore.a
+	$(CC) $(CFLAGS) host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/audio_mac.o $(B)/vm.o $(B)/usb_host.o $(B)/mac-restore/libhengerestore.a -lz -framework Foundation -framework CFNetwork -framework Security -framework SystemConfiguration -framework IOKit $(SLIRP_LIBS) -framework AudioToolbox -framework ParavirtualizedGraphics -framework Metal \
 	    -framework Foundation -framework CoreGraphics -framework ImageIO -framework CoreFoundation \
 	    -framework AppKit -framework QuartzCore -o $@
 
@@ -114,6 +114,10 @@ $(IB)/libhengevm.a: $(IOS_OBJ)
 	xcrun --sdk iphoneos libtool -static -o $@ $(IOS_OBJ)
 ios-lib: $(IB)/libhengevm.a
 .PHONY: ios-lib
+
+# The restore stack, built from the same sources and with the same stand-ins as iOS.
+$(B)/mac-restore/libhengerestore.a: tools/build_ios_restore.sh host/libusb_shim.c host/install.c host/curl_shim.m $(wildcard third_party/*/src/*.c) $(wildcard third_party/libirecovery/src/*.c)
+	nice -n 10 tools/build_ios_restore.sh mac
 
 # The installer: libirecovery, usbmuxd and idevicerestore (third_party, vendored
 # sources) linked against host/libusb_shim.c, so they restore the virtual Mac

@@ -6,16 +6,30 @@
 # libzip (cmake), and HengeVM's libusb stand-in, curl stand-in and install
 # driver. The Mac build (make) uses Homebrew's copies of the same libraries.
 set -e
+# "tools/build_ios_restore.sh mac" builds the very same sources for the Mac into
+# build/mac-restore, so tests on the Mac run the restore code iOS ships.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TP="$ROOT/third_party"
-OUT="$ROOT/build/ios/restore"
-SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-CC=(xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isysroot "$SDK")
+if [ "$1" = mac ]; then
+    BUILD="$ROOT/build/mac-restore"
+    SDKNAME=macosx
+    CC=(xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=14.0)
+    CMAKE_TARGET=(-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0)
+else
+    BUILD="$ROOT/build/ios"
+    SDKNAME=iphoneos
+    CC=(xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0)
+    CMAKE_TARGET=(-DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0)
+fi
+OUT="$BUILD/restore"
+DEPS="$BUILD/deps"
+SDK="$(xcrun --sdk $SDKNAME --show-sdk-path)"
+CC+=(-isysroot "$SDK")
 mkdir -p "$OUT"
 COMMON=(-O2 -w -DHAVE_CONFIG_H -I"$TP/restore_config" -I"$TP" -I"$TP/libusb-1.0" -I"$TP/curl_include"
         -I"$TP/libplist/include" -I"$TP/libimobiledevice-glue/include" -I"$TP/libusbmuxd/include"
         -I"$TP/libimobiledevice/include" -I"$TP/libimobiledevice" -I"$TP/libtatsu/include" -I"$TP/libirecovery/include"
-        -I"$TP/libzip/lib" -I"$ROOT/build/ios-deps/libzip" -I"$TP/mbedtls/include")
+        -I"$TP/libzip/lib" -I"$DEPS/libzip" -I"$TP/mbedtls/include")
 OBJS=()
 
 compile() { # name extra-flags... -- files...
@@ -34,14 +48,14 @@ compile() { # name extra-flags... -- files...
 }
 
 # libzip: cmake makes its config headers and the library.
-if [ ! -f "$ROOT/build/ios-deps/libzip/lib/libzip.a" ]; then
-    cmake -S "$TP/libzip" -B "$ROOT/build/ios-deps/libzip" -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
-        -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+if [ ! -f "$DEPS/libzip/lib/libzip.a" ]; then
+    cmake -S "$TP/libzip" -B "$DEPS/libzip" "${CMAKE_TARGET[@]}" -DCMAKE_OSX_ARCHITECTURES=arm64 \
+        -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
         -DZLIB_INCLUDE_DIR="$SDK/usr/include" -DZLIB_LIBRARY="$SDK/usr/lib/libz.tbd" -DENABLE_COMMONCRYPTO=OFF \
         -DENABLE_GNUTLS=OFF -DENABLE_MBEDTLS=OFF -DENABLE_OPENSSL=OFF -DENABLE_WINDOWS_CRYPTO=OFF -DENABLE_BZIP2=OFF \
         -DENABLE_LZMA=OFF -DENABLE_ZSTD=OFF -DBUILD_TOOLS=OFF -DBUILD_REGRESS=OFF -DBUILD_OSSFUZZ=OFF \
         -DBUILD_EXAMPLES=OFF -DBUILD_DOC=OFF -DLIBZIP_DO_INSTALL=OFF >/dev/null
-    cmake --build "$ROOT/build/ios-deps/libzip" -j4 >/dev/null
+    cmake --build "$DEPS/libzip" -j4 >/dev/null
 fi
 
 compile mbedtls -I"$TP/mbedtls/library" -- "$TP"/mbedtls/library/*.c
@@ -62,7 +76,7 @@ compile henge -std=c11 -I"$ROOT/core" -I"$ROOT/host" -I"$ROOT/devices" -- \
     "$ROOT/host/libusb_shim.c" "$ROOT/host/install.c"
 compile hengeobjc -fobjc-arc -- "$ROOT/host/curl_shim.m"
 
-rm -f "$ROOT/build/ios/libhengerestore.a"
-xcrun --sdk iphoneos libtool -static -no_warning_for_no_symbols -o "$ROOT/build/ios/libhengerestore.a" \
-    "${OBJS[@]}" "$ROOT/build/ios-deps/libzip/lib/libzip.a" 2>&1 | grep -v 'same member name' || true
-ls -la "$ROOT/build/ios/libhengerestore.a"
+rm -f "$BUILD/libhengerestore.a"
+xcrun --sdk $SDKNAME libtool -static -no_warning_for_no_symbols -o "$BUILD/libhengerestore.a" \
+    "${OBJS[@]}" "$DEPS/libzip/lib/libzip.a" 2>&1 | grep -v 'same member name' || true
+ls -la "$BUILD/libhengerestore.a"

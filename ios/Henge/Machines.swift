@@ -45,7 +45,21 @@ final class Machines: ObservableObject {
 
     @Published private(set) var unpacked: Double = 0
 
-    private init() { load() }
+    private init() {
+        load()
+        removeLeftovers()
+    }
+
+    /// Machine folders nothing refers to (an install cut short by a crash or by quitting): their disks take real space.
+    private func removeLeftovers() {
+        let known = Set(all.map(\.id))
+        let items = (try? FileManager.default.contentsOfDirectory(at: Self.root, includingPropertiesForKeys: nil)) ?? []
+        for item in items {
+            guard let id = UUID(uuidString: item.lastPathComponent), !known.contains(id) else { continue }
+            HengeLog.log("machines", "removing the unfinished machine \(id)")
+            try? FileManager.default.removeItem(at: item)
+        }
+    }
 
     nonisolated static var root: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]

@@ -19,42 +19,25 @@ struct SessionView: View {
     @AppStorage("henge.cpus") private var cpus = 3
 
     var body: some View {
-        ZStack {
-            Stone.bezel.ignoresSafeArea()
-            VStack(alignment: .leading, spacing: 14) {
-                HStack {
-                    Text(mac.name).font(.stone(24)).foregroundStyle(Stone.bezelText)
-                    Spacer()
-                    Button(state == 1 ? "Shut down" : "Close") { finish() }
-                        .buttonStyle(.bordered)
-                        .tint(Stone.copper)
+        NavigationStack {
+            List {
+                Section(phase) {
+                    BootDisplay().aspectRatio(16.0 / 10.0, contentMode: .fit)
+                    Text("Only the boot screen shows so far.").font(.caption).foregroundStyle(.secondary)
+                    if let error { Text(error).foregroundStyle(.red) }
                 }
-                screen
-                if let error {
-                    Text(error).foregroundStyle(Stone.copper).font(.subheadline)
-                }
-                status
-                logView
+                Section("Status") { status }
+                Section("Log") { logView }
             }
-            .padding(20)
+            .navigationTitle(mac.name)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button(state == 1 ? "Shut Down" : "Close") { finish() }
+                }
+            }
         }
         .task { await run() }
-    }
-
-    private var screen: some View {
-        RoundedRectangle(cornerRadius: 18, style: .continuous)
-            .fill(Color.black)
-            .aspectRatio(16.0 / 10.0, contentMode: .fit)
-            .overlay(BootDisplay().clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous)))
-            .overlay(alignment: .bottom) {
-                VStack(spacing: 2) {
-                    Text(phase).font(.headline).foregroundStyle(Stone.bezelText)
-                    Text("Boot screen only: the full display needs a GPU iOS does not have yet.").font(.caption2).foregroundStyle(Stone.bezelDim)
-                }
-                .padding(8)
-                .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 10))
-                .padding(8)
-            }
     }
 
     private var phase: String {
@@ -65,31 +48,18 @@ struct SessionView: View {
         }
     }
 
-    private var status: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            row("CPUs on", "\(cpusOn) of \(cpus)")
-            row("Translated blocks", String(format: "%.1f M/s", blocksPerSecond / 1e6))
-            row("Network frames", "\(framesOut) out, \(framesIn) in")
-            row("Up", "\(Int(Date().timeIntervalSince(started))) s")
-        }
-        .font(.system(.footnote, design: .monospaced))
-        .foregroundStyle(Stone.bezelText)
-    }
-
-    private func row(_ label: String, _ value: String) -> some View {
-        HStack { Text(label).foregroundStyle(Stone.bezelDim); Spacer(); Text(value) }
+    @ViewBuilder private var status: some View {
+        LabeledContent("CPUs on", value: "\(cpusOn) of \(cpus)")
+        LabeledContent("Translated blocks", value: String(format: "%.1f M/s", blocksPerSecond / 1e6))
+        LabeledContent("Network frames", value: "\(framesOut) out, \(framesIn) in")
+        LabeledContent("Up", value: "\(Int(Date().timeIntervalSince(started))) s")
     }
 
     private var logView: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 1) {
-                    ForEach(Array(log.enumerated()), id: \.offset) { i, line in
-                        Text(line).font(.system(size: 10, design: .monospaced)).foregroundStyle(Stone.bezelDim).id(i)
-                    }
-                }
+        VStack(alignment: .leading, spacing: 1) {
+            ForEach(Array(log.suffix(30).enumerated()), id: \.offset) { _, line in
+                Text(line).font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
             }
-            .onChange(of: log.count) { n in proxy.scrollTo(n - 1, anchor: .bottom) }
         }
     }
 

@@ -62,10 +62,20 @@ final class Installer: NSObject, ObservableObject {
     nonisolated static var imageDirectory: URL { Machines.root.appendingPathComponent("Restore images", isDirectory: true) }
     nonisolated static func imagePath(_ r: MacOSRelease) -> URL { imageDirectory.appendingPathComponent("\(r.id).ipsw") }
 
-    static func haveImage(_ r: MacOSRelease) -> Bool {
-        let size = (try? FileManager.default.attributesOfItem(atPath: imagePath(r).path)[.size] as? Int64) ?? 0
-        return size > r.bytes / 2 // the listed sizes are rounded
+    /// The size of the image on this iPhone, if a whole one is there (the listed sizes are rounded).
+    static func imageSize(_ r: MacOSRelease) -> Int64? {
+        let values = try? imagePath(r).resourceValues(forKeys: [.fileSizeKey])
+        guard let size = values?.fileSize, Int64(size) > r.bytes / 2 else { return nil }
+        return Int64(size)
     }
+
+    static func haveImage(_ r: MacOSRelease) -> Bool { imageSize(r) != nil }
+
+    static func deleteImage(_ r: MacOSRelease) { try? FileManager.default.removeItem(at: imagePath(r)) }
+
+    /// Free space an install takes: the new Mac's disk, and the download if it is not here yet.
+    static func spaceNeeded(_ r: MacOSRelease) -> Int64 { (haveImage(r) ? 0 : r.bytes) + newMacBytes }
+    private static let newMacBytes: Int64 = 24 << 30
 
     func reset() { if !busy { phase = .idle } }
 
@@ -75,10 +85,13 @@ final class Installer: NSObject, ObservableObject {
         UIApplication.shared.isIdleTimerDisabled = true // the screen locking would suspend the download and the restore
         Task {
             defer { UIApplication.shared.isIdleTimerDisabled = false }
+            var made: VirtualMac?
             do {
+                try checkSpace(release)
                 let ipsw = try await download(release)
                 phase = .preparing
                 let mac = try prepare(name: name, ramMB: ramMB)
+                made = mac
                 phase = .installing
                 try await install(mac, ipsw: ipsw, cpus: cpus)
                 Machines.shared.add(mac)
@@ -87,8 +100,19 @@ final class Installer: NSObject, ObservableObject {
                 phase = .done("\(release.name) is installed on \(name). Quit Henge (swipe it away) and open it again, then tap Start.")
             } catch {
                 HengeLog.log("install", "failed: \(error.localizedDescription)")
+                // A half-installed Mac is no use, and its disk can be many gigabytes. The download stays.
+                if let made, henge_vm_state() != 1 { try? FileManager.default.removeItem(at: made.directory) }
                 phase = .failed(error.localizedDescription)
             }
+        }
+    }
+
+    private func checkSpace(_ r: MacOSRelease) throws {
+        let free = (try? URL(fileURLWithPath: NSHomeDirectory()).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
+            .volumeAvailableCapacityForImportantUsage ?? 0
+        let needed = Self.spaceNeeded(r)
+        if free > 0 && free < needed {
+            throw message("This install needs about \(ByteText.string(UInt64(needed))) free; this iPhone has \(ByteText.string(UInt64(free))).")
         }
     }
 
@@ -105,12 +129,6 @@ final class Installer: NSObject, ObservableObject {
         phase = .downloading
         received = 0
         expected = r.bytes
-        let free = (try? URL(fileURLWithPath: NSHomeDirectory()).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
-            .volumeAvailableCapacityForImportantUsage ?? 0
-        let needed = r.bytes + (24 << 30)
-        if free > 0 && free < needed {
-            throw message("The download and the new Mac need about \(ByteText.string(UInt64(needed))); this iPhone has \(ByteText.string(UInt64(free))) free.")
-        }
         downloadTarget = dest
         HengeLog.log("install", "downloading \(r.url.absoluteString)")
         for attempt in 1...20 {

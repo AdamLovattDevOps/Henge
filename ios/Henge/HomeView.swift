@@ -4,46 +4,86 @@ import UniformTypeIdentifiers
 struct HomeView: View {
     @ObservedObject private var machines = Machines.shared
     @ObservedObject private var jit = JITCoordinator.shared
+    @ObservedObject private var installer = Installer.shared
     @Binding var running: VirtualMac?
     @State private var picking = false
     @State private var installing = false
-    @ObservedObject private var installer = Installer.shared
     @State private var jitReady = JITBootstrap.ready
+    @State private var toDelete: VirtualMac?
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    header
-                    jitStrip
-                    if let name = machines.importing {
-                        progress(machines.unpacked > 0 ? String(format: "Unpacking %@'s disk… %.0f%%", name, machines.unpacked * 100)
+            List {
+                Section("JIT") {
+                    LabeledContent("Status", value: jitReady ? "On" : "Off")
+                    if !jitReady {
+                        Text(JITBootstrap.lastFailure ?? jit.automaticDescription)
+                            .font(.footnote).foregroundStyle(.secondary)
+                        Button("Turn On") { jit.enable() }
+                    }
+                }
+                if let name = machines.importing {
+                    Section {
+                        HStack {
+                            ProgressView()
+                            Text(machines.unpacked > 0 ? String(format: "Unpacking %@'s disk… %.0f%%", name, machines.unpacked * 100)
                                                        : "Bringing in \(name)…")
-                    }
-                    if let error = machines.lastError { note(error) }
-                    if installer.busy {
-                        Button { installing = true } label: {
-                            progress("Installing \(installer.machineName)… (tap to see)")
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    if machines.all.isEmpty {
-                        welcome
-                    } else {
-                        ForEach(machines.all) { mac in
-                            MachineCard(mac: mac, jitOn: jitReady) { running = mac }
                         }
                     }
                 }
-                .padding(.horizontal, 20)
-                .padding(.top, 12)
-                .padding(.bottom, 28)
+                if let error = machines.lastError {
+                    Section { Text(error).foregroundStyle(.red) }
+                }
+                if installer.busy {
+                    Section {
+                        Button("Installing \(installer.machineName)… (tap to see)") { installing = true }
+                    }
+                }
+                Section("Macs") {
+                    if machines.all.isEmpty {
+                        Button("Install macOS") { installing = true }
+                    }
+                    ForEach(machines.all) { mac in
+                        HStack {
+                            VStack(alignment: .leading) {
+                                Text(mac.name)
+                                Text("\(mac.ramMB / 1024) GB memory, \(ByteText.string(UInt64(max(mac.diskBytes, 0)))) disk")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button("Start") { running = mac }
+                                .buttonStyle(.bordered)
+                                .disabled(!jitReady)
+                        }
+                        .swipeActions {
+                            Button("Delete", role: .destructive) { toDelete = mac }
+                        }
+                    }
+                }
             }
-            .background(Stone.page.ignoresSafeArea())
-            .toolbar(.hidden, for: .navigationBar)
+            .navigationTitle("Henge")
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Menu {
+                        Button("Install macOS…") { installing = true }
+                        Button("Bring in a Mac from a computer…") { picking = true }
+                    } label: {
+                        Image(systemName: "plus")
+                    }
+                    .accessibilityLabel("Add a Mac")
+                }
+            }
             .sheet(isPresented: $installing) { InstallView() }
             .fileImporter(isPresented: $picking, allowedContentTypes: [.folder]) { result in
                 if case let .success(url) = result { machines.importFolder(url) }
+            }
+            .confirmationDialog("Delete \(toDelete?.name ?? "this Mac")?", isPresented: Binding(get: { toDelete != nil }, set: { if !$0 { toDelete = nil } }),
+                                titleVisibility: .visible) {
+                Button("Delete", role: .destructive) {
+                    if let toDelete { machines.delete(toDelete.id) }
+                }
+            } message: {
+                Text("Its disk is removed from this iPhone.")
             }
             .task {
                 while !Task.isCancelled { // the region may be claimed after a hand-off to StikDebug
@@ -51,132 +91,6 @@ struct HomeView: View {
                     try? await Task.sleep(nanoseconds: 1_000_000_000)
                 }
             }
-        }
-    }
-
-    private var header: some View {
-        HStack(alignment: .center, spacing: 12) {
-            StonesMark(height: 32)
-            Text("Henge")
-                .font(.stone(34))
-                .foregroundStyle(Stone.text)
-            Spacer()
-            Menu {
-                Button { installing = true } label: { Label("Install macOS…", systemImage: "arrow.down.circle") }
-                Button { picking = true } label: { Label("Bring in a Mac from a computer…", systemImage: "folder") }
-            } label: {
-                Image(systemName: "plus")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(Stone.text)
-                    .frame(width: 40, height: 40)
-                    .background(Stone.raised, in: Circle())
-            }
-            .accessibilityLabel("Add a Mac")
-        }
-    }
-
-    private var jitStrip: some View {
-        HStack(alignment: .center, spacing: 12) {
-            Circle()
-                .fill(jitReady ? Stone.lichen : Color.clear)
-                .overlay(Circle().stroke(jitReady ? Stone.lichen : Stone.copper, lineWidth: 2))
-                .frame(width: 16, height: 16)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(jitReady ? "JIT is on" : "JIT is off")
-                    .font(.headline)
-                    .foregroundStyle(Stone.text)
-                Text(jitReady ? "A \(JITBootstrap.jitBytes >> 20) MB region is held for this session."
-                              : (JITBootstrap.lastFailure ?? jit.automaticDescription))
-                    .font(.subheadline)
-                    .foregroundStyle(Stone.dim)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Spacer()
-            if !jitReady {
-                Button("Turn on") { jit.enable() }
-                    .buttonStyle(.borderedProminent)
-            }
-        }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .stoneCard()
-    }
-
-    private var welcome: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("A Mac, in the circle")
-                .font(.stone(26))
-                .foregroundStyle(Stone.text)
-            Text("Tap + and choose Install macOS: Henge downloads it from Apple and installs it right here. Or bring in a Mac made on a computer (tools/export_ios.sh).")
-                .font(.body)
-                .foregroundStyle(Stone.dim)
-                .fixedSize(horizontal: false, vertical: true)
-            Button { installing = true } label: { Text("Install macOS").frame(maxWidth: .infinity) }
-                .buttonStyle(.borderedProminent)
-        }
-        .padding(20)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .stoneCard()
-    }
-
-    private func progress(_ text: String) -> some View {
-        HStack(spacing: 12) {
-            ProgressView()
-            Text(text).foregroundStyle(Stone.text)
-        }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .stoneCard()
-    }
-
-    private func note(_ text: String) -> some View {
-        Text(text)
-            .font(.subheadline)
-            .foregroundStyle(Stone.copper)
-            .padding(16)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .stoneCard()
-    }
-}
-
-private struct MachineCard: View {
-    let mac: VirtualMac
-    let jitOn: Bool
-    let run: () -> Void
-    @State private var confirmDelete = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Image(systemName: "desktopcomputer")
-                    .font(.system(size: 22))
-                    .foregroundStyle(Stone.copper)
-                Text(mac.name)
-                    .font(.stone(22))
-                    .foregroundStyle(Stone.text)
-                Spacer()
-                Menu {
-                    Button("Delete", role: .destructive) { confirmDelete = true }
-                } label: {
-                    Image(systemName: "ellipsis").foregroundStyle(Stone.dim).frame(width: 32, height: 32)
-                }
-            }
-            Text("\(mac.ramMB / 1024) GB memory · \(ByteText.string(UInt64(max(mac.diskBytes, 0)))) disk")
-                .font(.subheadline)
-                .foregroundStyle(Stone.dim)
-            Button(action: run) {
-                Text(jitOn ? "Start" : "Start (turn on JIT first)")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(!jitOn)
-        }
-        .padding(20)
-        .stoneCard()
-        .confirmationDialog("Delete \(mac.name)?", isPresented: $confirmDelete, titleVisibility: .visible) {
-            Button("Delete", role: .destructive) { Machines.shared.delete(mac.id) }
-        } message: {
-            Text("Its disk is removed from this iPhone.")
         }
     }
 }

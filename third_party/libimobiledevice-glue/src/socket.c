@@ -71,7 +71,7 @@
 #endif
 
 #define RECV_TIMEOUT 20000
-#define SEND_TIMEOUT 10000
+#define SEND_TIMEOUT 600000 /* HengeVM: the guest's receive window can stay shut for a long time while it writes to a slow disk */
 #define CONNECT_TIMEOUT 5000
 
 #ifndef EAFNOSUPPORT
