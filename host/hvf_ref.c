@@ -176,7 +176,7 @@ int main(int argc, char **argv) {
                 cpu.cntv_ctl = sysreg(HV_SYS_REG_CNTV_CTL_EL0);
                 cpu.cntv_cval = sysreg(HV_SYS_REG_CNTV_CVAL_EL0);
                 board.m->tick(board.m, &cpu);
-                CHECK(hv_vcpu_set_pending_interrupt(vcpu, HV_INTERRUPT_TYPE_IRQ, m.irq_line));
+                CHECK(hv_vcpu_set_pending_interrupt(vcpu, HV_INTERRUPT_TYPE_IRQ, m.percpu[0].irq_line));
                 CHECK(hv_vcpu_set_vtimer_mask(vcpu, false));
                 continue;
             }

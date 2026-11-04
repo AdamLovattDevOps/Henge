@@ -1,6 +1,7 @@
 #include "exception.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "machine.h"
@@ -109,6 +110,11 @@ void hv_eret(HvCpu *cpu) {
 
 /* PSCI 1.0 for one CPU. */
 static uint64_t psci(HvCpu *cpu, uint64_t fn) {
+    static int log = -1;
+    if (log < 0) log = getenv("HV_PSCI_LOG") != NULL;
+    if (log && ((uint32_t)fn >> 24 == 0x84 || (uint32_t)fn >> 24 == 0xc4))
+        fprintf(stderr, "psci %#llx x1 %#llx x2 %#llx x3 %#llx pc %llx\n", (unsigned long long)fn, (unsigned long long)cpu->x[1],
+                (unsigned long long)cpu->x[2], (unsigned long long)cpu->x[3], (unsigned long long)cpu->pc);
     switch ((uint32_t)fn) {
     case 0x84000000: return 0x10000;                         /* PSCI_VERSION: 1.0 */
     case 0x84000006: return 2;                               /* MIGRATE_INFO_TYPE: no trusted OS */
@@ -197,11 +203,13 @@ int hv_exception_insn(HvCpu *cpu, uint32_t insn, uint64_t pc) {
 
 int hv_check_interrupts(HvCpu *cpu) {
     HvMachine *m = cpu->m;
-    if (m->fiq_line && !(cpu->daif & HV_PSTATE_F)) {
+    HvPerCpu *p = cpu->pc_state;
+    (void)m;
+    if (p->fiq_line && !(cpu->daif & HV_PSTATE_F)) {
         hv_take_exception(cpu, HV_EXC_FIQ, 0, 0, 0, cpu->pc);
         return 1;
     }
-    if (m->irq_line && !(cpu->daif & HV_PSTATE_I)) {
+    if (p->irq_line && !(cpu->daif & HV_PSTATE_I)) {
         hv_take_exception(cpu, HV_EXC_IRQ, 0, 0, 0, cpu->pc);
         return 1;
     }

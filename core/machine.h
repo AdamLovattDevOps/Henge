@@ -70,6 +70,36 @@ typedef struct HvStats {
     uint64_t wfi, wfi_ticks;  /* WFI exits, host ticks spent asleep */
 } HvStats;
 
+#define HV_MAX_CPUS 8
+
+/* What each CPU has to itself and keeps across hv_cpu_reset (tests copy HvCpu
+   structs around, so it lives here, by CPU index): its indirect-branch cache and
+   the filters for dropping entries from it, the front cache of blocks, its
+   interrupt lines and its wakeup. */
+typedef struct HvPerCpu {
+    uint64_t *ijc;           /* indirect-branch cache tables (cpu->ijc points here) */
+    uint64_t ijc_pages[2][1024]; /* hashed bitmap of the user pages any process cached targets in (for all-ASID TLBIs) */
+    /* Hashed bitmap of (page, salt) pairs with cached targets: a TLBI for one
+       address space drops its entries only if that address space cached
+       something in the page. A new salt makes old bits meaningless, so this is
+       only cleared (with the whole cache) when it gets an eighth full. */
+    uint64_t ijc_keyed[1 << 14];
+    uint32_t ijc_keyed_count;
+    uint32_t ijc_tables_used; /* bit per flags value whose table was ever filled */
+    /* Exactly which (user id, user page) pairs have cached targets: a hash set,
+       so unmapping a big range of one address space drops only its code pages'
+       entries instead of the whole address space's. Emptied with the user half. */
+    uint64_t *ucode;
+    uint32_t ucode_count;
+    struct HvBlock *jc[1 << HV_JC_BITS]; /* direct-mapped cache in front of the hash */
+    /* Interrupt lines into this CPU, driven by the GIC. */
+    int irq_line, fiq_line;
+    /* WFI sleeps on this; device threads, the GIC and other CPUs signal it. */
+    pthread_mutex_t wake_mu;
+    pthread_cond_t wake_cv;
+    int wake_pending;
+} HvPerCpu;
+
 typedef struct HvMachine {
     HvRam ram[HV_MAX_RAM];
     int nram;
@@ -78,13 +108,10 @@ typedef struct HvMachine {
 
     HvJitRegion jit;
     HvBlock *hash[HV_BLOCK_HASH];
-    HvBlock *jc[1 << HV_JC_BITS]; /* direct-mapped cache in front of the hash */
     HvBlock *blocks;
     int nblocks;
     int flush_pending;   /* set by helpers; the dispatcher flushes once the block has left */
 
-    /* Interrupt lines into the CPU, driven by the GIC. */
-    int irq_line, fiq_line;
     void *gic;
     /* Devices: called between blocks every so often and while the CPU waits.
        Returns the host time (mach_absolute_time units) of the next timer event, or 0. */
@@ -106,26 +133,11 @@ typedef struct HvMachine {
     int chain;               /* block chaining and the indirect-branch cache are enabled */
     uint64_t *slots;         /* chainable exits' targets (0: not chained) */
     uint32_t nslots;
-    HvCpu *cpu;              /* the CPU, so device and invalidation code can ask it to leave */
-    uint64_t *ijc;           /* indirect-branch cache tables (cpu->ijc points here) */
-    uint64_t ijc_pages[2][1024]; /* hashed bitmap of the user pages any process cached targets in (for all-ASID TLBIs) */
-    /* Hashed bitmap of (page, salt) pairs with cached targets: a TLBI for one
-       address space drops its entries only if that address space cached
-       something in the page. A new salt makes old bits meaningless, so this is
-       only cleared (with the whole cache) when it gets an eighth full. */
-    uint64_t ijc_keyed[1 << 14];
-    uint32_t ijc_keyed_count;
-    uint32_t ijc_tables_used; /* bit per flags value whose table was ever filled */
-    /* Exactly which (user id, user page) pairs have cached targets: a hash set,
-       so unmapping a big range of one address space drops only its code pages'
-       entries instead of the whole address space's. Emptied with the user half. */
-    uint64_t *ucode;
-    uint32_t ucode_count;
+    HvCpu *cpu;              /* CPU 0: the one that polls devices */
+    HvCpu *cpus[HV_MAX_CPUS]; /* every CPU, so device and invalidation code can ask them to leave */
+    int ncpus;
+    HvPerCpu percpu[HV_MAX_CPUS];
     int stats_interval;  /* seconds between --stats lines, 0 = off */
-    /* Device threads (disk I/O, graphics) wake the CPU out of WFI with hv_machine_wake. */
-    pthread_mutex_t wake_mu;
-    pthread_cond_t wake_cv;
-    int wake_pending;
     /* --profile: host PCs of the CPU thread sampled every millisecond, drained by the stats line. */
     uint64_t *prof;
     uint32_t prof_head, prof_tail;
@@ -149,7 +161,12 @@ void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len);
 int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len);
 int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len);
 
-void hv_cpu_reset(HvCpu *cpu, HvMachine *m);
+void hv_cpu_reset(HvCpu *cpu, HvMachine *m); /* CPU 0 */
+void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index);
+/* Make every CPU leave its block at the next exit. */
+void hv_machine_kick_all(HvMachine *m);
+/* Wake one CPU out of WFI (and make it leave its block). */
+void hv_cpu_wake(HvCpu *cpu);
 
 /* From any thread: device work is waiting for the CPU thread's tick. Makes a
    running block leave and ends a WFI sleep. */

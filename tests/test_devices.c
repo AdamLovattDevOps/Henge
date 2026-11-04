@@ -69,15 +69,15 @@ static void test_gic(void) {
     wr8(VMAPPLE_GIC_DIST + 0x400 + 33, 0x80);
     check("ISENABLER1 reads back", rd32(VMAPPLE_GIC_DIST + 0x104) & 2, 2);
     hv_gicv3_set_irq(g, 33, 1);
-    check("level SPI raises IRQ", m.irq_line, 1);
+    check("level SPI raises IRQ", m.percpu[0].irq_line, 1);
     check("ISPENDR1 shows it", (rd32(VMAPPLE_GIC_DIST + 0x204) >> 1) & 1, 1);
     check("IAR1 = 33", m.icc_read(&m, &cpu, ICC_IAR1), 33);
-    check("active: line drops", m.irq_line, 0);
+    check("active: line drops", m.percpu[0].irq_line, 0);
     check("nothing else pending", m.icc_read(&m, &cpu, ICC_IAR1), 1023);
     m.icc_write(&m, &cpu, ICC_EOIR1, 33);
-    check("still-high level re-pends after EOI", m.irq_line, 1);
+    check("still-high level re-pends after EOI", m.percpu[0].irq_line, 1);
     hv_gicv3_set_irq(g, 33, 0);
-    check("level low: no IRQ", m.irq_line, 0);
+    check("level low: no IRQ", m.percpu[0].irq_line, 0);
 
     /* PMR masks; a higher-priority interrupt preempts a running one. */
     wr32(VMAPPLE_GIC_DIST + 0x84, 3u << 1);
@@ -85,11 +85,11 @@ static void test_gic(void) {
     wr8(VMAPPLE_GIC_DIST + 0x400 + 34, 0x40);
     m.icc_write(&m, &cpu, ICC_PMR, 0x80);
     hv_gicv3_set_irq(g, 33, 1);
-    check("priority 0x80 masked by PMR 0x80", m.irq_line, 0);
+    check("priority 0x80 masked by PMR 0x80", m.percpu[0].irq_line, 0);
     m.icc_write(&m, &cpu, ICC_PMR, 0xff);
     check("unmasked", m.icc_read(&m, &cpu, ICC_IAR1), 33);
     hv_gicv3_set_irq(g, 34, 1);
-    check("higher priority preempts", m.irq_line, 1);
+    check("higher priority preempts", m.percpu[0].irq_line, 1);
     check("IAR1 = 34", m.icc_read(&m, &cpu, ICC_IAR1), 34);
     m.icc_write(&m, &cpu, ICC_EOIR1, 34);
     hv_gicv3_set_irq(g, 34, 0);
@@ -102,7 +102,7 @@ static void test_gic(void) {
     hv_gicv3_set_irq(g, 33, 0);
     check("edge latched", m.icc_read(&m, &cpu, ICC_IAR1), 33);
     m.icc_write(&m, &cpu, ICC_EOIR1, 33);
-    check("edge consumed", m.irq_line, 0);
+    check("edge consumed", m.percpu[0].irq_line, 0);
     wr32(VMAPPLE_GIC_DIST + 0xc08, 0);
 
     /* SGI 5 to ourselves (redistributor bank) */

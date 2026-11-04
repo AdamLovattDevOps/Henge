@@ -23,7 +23,7 @@ static int failures, checks;
 
 static void ack_write(void *opaque, uint64_t off, uint64_t val, unsigned size) {
     (void)off, (void)val, (void)size;
-    ((HvMachine *)opaque)->irq_line = 0;
+    ((HvMachine *)opaque)->percpu[0].irq_line = 0;
 }
 
 static void check(const char *prog, const char *what, uint64_t got, uint64_t want) {
@@ -125,15 +125,15 @@ int main(void) {
     check("host", "mach_absolute_time is 24 MHz (timebase 125/3)", (uint64_t)tb.numer * 1000 + tb.denom, 125003);
 
     static const TestProgram irq = TEST_PROGRAM(p_irq);
-    m.irq_line = 1;
+    m.percpu[0].irq_line = 1;
     if (!run(&irq, &c, 0)) {
         check("irq", "masked IRQ not taken across WFI", c.x[1], 0);
         check("irq", "taken after DAIFClr", c.x[2], 1);
         check("irq", "vector", c.x[3], 0x280);
         check("irq", "ELR = next instruction", c.x[4], c.x[5]);
-        check("irq", "line acknowledged", m.irq_line, 0);
+        check("irq", "line acknowledged", m.percpu[0].irq_line, 0);
     }
-    m.irq_line = 0;
+    m.percpu[0].irq_line = 0;
 
     static const TestProgram fp = TEST_PROGRAM(p_fptrap);
     if (!run(&fp, &c, 0)) {

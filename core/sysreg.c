@@ -100,7 +100,7 @@ static int read_reg(HvCpu *cpu, uint32_t reg, uint64_t *v) {
     case R(3, 0, 10, 3, 0): *v = cpu->amair_el1; return 0;
     case R(3, 0, 12, 0, 0): *v = cpu->vbar_el1; return 0;
     case R(3, 0, 12, 1, 0): /* ISR_EL1: interrupts pending at the CPU, masked or not */
-        *v = (cpu->m && cpu->m->irq_line ? 1u << 7 : 0) | (cpu->m && cpu->m->fiq_line ? 1u << 6 : 0);
+        *v = (cpu->pc_state && cpu->pc_state->irq_line ? 1u << 7 : 0) | (cpu->pc_state && cpu->pc_state->fiq_line ? 1u << 6 : 0);
         return 0;
     case R(3, 0, 13, 0, 1): *v = cpu->contextidr_el1; return 0;
     case R(3, 0, 13, 0, 4): *v = cpu->tpidr_el1; return 0;
@@ -286,7 +286,9 @@ int hv_sysreg_mrs(HvCpu *cpu, uint32_t insn, uint64_t pc) {
    the block leave at its next exit for the dispatcher to take it. */
 static void irq_check(HvCpu *cpu) {
     HvMachine *m = cpu->m;
-    if (m && ((m->irq_line && !(cpu->daif & HV_PSTATE_I)) || (m->fiq_line && !(cpu->daif & HV_PSTATE_F))))
+    HvPerCpu *p = cpu->pc_state;
+    (void)m;
+    if (p && ((p->irq_line && !(cpu->daif & HV_PSTATE_I)) || (p->fiq_line && !(cpu->daif & HV_PSTATE_F))))
         __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED);
 }
 

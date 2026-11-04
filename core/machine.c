@@ -16,20 +16,36 @@ int hv_machine_init(HvMachine *m, size_t jit_bytes) {
     if (!m->blocks) return -1;
     m->stop_pc = ~0ull;
     m->chain = 1;
-    m->ijc = calloc(HV_IJC_TABLES * HV_IJC_TABLE_BYTES / 8, 8);
-    m->ucode = calloc(1u << HV_UCODE_BITS, 8);
     m->slots = calloc(HV_MAX_SLOTS, sizeof *m->slots);
-    pthread_mutex_init(&m->wake_mu, NULL);
-    pthread_cond_init(&m->wake_cv, NULL);
-    return m->ijc && m->slots && m->ucode ? 0 : -1;
+    if (!m->slots) return -1;
+    for (int i = 0; i < HV_MAX_CPUS; i++) { /* untouched pages cost nothing, so every CPU gets its tables now */
+        HvPerCpu *p = &m->percpu[i];
+        p->ijc = calloc(HV_IJC_TABLES * HV_IJC_TABLE_BYTES / 8, 8);
+        p->ucode = calloc(1u << HV_UCODE_BITS, 8);
+        if (!p->ijc || !p->ucode) return -1;
+        pthread_mutex_init(&p->wake_mu, NULL);
+        pthread_cond_init(&p->wake_cv, NULL);
+    }
+    return 0;
 }
 
+void hv_cpu_wake(HvCpu *cpu) {
+    __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED);
+    HvPerCpu *p = cpu->pc_state;
+    pthread_mutex_lock(&p->wake_mu);
+    p->wake_pending = 1;
+    pthread_cond_signal(&p->wake_cv);
+    pthread_mutex_unlock(&p->wake_mu);
+}
+
+void hv_machine_kick_all(HvMachine *m) {
+    for (int i = 0; i < m->ncpus; i++)
+        if (m->cpus[i]) __atomic_store_n(&m->cpus[i]->exit_req, 1, __ATOMIC_RELAXED);
+}
+
+/* Device work is for CPU 0, which polls the devices. */
 void hv_machine_wake(HvMachine *m) {
-    if (m->cpu) __atomic_store_n(&m->cpu->exit_req, 1, __ATOMIC_RELAXED);
-    pthread_mutex_lock(&m->wake_mu);
-    m->wake_pending = 1;
-    pthread_cond_signal(&m->wake_cv);
-    pthread_mutex_unlock(&m->wake_mu);
+    if (m->cpu) hv_cpu_wake(m->cpu);
 }
 
 void hv_machine_free(HvMachine *m) {
@@ -39,7 +55,10 @@ void hv_machine_free(HvMachine *m) {
         free(m->ram[i].page_gen);
     }
     free(m->blocks);
-    free(m->ijc);
+    for (int i = 0; i < HV_MAX_CPUS; i++) {
+        free(m->percpu[i].ijc);
+        free(m->percpu[i].ucode);
+    }
     free(m->slots);
 }
 
@@ -84,13 +103,14 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
     r->page_gen[pg]++;
     m->stats.flush_smc++;
     /* The indirect-branch cache may lead into the stale blocks: start it over. */
-    if (m->cpu) {
-        hv_ijc_reset(m->cpu, 0);
-        hv_ijc_reset(m->cpu, 1);
-    }
+    for (int i = 0; i < m->ncpus; i++)
+        if (m->cpus[i]) {
+            hv_ijc_reset(m->cpus[i], 0);
+            hv_ijc_reset(m->cpus[i], 1);
+        }
     m->stats.reset_why[4]++;
     /* Make a running chain leave (chains stay patched: see chain() in dispatch.c). */
-    if (m->cpu) __atomic_store_n(&m->cpu->exit_req, 1, __ATOMIC_RELAXED);
+    hv_machine_kick_all(m);
 }
 
 HvMmio *hv_mmio_lookup(HvMachine *m, uint64_t pa) {
@@ -154,10 +174,18 @@ int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
 }
 
 void hv_cpu_reset(HvCpu *cpu, HvMachine *m) {
+    hv_cpu_reset_index(cpu, m, 0);
+}
+
+void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
     memset(cpu, 0, sizeof *cpu);
     cpu->m = m;
-    m->cpu = cpu;
-    cpu->ijc = (uint64_t)(uintptr_t)m->ijc;
+    cpu->index = index;
+    cpu->pc_state = &m->percpu[index];
+    m->cpus[index] = cpu;
+    if (m->ncpus <= (int)index) m->ncpus = (int)index + 1;
+    if (index == 0) m->cpu = cpu;
+    cpu->ijc = (uint64_t)(uintptr_t)cpu->pc_state->ijc;
     cpu->next_cid = 1;
     cpu->kernel_gen = 1;
     cpu->ijc_salt[1] = 1ull << 48; /* tags of an all-zero table never match */

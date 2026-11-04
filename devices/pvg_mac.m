@@ -291,7 +291,7 @@ int hv_pvg_attach(HvVmapple *b, const char *screenshot) {
         idesc.raiseInterrupt = ^bool(uint32_t vector) {
             (void)vector;
             atomic_store(&pending_iosfc, 1);
-            __atomic_store_n(&board->cpu->exit_req, 1, __ATOMIC_RELAXED);
+            hv_machine_kick_all(board->m);
             return true;
         };
         iosfc = [[PGIOSurfaceHostDevice alloc] initWithDescriptor:idesc];
@@ -304,7 +304,7 @@ int hv_pvg_attach(HvVmapple *b, const char *screenshot) {
         desc.raiseInterrupt = ^(uint32_t vector) {
             (void)vector;
             atomic_store(&pending_gfx, 1);
-            __atomic_store_n(&board->cpu->exit_req, 1, __ATOMIC_RELAXED);
+            hv_machine_kick_all(board->m);
         };
         pgdev = PGCreateDeviceWithDescriptor(desc);
         if (!pgdev) return -1;

@@ -44,8 +44,8 @@ static int hppi(HvGic *g, int masked) {
 
 void hv_gicv3_update(HvGic *g) {
     int i = hppi(g, 1);
-    g->m->irq_line = i != SPURIOUS && g->group[i] == 1;
-    g->m->fiq_line = i != SPURIOUS && g->group[i] == 0;
+    g->m->percpu[0].irq_line = i != SPURIOUS && g->group[i] == 1;
+    g->m->percpu[0].fiq_line = i != SPURIOUS && g->group[i] == 0;
 }
 
 void hv_gicv3_set_irq(HvGic *g, int intid, int level) {

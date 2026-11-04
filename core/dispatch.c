@@ -16,11 +16,12 @@
 
 void hv_flush_blocks(HvMachine *m) {
     m->stats.block_flushes++;
-    if (m->cpu) {
-        hv_ijc_reset(m->cpu, 0);
-        hv_ijc_reset(m->cpu, 1);
-    }
-    memset(m->jc, 0, sizeof m->jc);
+    for (int i = 0; i < m->ncpus; i++)
+        if (m->cpus[i]) {
+            hv_ijc_reset(m->cpus[i], 0);
+            hv_ijc_reset(m->cpus[i], 1);
+            memset(m->percpu[i].jc, 0, sizeof m->percpu[i].jc);
+        }
     memset(m->hash, 0, sizeof m->hash);
     m->nblocks = 0;
     m->nslots = 0;
@@ -44,14 +45,15 @@ static uint32_t hash_of(uint64_t va, uint64_t pa, uint32_t flags) {
 static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, const uint32_t *code, uint32_t avail) {
     HvMachine *m = cpu->m;
     uint32_t j = (uint32_t)((va >> 2) ^ (va >> 18) ^ ((uint64_t)flags << 13)) & ((1u << HV_JC_BITS) - 1);
-    HvBlock *c = m->jc[j];
+    HvBlock **jc = cpu->pc_state->jc;
+    HvBlock *c = jc[j];
     if (c && c->va == va && c->pa == pa && c->flags == flags && c->ram->page_gen[c->pg] == c->gen) return c;
     uint32_t h = hash_of(va, pa, flags);
     HvRam *ram = hv_ram_lookup(m, pa);
     uint64_t pg = (pa - ram->pa) >> HV_TLB_PAGE_BITS;
     uint32_t gen = ram->page_gen[pg];
     for (HvBlock *b = m->hash[h]; b; b = b->next)
-        if (b->va == va && b->pa == pa && b->flags == flags && b->gen == gen) return m->jc[j] = b;
+        if (b->va == va && b->pa == pa && b->flags == flags && b->gen == gen) return jc[j] = b;
 
     for (int attempt = 0; attempt < 2; attempt++) {
         if (m->nblocks == HV_MAX_BLOCKS) {
@@ -179,20 +181,21 @@ void hv_debug_el0_in_kernel(HvCpu *cpu, const char *what) {
 static int wait_for_interrupt(HvCpu *cpu) {
     HvMachine *m = cpu->m;
     uint64_t deadline = m->tick ? m->tick(m, cpu) : 0;
-    if (m->irq_line || m->fiq_line) return 0;
+    HvPerCpu *p = cpu->pc_state;
+    if (p->irq_line || p->fiq_line) return 0;
     if (!m->tick) return -1; /* nothing could ever wake us */
     uint64_t now = mach_absolute_time();
     uint64_t wait_ticks = deadline && deadline > now ? deadline - now : 240000; /* the counter runs at 24 MHz */
     if (wait_ticks > 240000) wait_ticks = 240000;
     uint64_t t0 = mach_absolute_time();
     /* Sleep until the next timer event or until a device thread has work for us. */
-    pthread_mutex_lock(&m->wake_mu);
-    if (!m->wake_pending) {
+    pthread_mutex_lock(&p->wake_mu);
+    if (!p->wake_pending) {
         struct timespec ts = {(time_t)(wait_ticks / 24000000), (long)(wait_ticks % 24000000) * 1000 / 24};
-        pthread_cond_timedwait_relative_np(&m->wake_cv, &m->wake_mu, &ts);
+        pthread_cond_timedwait_relative_np(&p->wake_cv, &p->wake_mu, &ts);
     }
-    m->wake_pending = 0;
-    pthread_mutex_unlock(&m->wake_mu);
+    p->wake_pending = 0;
+    pthread_mutex_unlock(&p->wake_mu);
     m->stats.wfi++;
     m->stats.wfi_ticks += mach_absolute_time() - t0;
     m->tick(m, cpu);
@@ -490,7 +493,8 @@ static int run(HvCpu *cpu, int one) {
         /* EL0 tables only hold user VAs and EL1 tables kernel VAs, so each half has its own salt. */
         int kernel = b->flags & HV_BLOCK_EL1;
         if (m->chain && b->va != m->stop_pc && (int)((b->va >> 55) & 1) == kernel) {
-            uint64_t *t = m->ijc + (size_t)(b->flags & (HV_IJC_TABLES - 1)) * (HV_IJC_TABLE_BYTES / 8);
+            HvPerCpu *pcs = cpu->pc_state;
+            uint64_t *t = pcs->ijc + (size_t)(b->flags & (HV_IJC_TABLES - 1)) * (HV_IJC_TABLE_BYTES / 8);
             uint64_t tag = b->va ^ cpu->ijc_salt[kernel];
             uint64_t *ent = t + (size_t)hv_ijc_index(tag) * 2;
             if (why == 5 && ent[0] == tag) {
@@ -540,21 +544,21 @@ static int run(HvCpu *cpu, int one) {
             }
             ent[0] = tag;
             ent[1] = (uint64_t)(uintptr_t)b->code;
-            m->ijc_tables_used |= 1u << (b->flags & (HV_IJC_TABLES - 1));
+            pcs->ijc_tables_used |= 1u << (b->flags & (HV_IJC_TABLES - 1));
             if (!kernel) {
                 hv_ucode_add(cpu, b->va);
                 uint32_t h = (uint32_t)(b->va >> HV_TLB_PAGE_BITS) & 0xffff;
-                m->ijc_pages[0][h >> 6] |= 1ull << (h & 63);
+                pcs->ijc_pages[0][h >> 6] |= 1ull << (h & 63);
             }
             uint32_t k = hv_ijc_key(b->va, cpu->ijc_salt[kernel]);
-            if (!(m->ijc_keyed[k >> 6] >> (k & 63) & 1)) {
-                m->ijc_keyed[k >> 6] |= 1ull << (k & 63);
-                if (++m->ijc_keyed_count > (1u << 17)) { /* an eighth full: start the cache and the filter over */
+            if (!(pcs->ijc_keyed[k >> 6] >> (k & 63) & 1)) {
+                pcs->ijc_keyed[k >> 6] |= 1ull << (k & 63);
+                if (++pcs->ijc_keyed_count > (1u << 17)) { /* an eighth full: start the cache and the filter over */
                     m->stats.reset_why[6]++;
                     hv_ijc_reset(cpu, 0);
                     hv_ijc_reset(cpu, 1);
-                    memset(m->ijc_keyed, 0, sizeof m->ijc_keyed);
-                    m->ijc_keyed_count = 0;
+                    memset(pcs->ijc_keyed, 0, sizeof pcs->ijc_keyed);
+                    pcs->ijc_keyed_count = 0;
                 }
             }
             m->stats.ijc_fills++;

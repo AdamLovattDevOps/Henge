@@ -130,9 +130,9 @@ void hv_tlb_flush(HvCpu *cpu) {
 
 /* Clear the tables of one half (user tables are the even flags values, kernel ones odd). */
 static void ijc_clear(HvCpu *cpu, int kernel) {
-    if (!cpu->m || !cpu->m->ijc) return;
+    if (!cpu->pc_state) return;
     for (int t = kernel; t < HV_IJC_TABLES; t += 2)
-        memset(cpu->m->ijc + (size_t)t * (HV_IJC_TABLE_BYTES / 8), 0, HV_IJC_TABLE_BYTES);
+        memset(cpu->pc_state->ijc + (size_t)t * (HV_IJC_TABLE_BYTES / 8), 0, HV_IJC_TABLE_BYTES);
 }
 
 /* ASIDs live in TTBR0 unless TCR.A1 puts them in TTBR1; then every process looks alike to us. */
@@ -150,12 +150,12 @@ static uint32_t ucode_slot(uint64_t key) {
     return (uint32_t)((key * 0x9e3779b97f4a7c15ull) >> (64 - HV_UCODE_BITS));
 }
 
-static void ucode_clear(HvMachine *m) {
+static void ucode_clear(HvPerCpu *m) {
     if (m && m->ucode) memset(m->ucode, 0, (sizeof *m->ucode) << HV_UCODE_BITS);
     if (m) m->ucode_count = 0;
 }
 
-static int ucode_has(HvMachine *m, uint32_t cid, uint64_t va) {
+static int ucode_has(HvPerCpu *m, uint32_t cid, uint64_t va) {
     uint64_t key = ucode_key(cid, va);
     for (uint32_t i = ucode_slot(key);; i = (i + 1) & ((1u << HV_UCODE_BITS) - 1)) {
         if (m->ucode[i] == key) return 1;
@@ -164,7 +164,7 @@ static int ucode_has(HvMachine *m, uint32_t cid, uint64_t va) {
 }
 
 void hv_ucode_add(HvCpu *cpu, uint64_t va) {
-    HvMachine *m = cpu->m;
+    HvPerCpu *m = cpu->pc_state;
     uint32_t cid = (uint32_t)(cpu->ijc_salt[0] >> 48);
     if (!m || !cid) return;
     uint64_t key = ucode_key(cid, va);
@@ -186,7 +186,7 @@ void hv_ucode_add(HvCpu *cpu, uint64_t va) {
 static uint16_t fresh_cid(HvCpu *cpu) {
     if (cpu->next_cid == 0 || cpu->next_cid > 0xffff) {
         ijc_clear(cpu, 0);
-        ucode_clear(cpu->m);
+        ucode_clear(cpu->pc_state);
         memset(cpu->asid_cid, 0, sizeof cpu->asid_cid);
         cpu->next_cid = 1;
     }
@@ -216,7 +216,7 @@ void hv_ijc_drop_asid(HvCpu *cpu, uint16_t asid) {
 void hv_ijc_reset(HvCpu *cpu, int kernel) {
     if (cpu->m) {
         cpu->m->stats.ijc_resets++;
-        memset(cpu->m->ijc_pages[kernel], 0, sizeof cpu->m->ijc_pages[kernel]);
+        memset(cpu->pc_state->ijc_pages[kernel], 0, sizeof cpu->pc_state->ijc_pages[kernel]);
     }
     if (kernel) {
         /* Kernel VAs have 0xffff in bits 63..48, so the salt must not make that 0 (the empty tag). */
@@ -228,7 +228,7 @@ void hv_ijc_reset(HvCpu *cpu, int kernel) {
         return;
     }
     memset(cpu->asid_cid, 0, sizeof cpu->asid_cid);
-    ucode_clear(cpu->m); /* every user id is new now */
+    ucode_clear(cpu->pc_state); /* every user id is new now */
     hv_ijc_switch(cpu);
 }
 
@@ -268,7 +268,7 @@ void hv_tlb_protect_code(HvCpu *cpu, const uint8_t *host_page) {
 /* Forget one salt's cached targets in one 16 KB page. A page's 4096 possible
    targets have 4096 known slots in each table, so only those are looked at. */
 static void ijc_clear_page(HvCpu *cpu, uint64_t page, int kernel, uint64_t salt) {
-    HvMachine *m = cpu->m;
+    HvPerCpu *m = cpu->pc_state;
     for (int t = kernel; t < HV_IJC_TABLES; t += 2) {
         if (!(m->ijc_tables_used >> t & 1)) continue;
         uint64_t *tab = m->ijc + (size_t)t * (HV_IJC_TABLE_BYTES / 8);
@@ -285,17 +285,18 @@ static void ijc_clear_page(HvCpu *cpu, uint64_t page, int kernel, uint64_t salt)
 void hv_ijc_drop_va(HvCpu *cpu, uint64_t va, int asid) {
     int kernel = (va >> 55) & 1;
     HvMachine *m = cpu->m;
-    if (m) {
+    HvPerCpu *p = cpu->pc_state;
+    if (m && p) {
         int drop = 0;
         if (kernel) {
             uint32_t k = hv_ijc_key(va, cpu->ijc_salt[1]);
-            drop = m->ijc_keyed[k >> 6] >> (k & 63) & 1;
+            drop = p->ijc_keyed[k >> 6] >> (k & 63) & 1;
         } else if (asid < 0) { /* every address space: any process's targets in the page count */
             uint32_t h = (uint32_t)(va >> HV_TLB_PAGE_BITS) & 0xffff;
-            drop = m->ijc_pages[0][h >> 6] >> (h & 63) & 1;
+            drop = p->ijc_pages[0][h >> 6] >> (h & 63) & 1;
         } else {
             uint64_t salt = current_asid(cpu) < 0 ? cpu->ijc_salt[0] : (uint64_t)cpu->asid_cid[asid] << 48;
-            drop = (salt >> 48) && ucode_has(m, (uint32_t)(salt >> 48), va);
+            drop = (salt >> 48) && ucode_has(p, (uint32_t)(salt >> 48), va);
         }
         if (drop) {
             m->stats.reset_why[kernel ? 3 : 2]++;
@@ -333,14 +334,14 @@ void hv_ijc_drop_range(HvCpu *cpu, uint64_t va, uint64_t len, int asid) {
     uint64_t first = va >> HV_TLB_PAGE_BITS, last = (va + len - 1) >> HV_TLB_PAGE_BITS;
     if (last - first < 4096) {
         for (uint64_t p = first; p <= last; p++)
-            if (ucode_has(m, cid, p << HV_TLB_PAGE_BITS)) {
+            if (ucode_has(cpu->pc_state, cid, p << HV_TLB_PAGE_BITS)) {
                 m->stats.reset_why[2]++;
                 ijc_clear_page(cpu, p << HV_TLB_PAGE_BITS, 0, salt);
             }
         return;
     }
     for (uint32_t i = 0; i < 1u << HV_UCODE_BITS; i++) {
-        uint64_t k = m->ucode[i];
+        uint64_t k = cpu->pc_state->ucode[i];
         if (!k || (k - 1) >> 40 != cid) continue;
         uint64_t p = (k - 1) & 0xffffffffffull;
         if (p >= (first & 0xffffffffffull) && p <= (last & 0xffffffffffull)) {

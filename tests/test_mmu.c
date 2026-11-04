@@ -215,17 +215,17 @@ int main(void) {
         static const uint64_t vas[3] = {0x100004010ull, 0x100007ffcull, 0x100008010ull}; /* page P twice, then page Q */
         uint64_t *ents[3];
         for (int i = 0; i < 3; i++) {
-            uint64_t *ent = m.ijc + (size_t)hv_ijc_index(vas[i] ^ salt) * 2;
+            uint64_t *ent = m.percpu[0].ijc + (size_t)hv_ijc_index(vas[i] ^ salt) * 2;
             ent[0] = vas[i] ^ salt;
             ent[1] = 0x1234;
             ents[i] = ent;
             uint32_t k = hv_ijc_key(vas[i], salt);
-            m.ijc_keyed[k >> 6] |= 1ull << (k & 63);
+            m.percpu[0].ijc_keyed[k >> 6] |= 1ull << (k & 63);
             uint32_t h = (uint32_t)(vas[i] >> 14) & 0xffff;
-            m.ijc_pages[0][h >> 6] |= 1ull << (h & 63);
+            m.percpu[0].ijc_pages[0][h >> 6] |= 1ull << (h & 63);
             hv_ucode_add(&cpu, vas[i]);
         }
-        m.ijc_tables_used |= 1;
+        m.percpu[0].ijc_tables_used |= 1;
         hv_tlb_flush_va_asid(&cpu, 0x100004000ull, 7);
         int want[3] = {0, 0, 1};
         for (int i = 0; i < 3; i++) {
@@ -245,7 +245,7 @@ int main(void) {
         hv_tlb_flush_va_asid(&cpu, 0x100008000ull, -1); /* all address spaces */
         checks++;
         uint64_t now = vas[2] ^ cpu.ijc_salt[0]; /* what a lookup would compare against now */
-        if (m.ijc[(size_t)hv_ijc_index(now) * 2] == now) {
+        if (m.percpu[0].ijc[(size_t)hv_ijc_index(now) * 2] == now) {
             printf("  FAIL an all-ASID TLBI kept the entry\n");
             failures++;
         }

@@ -72,7 +72,7 @@ static void *kicker_thread(void *unused) {
     (void)unused;
     for (;;) {
         usleep(1000);
-        __atomic_store_n(&cpu.exit_req, 1, __ATOMIC_RELAXED);
+        hv_machine_kick_all(&m);
         if (m.prof && cpu_port) sample_cpu();
     }
     return NULL;
@@ -245,7 +245,7 @@ int main(int argc, char **argv) {
     m.stats_interval = stats; /* set after hv_machine_init, which clears the machine */
     if (profile) m.prof = calloc(HV_PROF_RING, sizeof *m.prof);
     m.chain = !no_chain && brk == ~0ull; /* breakpoints need every block to come back */
-    HvCfgParams cfg = {.nr_cpus = 1, .ecid = ecid, .seed = seed, .mac_en0 = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01}};
+    HvCfgParams cfg = {.nr_cpus = getenv("HV_CFG_CPUS") ? (uint32_t)atoi(getenv("HV_CFG_CPUS")) : 1, .ecid = ecid, .seed = seed, .mac_en0 = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01}};
     static const uint8_t mac[6] = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01};
     if (hv_vmapple_create(&board, &m, &cpu, ram_mb << 20, &disk, &aux, &cfg, mac) != 0 ||
         hv_vmapple_load_rom(&board, rom) != 0) {

@@ -117,6 +117,8 @@ typedef struct HvCpu {
     uint64_t cntvoff;
 
     uint64_t mpidr;
+    uint32_t index;          /* which CPU: m->percpu[index] holds its caches and interrupt lines */
+    struct HvPerCpu *pc_state;
     uint64_t icount;         /* blocks entered, for tests and stats */
     int halted;              /* PSCI CPU_OFF / SYSTEM_OFF */
 } HvCpu;
