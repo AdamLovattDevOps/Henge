@@ -93,6 +93,7 @@ static uint64_t post_locked_done(HvCpu *target, HvPerCpu *p) {
     uint64_t seq = __atomic_add_fetch(&p->req_seq, 1, __ATOMIC_SEQ_CST);
     pthread_mutex_unlock(&p->req_mu);
     __atomic_store_n(&target->exit_req, 1, __ATOMIC_SEQ_CST);
+    target->m->stats.kick_src[0]++;
     return seq;
 }
 
@@ -189,6 +190,7 @@ void hv_big_yield(HvMachine *m) {
 
 void hv_cpu_wake(HvCpu *cpu) {
     __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED);
+    cpu->m->stats.kick_src[1]++;
     HvPerCpu *p = cpu->pc_state;
     pthread_mutex_lock(&p->wake_mu);
     p->wake_pending = 1;
@@ -197,12 +199,14 @@ void hv_cpu_wake(HvCpu *cpu) {
 }
 
 void hv_machine_kick_all(HvMachine *m) {
+    m->stats.kick_src[2]++;
     for (int i = 0; i < m->ncpus; i++)
         if (m->cpus[i]) __atomic_store_n(&m->cpus[i]->exit_req, 1, __ATOMIC_RELAXED);
 }
 
 /* Device work is for CPU 0, which polls the devices. */
 void hv_machine_wake(HvMachine *m) {
+    m->stats.kick_src[3]++;
     if (m->cpu) hv_cpu_wake(m->cpu);
 }
 

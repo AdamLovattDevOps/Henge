@@ -318,7 +318,9 @@ static void ijc_clear_page(HvCpu *cpu, uint64_t page, int kernel, uint64_t salt)
 
 /* The page may hold cached branch targets even if its TLB entry is gone: forget
    them, if the filters say it has any. */
-void hv_ijc_drop_va(HvCpu *cpu, uint64_t va, int asid) {
+/* remote: another CPU doing it (hv_tlbi_drop_remote_va): returns 0 instead of
+   starting the user half over, which only cpu itself may do. */
+static int ijc_drop_va(HvCpu *cpu, uint64_t va, int asid, int remote) {
     int kernel = (va >> 55) & 1;
     HvMachine *m = cpu->m;
     HvPerCpu *p = cpu->pc_state;
@@ -335,6 +337,7 @@ void hv_ijc_drop_va(HvCpu *cpu, uint64_t va, int asid) {
             drop = (salt >> 48) && ucode_has(p, (uint32_t)(salt >> 48), va);
         }
         if (drop) {
+            if (remote && !kernel && asid < 0) return 0;
             m->stats.reset_why[kernel ? 3 : 2]++;
             uint64_t page = va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
             if (kernel) ijc_clear_page(cpu, page, 1, cpu->ijc_salt[1]);
@@ -342,6 +345,11 @@ void hv_ijc_drop_va(HvCpu *cpu, uint64_t va, int asid) {
             else ijc_clear_page(cpu, page, 0, current_asid(cpu) < 0 ? cpu->ijc_salt[0] : (uint64_t)cpu->asid_cid[asid] << 48);
         }
     }
+    return 1;
+}
+
+void hv_ijc_drop_va(HvCpu *cpu, uint64_t va, int asid) {
+    ijc_drop_va(cpu, va, asid, 0);
 }
 
 void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid) {
@@ -467,6 +475,8 @@ int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid) {
     HvPerCpu *p = target->pc_state;
     uint32_t s1 = __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST);
     if (s1 & 1) return 0; /* mid-walk: it may be about to fill from the old table */
+    uint32_t c1 = __atomic_load_n(&p->ijc_seq, __ATOMIC_SEQ_CST);
+    if (c1 & 1) return 0; /* caching a block it may have looked up through the old mapping */
     if (!((va >> 55) & 1)) stash_drop(p, asid);
     uint32_t idx = (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1);
     for (int t = 0; t < 3; t++) { /* the slot whatever its tag byte, as hv_tlb_flush_va_asid does */
@@ -476,7 +486,13 @@ int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid) {
         __atomic_store_n(&e->exec_tag, HV_TLB_INVALID, __ATOMIC_RELAXED);
     }
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    return __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST) == s1; /* no fill in between */
+    /* Its cached branch targets in the page too: a cache fill checks the TLB
+       entry first (hv_ijc_fill_checked), so one after this sees it gone, and one
+       during it changed ijc_seq. */
+    if (!ijc_drop_va(target, va, asid, 1)) return 0;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    return __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST) == s1 && /* no fill in between */
+           __atomic_load_n(&p->ijc_seq, __ATOMIC_SEQ_CST) == c1;
 }
 
 const uint32_t *hv_mmu_fetch(HvCpu *cpu, uint64_t va, uint64_t *pa, uint32_t *avail) {
@@ -582,15 +598,62 @@ void hv_ijc_fill(HvCpu *cpu, HvBlock *b) {
    registers live (see read_desc), so nothing that could reach libc runs: a
    fill that would reset the cache's filters goes to the dispatcher instead.
    flags: the block flags the branch was translated under (the target's too). */
+/* Does this CPU's TLB (the table for flags) map b's page where b came from? */
+static int tlb_maps_block(HvCpu *cpu, const HvBlock *b) {
+    int table = !(b->flags & HV_BLOCK_EL1) ? 0 : (b->flags & HV_BLOCK_PAN) ? 2 : 1;
+    const HvTlbEntry *e = &cpu->tlb[(b->va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1)][table];
+    uint64_t page_va = b->va & ~(uint64_t)PAGE_MASK, page_pa = b->pa & ~(uint64_t)PAGE_MASK;
+    return __atomic_load_n(&e->exec_tag, __ATOMIC_RELAXED) == page_va &&
+           (uint64_t)e->addend == (uint64_t)(uintptr_t)(b->ram->host + (page_pa - b->ram->pa)) - page_va;
+}
+
+/* The dispatcher caching a block it found for va: only while the TLB still
+   says va is there, inside ijc_seq, so another CPU's TLBI can drop this CPU's
+   cached targets itself (hv_tlbi_drop_remote_va). */
+int hv_ijc_fill_checked(HvCpu *cpu, HvBlock *b) {
+    HvPerCpu *p = cpu->pc_state;
+    if (!p) {
+        hv_ijc_fill(cpu, b);
+        return 1;
+    }
+    __atomic_add_fetch(&p->ijc_seq, 1, __ATOMIC_SEQ_CST);
+    int ok = tlb_maps_block(cpu, b);
+    if (ok) hv_ijc_fill(cpu, b);
+    __atomic_add_fetch(&p->ijc_seq, 1, __ATOMIC_RELEASE);
+    return ok;
+}
+
+static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags);
+
 void *hv_ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
+    HvPerCpu *p = cpu->pc_state;
+    __atomic_add_fetch(&p->ijc_seq, 1, __ATOMIC_SEQ_CST);
+    void *r = ijc_resolve(cpu, va, flags);
+    __atomic_add_fetch(&p->ijc_seq, 1, __ATOMIC_RELEASE);
+    return r;
+}
+
+static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
     HvMachine *m = cpu->m;
     HvPerCpu *pcs = cpu->pc_state;
     int kernel = flags & HV_BLOCK_EL1;
-    if (!m->chain || va == m->stop_pc || (int)((va >> 55) & 1) != kernel || (va & 3)) return 0;
-    if (pcs->ijc_keyed_count >= (1u << 17) || pcs->ucode_count + 1 >= (1u << HV_UCODE_BITS) / 2) return 0;
+#define FAIL(k) do { if (m->stats_interval) m->stats.light_fail[k]++; return 0; } while (0)
+    if (!m->chain || va == m->stop_pc || (int)((va >> 55) & 1) != kernel || (va & 3)) FAIL(0);
+    if (pcs->ijc_keyed_count >= (1u << 17) || pcs->ucode_count + 1 >= (1u << HV_UCODE_BITS) / 2) FAIL(1);
     int table = !kernel ? 0 : (flags & HV_BLOCK_PAN) ? 2 : 1;
     HvTlbEntry *e = &cpu->tlb[(va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1)][table];
-    if (e->exec_tag != (va & ~(uint64_t)PAGE_MASK)) return 0;
+    if (e->exec_tag != (va & ~(uint64_t)PAGE_MASK)) {
+        /* Not in the TLB (a process switch, or another page took the slot):
+           walk for it here, as hv_tlb_refill does for data. A fault is for the
+           dispatcher to take. */
+        HvWalk w;
+        walk_begin(cpu);
+        hv_mmu_walk(cpu, va, HV_ACC_EXEC, kernel ? 1 : 0, &w);
+        if (!w.fsc) tlb_fill(cpu, va, kernel ? 1 : 0, &w);
+        walk_end(cpu);
+        if (w.fsc || e->exec_tag != (va & ~(uint64_t)PAGE_MASK)) FAIL(2);
+        if (m->stats_interval) m->stats.light_walks++;
+    }
     const uint8_t *host = (const uint8_t *)(uintptr_t)(va + (uint64_t)e->addend);
     HvRam *ram = NULL;
     for (int i = 0; i < m->nram; i++)
@@ -603,7 +666,8 @@ void *hv_ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
     HvBlock *b = pcs->jc[j];
     if (!(b && b->va == va && b->pa == pa && b->flags == flags && b->gen == gen)) {
         b = hv_block_find(m, hv_block_hash(va, pa, flags), va, pa, flags, gen);
-        if (!b) return 0;
+        if (!b) FAIL(3);
+#undef FAIL
         pcs->jc[j] = b;
     }
     if (m->stats_interval) { /* what the fill replaces, as the dispatcher counts it */

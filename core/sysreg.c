@@ -294,8 +294,10 @@ static void irq_check(HvCpu *cpu) {
     HvMachine *m = cpu->m;
     HvPerCpu *p = cpu->pc_state;
     (void)m;
-    if (p && ((p->irq_line && !(cpu->daif & HV_PSTATE_I)) || (p->fiq_line && !(cpu->daif & HV_PSTATE_F))))
+    if (p && ((p->irq_line && !(cpu->daif & HV_PSTATE_I)) || (p->fiq_line && !(cpu->daif & HV_PSTATE_F)))) {
         __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED);
+        m->stats.kick_src[4]++;
+    }
 }
 
 int hv_sysreg_msr(HvCpu *cpu, uint32_t insn, uint64_t pc) {
@@ -427,8 +429,9 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
             for (int i = 0; i < m->ncpus; i++) {
                 HvCpu *c = m->cpus[i];
                 if (!c || c == cpu) continue;
-                uint64_t s = hv_cpu_post_tlbi(c, op1, crn, crm, op2, xt);
-                if (!(by_va && hv_tlbi_drop_remote_va(c, va, op2 == 3 || op2 == 7 ? -1 : (int)(xt >> 48)))) seq[i] = s;
+                /* Done from here entirely if it can be; else c does it, and we wait. */
+                if (by_va && hv_tlbi_drop_remote_va(c, va, op2 == 3 || op2 == 7 ? -1 : (int)(xt >> 48))) continue;
+                seq[i] = hv_cpu_post_tlbi(c, op1, crn, crm, op2, xt);
             }
             for (int i = 0; i < m->ncpus; i++)
                 if (seq[i]) hv_cpu_sync(cpu, m->cpus[i], seq[i]);

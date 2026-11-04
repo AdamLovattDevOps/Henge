@@ -54,6 +54,7 @@ void hv_ijc_drop_va(HvCpu *cpu, uint64_t va, int asid);
 int hv_tlb_refill(HvCpu *cpu, uint64_t va, uint32_t flags);
 struct HvBlock;
 void hv_ijc_fill(HvCpu *cpu, struct HvBlock *b);
+int hv_ijc_fill_checked(HvCpu *cpu, struct HvBlock *b); /* only if the TLB still maps it (0: not cached) */
 void *hv_ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags);
 /* Another CPU's TLBI of one page: drop target's entries for it from here. 1 if
    that is enough (no page walk of target's raced it), 0 if target must do it

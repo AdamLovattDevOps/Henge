@@ -445,6 +445,10 @@ static void print_stats(HvCpu *cpu, int force) {
         fprintf(stderr, "  new code pages %.0f/s; waits: tlbi acks %.0f/s %.1f%%, device lock %.0f/s %.1f%%, translation lock %.0f/s %.1f%% (of one CPU)\n",
                 RATE(code_protects), RATE(syncs), RATE(sync_ticks) / 240000.0, RATE(dev_waits), RATE(dev_wait_ticks) / 240000.0,
                 RATE(tr_waits), RATE(tr_wait_ticks) / 240000.0);
+        fprintf(stderr, "  light lookups failed/s: odd %.0f, filters full %.0f, no mapping %.0f, no block yet %.0f; walked %.0fK/s\n",
+                RATE(light_fail[0]), RATE(light_fail[1]), RATE(light_fail[2]), RATE(light_fail[3]), RATE(light_walks) / 1e3);
+        fprintf(stderr, "  exit requests/s: TLBI posts %.0f, wakes %.0f (of them device work %.0f), kick all %.0f, own %.0f\n",
+                RATE(kick_src[0]), RATE(kick_src[1]), RATE(kick_src[3]), RATE(kick_src[2]), RATE(kick_src[4]));
         fprintf(stderr, "  light refills %.0fK/s, light branch-cache fills %.0fK/s, chained to other pages %.0f/s\n", RATE(refills) / 1e3,
                 RATE(ijc_light) / 1e3, RATE(xchained));
         fprintf(stderr, "  process switches: %.0f/s saved, %.0f/s restored (%.0f entries each)\n", RATE(stash_saves), RATE(stash_hits),
@@ -775,8 +779,7 @@ static int run_loop(HvCpu *cpu, int one) {
                 }
                 m->stats.fill_kind[kind]++;
             }
-            hv_ijc_fill(cpu, b);
-            m->stats.ijc_fills++;
+            if (hv_ijc_fill_checked(cpu, b)) m->stats.ijc_fills++;
         }
         /* The block before left through a chainable direct branch to this one: link them. */
         /* Only if nothing in between (an abort, an interrupt) sent the CPU elsewhere. */

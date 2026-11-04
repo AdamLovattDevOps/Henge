@@ -60,7 +60,8 @@ typedef struct HvStats {
     uint64_t blocks, translations, block_flushes;
     uint64_t flush_smc, flush_ic, flush_full;  /* why translations were dropped */
     uint64_t chained, ijc_fills, ijc_resets;
-    uint64_t xchained;        /* of them, exits to another page (TLB-checked) */
+    uint64_t xchained;
+    uint64_t kick_src[5];     /* exit_req set by: a request (TLBI), hv_cpu_wake, kick_all, hv_machine_wake, the CPU itself */        /* of them, exits to another page (TLB-checked) */
     uint64_t syncs, sync_ticks;        /* TLBI acks waited for, and host ticks spent waiting */
     uint64_t dev_waits, dev_wait_ticks; /* device lock taken while another CPU held it */
     uint64_t tr_waits, tr_wait_ticks;   /* translation lock likewise */
@@ -72,7 +73,9 @@ typedef struct HvStats {
     uint64_t tlb_miss_kind[4]; /* TLB misses: EL0 empty, EL0 other page there, EL1 empty, EL1 other page there */
     uint64_t slow_why[6];     /* slow accesses by cause: MMIO, code-page write, page end, TLB miss, other, TLB entry there but mismatched */
     uint64_t slow_kind[12];   /* hv_mem_emulate calls by HV_MEM_* kind */
-    uint64_t light_kind[4];   /* the same for hv_ijc_resolve's fills */
+    uint64_t light_kind[4];
+    uint64_t light_fail[4];
+    uint64_t light_walks;     /* of hv_ijc_resolve's lookups, ones that walked for the target page */   /* hv_ijc_resolve could not: chaining off/odd target, filters full, no TLB entry, block not made yet */   /* the same for hv_ijc_resolve's fills */
     uint64_t fill_kind[4];    /* ijc fills into an empty slot, over another live salt, over the same salt, over a dead salt */
     uint64_t reset_why[8];    /* cache drops: full flush, TLBI by ASID, TLBI user VA, TLBI kernel VA, code change, user VA in every ASID (whole user half), keyed filter full, big user range */
     uint64_t why[6];          /* dispatcher entries by cause: chain fill, kick, exception/sysreg, interrupt, cached target, cache miss */
@@ -147,6 +150,7 @@ typedef struct HvPerCpu {
        may be using TLB entries right now. */
     int active, tlb_live;
     uint32_t walk_seq;           /* odd while it walks page tables and fills its TLB (see hv_tlbi_drop_remote_va) */
+    uint32_t ijc_seq;            /* odd while it checks a block's mapping in its TLB and caches it (hv_ijc_fill_checked) */
     HvTlbStash stash[HV_STASHES];
     uint64_t stash_clock;
 } HvPerCpu;
