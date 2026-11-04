@@ -111,6 +111,16 @@ uint8_t *hv_cfg_create(HvMachine *m, uint64_t pa, const HvCfgParams *p) {
     put_str(c->model, p->model ? p->model : "VM0001");
     c->unk10 = 1;
     put_str(c->soc_name, p->soc_name ? p->soc_name : "Apple M1 (Virtual)");
+    /* Experiment (HV_CFG_POKE="0x8=0,0x2c=0"): override 32-bit words, to find
+       what the unknown fields mean. */
+    for (const char *e = getenv("HV_CFG_POKE"); e && *e;) {
+        char *end;
+        unsigned long off = strtoul(e, &end, 0), val = 0;
+        if (*end == '=') val = strtoul(end + 1, &end, 0);
+        if (off + 4 <= CFG_SIZE) memcpy(mem + off, &(uint32_t){(uint32_t)val}, 4);
+        e = *end == ',' ? end + 1 : end;
+        if (*end != ',') break;
+    }
     hv_machine_add_mmio(m, pa, CFG_SIZE, mem, cfg_read, cfg_write, "cfg");
     hv_machine_add_ram(m, pa + CFG_SIZE, CFG_WINDOW - CFG_SIZE, mem + CFG_SIZE, 0);
     return mem;

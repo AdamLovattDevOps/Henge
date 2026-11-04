@@ -57,6 +57,8 @@ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static struct libusb_device *g_dev; /* the current connection's device, or NULL */
 static uint8_t g_next_address = 1;
 static uint8_t g_outstanding[32];   /* IN requests the guest still holds, per endpoint index */
+static uint8_t *g_left[32];         /* the unread rest of the last IN response, per endpoint index */
+static uint32_t g_left_off[32], g_left_len[32];
 
 static int ep_index(uint8_t ep) { return (ep & 0x0f) | (ep & 0x80 ? 16 : 0); }
 
@@ -132,6 +134,7 @@ static void refresh(void) {
         old->gone = 1;
         g_dev = NULL;
         memset(g_outstanding, 0, sizeof g_outstanding);
+        for (int i = 0; i < 32; i++) free(g_left[i]), g_left[i] = NULL, g_left_len[i] = g_left_off[i] = 0;
     }
     int want = on && !g_dev;
     pthread_mutex_unlock(&g_mu);
@@ -246,7 +249,18 @@ static void run(Xfer *x) {
             if (t->length == 0) break;
         }
     } else {
+        /* The rest of a device write bigger than the last read: on a bus the
+           host reads it in the next transfers, so serve it first. */
         pthread_mutex_lock(&g_mu);
+        if (g_left_len[ix]) {
+            int n = (int)g_left_len[ix] < t->length ? (int)g_left_len[ix] : t->length;
+            memcpy(t->buffer, g_left[ix] + g_left_off[ix], (size_t)n);
+            g_left_off[ix] += (uint32_t)n, g_left_len[ix] -= (uint32_t)n;
+            if (!g_left_len[ix]) free(g_left[ix]), g_left[ix] = NULL, g_left_off[ix] = 0;
+            pthread_mutex_unlock(&g_mu);
+            complete(x, LIBUSB_TRANSFER_COMPLETED, n);
+            return;
+        }
         int have = g_outstanding[ix] > 0;
         if (!have) g_outstanding[ix]++;
         pthread_mutex_unlock(&g_mu);
@@ -275,8 +289,13 @@ static void run(Xfer *x) {
             if (m.type == HV_VUSB_RSP_DATA) {
                 n = in ? ((int)m.len < t->length ? (int)m.len : t->length) : t->length;
                 if (in && n) memcpy(t->buffer, m.data, (size_t)n);
-                if (in && (int)m.len > t->length && g_log)
-                    fprintf(stderr, "libusb shim: ep %#x: %u bytes for a %d-byte buffer\n", ep, m.len, t->length);
+                if (in && (int)m.len > t->length) { /* keep the rest for the next reads */
+                    pthread_mutex_lock(&g_mu);
+                    free(g_left[ix]);
+                    g_left[ix] = m.data, m.data = NULL;
+                    g_left_off[ix] = (uint32_t)n, g_left_len[ix] = m.len - (uint32_t)n;
+                    pthread_mutex_unlock(&g_mu);
+                }
             } else if (m.type == HV_VUSB_RSP_STALL) {
                 st = LIBUSB_TRANSFER_STALL;
             } else {

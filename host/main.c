@@ -5,6 +5,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
@@ -261,6 +262,11 @@ int main(int argc, char **argv) {
             fprintf(stderr, "hengevm: cannot start the installer\n");
             return 1;
         }
+        /* usbmuxd installs its own handlers; take SIGINT and SIGTERM back so
+           the machine still stops on them. */
+        usleep(500000);
+        signal(SIGINT, on_signal);
+        signal(SIGTERM, on_signal);
     }
     int pvg_on = 0;
     if (use_pvg) {

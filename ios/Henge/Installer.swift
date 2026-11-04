@@ -187,8 +187,9 @@ final class Installer: NSObject, ObservableObject {
             if step == 100 { break }
             if step == 101 { throw message("The restore failed. The log (Settings, or Documents/henge.log) says why.") }
             if henge_vm_state() == 2 && step < 100 {
-                // The restore ends with the machine rebooting; anything else is a failure.
-                try await Task.sleep(nanoseconds: 3_000_000_000)
+                // The restore ends with the machine restarting, and idevicerestore finishes a
+                // little after; a stop with no result after that is a failure.
+                for _ in 0..<90 where henge_install_step() < 100 { try await Task.sleep(nanoseconds: 1_000_000_000) }
                 if henge_install_step() == 100 { break }
                 throw message("The machine stopped during the restore (\(String(cString: henge_vm_exit_reason()))).")
             }

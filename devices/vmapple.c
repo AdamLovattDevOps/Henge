@@ -106,7 +106,10 @@ static uint64_t pvg_read(void *opaque, uint64_t off, unsigned size) {
     HvVmapple *b = opaque;
     if (b->m->log) fprintf(stderr, "hengevm: pvg read +%llx (size %u) pc %llx\n", (unsigned long long)off, size,
                            (unsigned long long)b->m->access_pc);
-    return 0;
+    /* Experiment (HV_GFX_ABSENT=1): read like a bus with nothing on it. */
+    static int absent = -1;
+    if (absent < 0) absent = getenv("HV_GFX_ABSENT") != NULL;
+    return absent ? (size >= 8 ? ~0ull : (1ull << (size * 8)) - 1) : 0;
 }
 
 static void pvg_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
