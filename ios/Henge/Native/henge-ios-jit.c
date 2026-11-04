@@ -174,7 +174,7 @@ void henge_ios_jit_install_trap_handler(void)
 {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
-    sa.sa_flags = SA_SIGINFO;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK; /* a CPU thread's SP may hold a guest address */
     sa.sa_sigaction = henge_trap_handler;
     sigemptyset(&sa.sa_mask);
 

@@ -71,6 +71,7 @@ static Emit E; /* translation runs on the dispatcher thread only */
 #define BFM_X(d, n, immr, imms) (0xb3400000u | (immr) << 16 | (imms) << 10 | (n) << 5 | (d))
 #define B_OP 0x14000000u
 #define MOV_X(d, m) (0xaa0003e0u | (m) << 16 | (d))
+#define ADD_SP_TO(d) (0x910003e0u | (d)) /* add xd, sp, #0: what mov from SP is (an ORR would read XZR) */
 #define ADD_LSL(d, n, m, sh) (0x8b000000u | (m) << 16 | (sh) << 10 | (n) << 5 | (d))
 #define SUB_X(d, n, m) (0xcb000000u | (m) << 16 | (n) << 5 | (d))
 #define ADD_EXT(d, n, m, opt, sh) (0x8b200000u | (m) << 16 | (opt) << 13 | (sh) << 10 | (n) << 5 | (d))
@@ -291,7 +292,6 @@ static void translate_copy(Emit *e, uint32_t insn) {
         put(e, insn);
         return;
     }
-    static const uint32_t sp_flag[4] = {HV_FIELD_RD_SP, HV_FIELD_RN_SP, 0, 0};
     int stolen[4] = {-1, -1, -1, -1}; /* per field: the guest register to rename, or -1 */
     uint32_t used = 0;
     int any = 0;
@@ -299,7 +299,7 @@ static void translate_copy(Emit *e, uint32_t insn) {
         if (!(fields & (1u << f))) continue;
         int r = hv_field_reg(insn, f);
         used |= 1u << r;
-        if (is_stolen(r) || (r == 31 && (fields & sp_flag[f]))) {
+        if (is_stolen(r)) { /* guest SP is the host SP while blocks run: copied as it is */
             stolen[f] = r;
             any = 1;
         }
@@ -484,7 +484,10 @@ static void translate_excl(Emit *e, uint32_t insn, uint64_t pc) {
         return;
     }
     int a = rn;
-    if (rn == 31 || is_stolen(rn)) {
+    if (rn == 31) {
+        put(e, ADD_SP_TO(15));
+        a = 15;
+    } else if (is_stolen(rn)) {
         put(e, LDR_X(15, 28, slot_of(rn)));
         a = 15;
     }
@@ -558,7 +561,8 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
     spill(e, s, 3);
 
     /* Effective address into A, or used where it is: a guest base register with nothing added. */
-    int base_stolen = !literal && (op.rn == 31 || is_stolen(op.rn));
+    int sp_base = !literal && op.rn == 31; /* the guest SP, which is the host SP while blocks run */
+    int base_stolen = !literal && (sp_base || is_stolen(op.rn));
     int direct = !literal && !base_stolen &&
                  (op.mode == HV_ADDR_POST || ((op.mode == HV_ADDR_OFFSET || op.mode == HV_ADDR_PRE) && op.imm == 0));
     int addr = direct ? op.rn : A;
@@ -567,7 +571,7 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
         put_lit(e, A, pc + op.imm);
     } else {
         if (base_stolen) {
-            put(e, LDR_X(A, 28, slot_of(op.rn)));
+            put(e, sp_base ? ADD_SP_TO(A) : LDR_X(A, 28, slot_of(op.rn)));
             base = A;
         }
         switch (op.mode) {
@@ -683,7 +687,7 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
     /* Base writeback. */
     if (op.mode == HV_ADDR_PRE || op.mode == HV_ADDR_POST) {
         int b = op.rn;
-        if (base_stolen) {
+        if (base_stolen && !sp_base) {
             put(e, LDR_X(T, 28, slot_of(op.rn)));
             b = T;
         }
@@ -693,11 +697,11 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
                 put(e, LDR_X(U, 28, slot_of(rm)));
                 rm = U;
             }
-            put(e, ADD_LSL(b, b, rm, 0));
+            put(e, sp_base ? ADD_EXT(31, 31, rm, 3, 0) : ADD_LSL(b, b, rm, 0)); /* add sp, sp, rm, uxtx */
         } else {
-            put_add_imm(e, b, b, op.imm);
+            put_add_imm(e, b, b, op.imm); /* the immediate forms take SP as it is */
         }
-        if (base_stolen) put(e, STR_X(T, 28, slot_of(op.rn)));
+        if (base_stolen && !sp_base) put(e, STR_X(T, 28, slot_of(op.rn)));
     }
     unspill(e, s, 3);
     e->ool[slow].join = e->n;

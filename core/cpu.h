@@ -67,7 +67,8 @@ typedef struct HvCpu {
     uint32_t excl_size;      /* 0x3f8: bytes the LDXR read */
     uint32_t pad0;
     uint64_t excl_val[2];    /* 0x400: what it read (a pair's two halves) */
-    uint64_t pad2[6];        /* keeps the TLB at 0x440 */
+    uint64_t host_sp;        /* 0x410: the host's stack while blocks run: they keep the guest SP in the SP register */
+    uint64_t pad2[5];        /* keeps the TLB at 0x440 */
     /* 0x440: [0] EL0 and unprivileged accesses, [1] EL1, [2] EL1 with PSTATE.PAN set,
        so toggling PAN (the kernel does it around every user copy) flushes nothing. */
     HvTlbEntry tlb[3][HV_TLB_SIZE];
@@ -158,6 +159,7 @@ typedef struct HvCpu {
 #define HV_CPU_EXCL_ADDR   0x3f0
 #define HV_CPU_EXCL_SIZE   0x3f8
 #define HV_CPU_EXCL_VAL    0x400
+#define HV_CPU_HOST_SP     0x410
 #define HV_CPU_TLB         0x440
 
 /* Indirect-branch cache: one table per block-flags value, 64K entries of 16 bytes,
@@ -190,6 +192,7 @@ _Static_assert(offsetof(HvCpu, excl_addr) == HV_CPU_EXCL_ADDR, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, el0_cnt) == HV_CPU_EL0_CNT, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, excl_size) == HV_CPU_EXCL_SIZE, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, excl_val) == HV_CPU_EXCL_VAL, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, host_sp) == HV_CPU_HOST_SP, "HvCpu layout");
 _Static_assert(sizeof(HvTlbEntry) == 32, "TLB entries are indexed with lsl #5");
 
 /* Why the last block returned to the dispatcher. */

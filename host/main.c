@@ -98,6 +98,7 @@ static void *cpu_thread(void *unused) {
     (void)unused;
     RunArgs *a = &run_args;
     cpu_port = mach_thread_self();
+    hv_vm_prepare_cpu_thread();
     /* --break PC: stop the brk_hits-th time execution reaches PC. */
     m.stop_pc = a->brk;
     int r;

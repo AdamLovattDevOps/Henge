@@ -3,6 +3,7 @@
 #include <TargetConditionals.h>
 #include <pthread.h>
 #include <pthread/qos.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -83,8 +84,25 @@ static void *kicker_thread(void *unused) {
     return NULL;
 }
 
+/* A thread that runs guest code. While a block runs its SP register holds the
+   guest's SP, a guest address, so the kernel must never push a signal frame
+   there: other threads take the asynchronous signals, and a handler that does
+   run here (a fault) gets a stack of its own. */
+void hv_vm_prepare_cpu_thread(void) {
+    static __thread int done;
+    if (done) return;
+    done = 1;
+    stack_t ss = {.ss_sp = malloc(1u << 16), .ss_size = 1u << 16, .ss_flags = 0};
+    if (ss.ss_sp) sigaltstack(&ss, NULL);
+    sigset_t set;
+    sigfillset(&set);
+    sigdelset(&set, SIGSEGV), sigdelset(&set, SIGBUS), sigdelset(&set, SIGILL), sigdelset(&set, SIGTRAP), sigdelset(&set, SIGFPE);
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+}
+
 /* iOS parks default-QoS threads on efficiency cores readily; the guest's CPUs are what the user waits on. */
 static void cpu_qos(void) {
+    hv_vm_prepare_cpu_thread();
 #if TARGET_OS_IPHONE
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
 #endif

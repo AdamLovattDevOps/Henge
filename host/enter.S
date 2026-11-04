@@ -21,6 +21,8 @@
 #define CPU_FPCR 0x340
 #define CPU_FPSR 0x348
 #define CPU_HELPER_RET 0x358
+#define CPU_SP 0xf8
+#define CPU_HOST_SP 0x410
 
     .text
     .p2align 2
@@ -127,11 +129,21 @@ _hv_enter:
     LOAD_FLAGS_FP
     LOAD_X1_X30
     ldr x15, [sp, #160]
+    // From here the SP register holds the guest's SP (a guest address: nothing
+    // may push onto it). The host's is kept in the HvCpu until the block leaves.
+    mov x0, sp
+    str x0, [x28, #CPU_HOST_SP]
+    ldr x0, [x28, #CPU_SP]
+    mov sp, x0
     ldr x0, [x28, #0]
     br x15
 
 _hv_exit:
-    // x0, x1 and pc are already in the HvCpu.
+    // x0, x1 and pc are already in the HvCpu. Back to the host's stack first.
+    mov x0, sp
+    str x0, [x28, #CPU_SP]
+    ldr x0, [x28, #CPU_HOST_SP]
+    mov sp, x0
     SAVE_X2_X29
     str x30, [x28, #240]
     SAVE_FLAGS_FP
@@ -153,12 +165,19 @@ _hv_helper_entry:
     str x30, [x28, #CPU_HELPER_RET]
     mov x1, x0
     SAVE_X2_X29
+    // The guest's SP into the HvCpu (C reads and changes it: exceptions, SPSel), the host's stack back.
+    mov x2, sp
+    str x2, [x28, #CPU_SP]
+    ldr x2, [x28, #CPU_HOST_SP]
+    mov sp, x2
     SAVE_FLAGS_FP
     mov x0, x28
     bl _hv_helper
     cbnz w0, Lrestore_host
     LOAD_FLAGS_FP
     LOAD_X1_X30
+    ldr x0, [x28, #CPU_SP]
+    mov sp, x0
     ldr x0, [x28, #CPU_HELPER_RET]
     br x0
 
