@@ -1,5 +1,7 @@
 #include "virtio_blk.h"
 
+#include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -92,15 +94,57 @@ static int handle(HvVirtioBlk *b, HvVirtqElem *e, uint32_t *written) {
     return 0;
 }
 
+static uint64_t now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
+}
+
+/* Workers take requests in order and run them in parallel; a flush or an
+   Apple barrier first waits for every request before it to finish, and nothing
+   after it starts until it is done, so their ordering meaning holds. */
 static void *worker(void *opaque) {
     HvVirtioBlk *b = opaque;
+    /* HV_BLK_STATS: requests, bytes, flushes and how busy this worker was, every 10 s. */
+    int stats = getenv("HV_BLK_STATS") != NULL;
+    uint64_t t_last = now_us(), busy = 0, reqs = 0, bytes = 0, flushes = 0, flush_us = 0;
     for (;;) {
         pthread_mutex_lock(&b->mu);
-        while (b->completed == __atomic_load_n(&b->submitted, __ATOMIC_ACQUIRE)) pthread_cond_wait(&b->cv, &b->mu);
+        while (b->fence || b->claimed == __atomic_load_n(&b->submitted, __ATOMIC_ACQUIRE)) pthread_cond_wait(&b->cv, &b->mu);
+        HvVblkReq *r = &b->ring[b->claimed % HV_VBLK_RING];
+        uint32_t type = 0;
+        hv_virtq_read(&b->vio, &r->e, 0, &type, 4);
+        int fence = type == T_FLUSH || type == T_APPLE_BARRIER;
+        b->claimed++;
+        if (fence) {
+            b->fence = 1;
+            while (b->inflight) pthread_cond_wait(&b->done_cv, &b->mu);
+        }
+        b->inflight++;
         pthread_mutex_unlock(&b->mu);
-        HvVblkReq *r = &b->ring[b->completed % HV_VBLK_RING];
+
+        uint64_t t0 = stats ? now_us() : 0;
         if (handle(b, &r->e, &r->written) != 0) r->written = 0;
-        __atomic_store_n(&b->completed, b->completed + 1, __ATOMIC_RELEASE); /* in order: a single worker */
+        if (stats) {
+            uint64_t t1 = now_us();
+            busy += t1 - t0, reqs++, bytes += r->written > 1 ? r->written : readable(&r->e);
+            if (type == T_FLUSH) flushes++, flush_us += t1 - t0;
+            if (t1 - t_last > 10000000) {
+                fprintf(stderr, "virtio-blk %s worker: %.0f req/s %.1f MB/s, %.0f flushes/s (%.1f ms each), busy %.0f%%\n",
+                        b->disk->offset ? "aux" : "root", reqs / 10.0, bytes / 10.0 / (1 << 20), flushes / 10.0,
+                        flushes ? flush_us / 1000.0 / flushes : 0.0, busy / 100000.0);
+                t_last = t1, busy = reqs = bytes = flushes = flush_us = 0;
+            }
+        }
+
+        pthread_mutex_lock(&b->mu);
+        __atomic_store_n(&r->done, 1, __ATOMIC_RELEASE);
+        b->inflight--;
+        if (fence) b->fence = 0;
+        __atomic_add_fetch(&b->completed, 1, __ATOMIC_RELEASE);
+        pthread_cond_broadcast(&b->done_cv);
+        if (fence) pthread_cond_broadcast(&b->cv);
+        pthread_mutex_unlock(&b->mu);
         hv_machine_wake(b->vio.m);
     }
     return NULL;
@@ -119,7 +163,7 @@ static void notify(HvVirtio *v, int q) {
         pthread_mutex_unlock(&b->mu);
         any = 1;
     }
-    if (any) pthread_cond_signal(&b->cv);
+    if (any) pthread_cond_broadcast(&b->cv);
 }
 
 void hv_virtio_blk_drain(HvVirtioBlk *b) {
@@ -127,17 +171,26 @@ void hv_virtio_blk_drain(HvVirtioBlk *b) {
     hv_virtio_blk_poll(b);
 }
 
+/* CPU thread: hand finished requests back, in whatever order they finished;
+   a slot is reused once it and every slot before it are back. */
 void hv_virtio_blk_poll(HvVirtioBlk *b) {
     if (!b) return;
-    uint32_t done = __atomic_load_n(&b->completed, __ATOMIC_ACQUIRE);
-    if (done == b->published) return;
-    int q = 0;
-    for (; b->published != done; b->published++) {
-        HvVblkReq *r = &b->ring[b->published % HV_VBLK_RING];
+    int q = -1;
+    for (uint32_t i = b->published; i != b->submitted; i++) {
+        HvVblkReq *r = &b->ring[i % HV_VBLK_RING];
+        if (r->pushed || !__atomic_load_n(&r->done, __ATOMIC_ACQUIRE)) continue;
         hv_virtq_push(&b->vio, r->q, &r->e, r->written);
+        r->pushed = 1;
         q = r->q;
         b->requests++;
     }
+    while (b->published != b->submitted && b->ring[b->published % HV_VBLK_RING].pushed) {
+        HvVblkReq *r = &b->ring[b->published % HV_VBLK_RING];
+        r->pushed = 0;
+        __atomic_store_n(&r->done, 0, __ATOMIC_RELAXED);
+        b->published++;
+    }
+    if (q < 0) return;
     hv_virtio_interrupt(&b->vio);
     notify(&b->vio, q); /* requests that waited for room in the ring */
 }
@@ -152,7 +205,8 @@ HvVirtioBlk *hv_virtio_blk_create(HvMachine *m, HvPcie *bus, HvDisk *disk, int a
     b->ring = calloc(HV_VBLK_RING, sizeof *b->ring);
     pthread_mutex_init(&b->mu, NULL);
     pthread_cond_init(&b->cv, NULL);
-    pthread_create(&b->worker, NULL, worker, b);
+    pthread_cond_init(&b->done_cv, NULL);
+    for (int i = 0; i < HV_VBLK_WORKERS; i++) pthread_create(&b->worker[i], NULL, worker, b);
     uint64_t capacity = disk->size / 512;
     uint32_t seg_max = HV_VIRTQ_MAX_SEGS - 2, blk_size = 512, apple_type = (uint32_t)apple_variant;
     uint16_t num_queues = 1;

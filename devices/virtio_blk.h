@@ -21,7 +21,11 @@ typedef struct HvVblkReq {
     HvVirtqElem e;
     int q;
     uint32_t written;
+    int done;            /* a worker finished it (CPU thread pushes it) */
+    int pushed;          /* in the used ring (the slot is free once all before it are too) */
 } HvVblkReq;
+
+#define HV_VBLK_WORKERS 4 /* requests in flight at once: the guest queues many, and each waits on the host disk */
 
 typedef struct HvVirtioBlk {
     HvVirtio vio;
@@ -29,11 +33,15 @@ typedef struct HvVirtioBlk {
     uint64_t requests, errors;
     HvVblkReq *ring;
     uint32_t submitted;  /* CPU thread: requests handed to the worker */
-    uint32_t completed;  /* worker: requests done */
+    uint32_t completed;  /* workers: requests done (in any order) */
+    uint32_t claimed;    /* workers: requests taken (under mu) */
+    int inflight;        /* taken, not done */
+    int fence;           /* a flush or barrier waits for everything before it: nothing else is taken meanwhile */
+    pthread_cond_t done_cv;
     uint32_t published;  /* CPU thread: completions pushed to the used ring */
     pthread_mutex_t mu;
     pthread_cond_t cv;
-    pthread_t worker;
+    pthread_t worker[HV_VBLK_WORKERS];
 } HvVirtioBlk;
 
 HvVirtioBlk *hv_virtio_blk_create(HvMachine *m, HvPcie *bus, HvDisk *disk, int apple_variant);
