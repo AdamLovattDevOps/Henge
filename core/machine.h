@@ -272,6 +272,8 @@ int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,
 HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa);
 /* Drop the translations made from the RAM page holding pa (it was written, or the guest invalidated it). */
 void hv_invalidate_code(HvMachine *m, uint64_t pa);
+/* A device wrote guest RAM directly (DMA): drop translations of any code in [pa, pa+len). */
+void hv_dma_written(HvMachine *m, uint64_t pa, uint64_t len);
 HvMmio *hv_mmio_lookup(HvMachine *m, uint64_t pa);
 /* Host pointer for `len` bytes of guest RAM at pa, or NULL. */
 void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len);
