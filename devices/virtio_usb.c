@@ -124,6 +124,9 @@ static void track_status(HvVirtioUsb *d) {
     int on = (d->vio.status & 4) != 0;
     if (on == d->pci_on) return;
     d->pci_on = on;
+    /* The kernel's driver has the port now: the boot ROM's last posted
+       buffer is memory the kernel owns, so nothing may go there again. */
+    if (on) d->rom_on = 0;
     hv_vusb_set_online(d, on);
 }
 

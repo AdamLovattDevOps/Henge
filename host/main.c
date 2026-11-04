@@ -5,6 +5,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -13,6 +14,7 @@
 #include "mmu.h"
 #include "pvg.h"
 #include "vm.h"
+#include "install.h"
 
 /* The machine lives in vm.c; these name its parts here. */
 #define m (*hv_vm_machine())
@@ -155,13 +157,25 @@ static void *cpu_thread(void *unused) {
 }
 
 static void usage(void) {
-    fprintf(stderr, "usage: hengevm --rom FILE --disk FILE --aux FILE --ecid N [--seed N] [--ram MB] [--log N] [--trace 1] [--screenshot PNG] [--watch VA] [--stats SECONDS [--profile 1]] [--cpus N] [--window] [--no-pvg] [--no-chain] [--break PC [--break-hits N]] [--dump PA LEN FILE] [--aux-offset BYTES]\n");
+    fprintf(stderr, "usage: hengevm --rom FILE --disk FILE --aux FILE --ecid N [--seed N] [--ram MB] [--log N] [--trace 1] [--screenshot PNG] [--watch VA] [--stats SECONDS [--profile 1]] [--cpus N] [--window] [--no-pvg] [--no-chain] [--break PC [--break-hits N]] [--dump PA LEN FILE] [--aux-offset BYTES] [--install IPSW]\n");
     exit(2);
+}
+
+static void install_progress(int step, double p, void *user) {
+    (void)user;
+    static int last_step = -1, last_pct = -1;
+    int pct = (int)(p * 100);
+    if (step == last_step && pct / 5 == last_pct / 5) return;
+    last_step = step, last_pct = pct;
+    if (step == HV_INSTALL_DONE) fprintf(stderr, "hengevm: install: done\n");
+    else if (step == HV_INSTALL_FAILED) fprintf(stderr, "hengevm: install: failed\n");
+    else fprintf(stderr, "hengevm: install: step %d %d%%\n", step, pct);
 }
 
 int main(int argc, char **argv) {
     const char *rom = NULL, *disk_path = NULL, *aux_path = NULL;
     uint64_t seed = 0, ecid = 0, ram_mb = 4096, aux_offset = 16384;
+    const char *install_ipsw = NULL;
     int log = 1, trace = 0, use_pvg = 1, no_chain = 0;
     const char *screenshot = NULL;
     uint64_t watch = 0, watch_pa = 0;
@@ -206,13 +220,15 @@ int main(int argc, char **argv) {
             dump_path = argv[++i];
         }
         else if (!strcmp(argv[i], "--aux-offset")) aux_offset = strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--install")) install_ipsw = argv[++i];
         else usage();
     }
     if (!rom || !disk_path || !aux_path) usage();
     setvbuf(stderr, NULL, _IONBF, 0);
 
     HvVmConfig vc = {.rom = rom, .disk = disk_path, .aux = aux_path, .aux_offset = aux_offset, .ecid = ecid, .seed = seed,
-                     .ram_mb = ram_mb, .ncpus = ncpus, .log = log, .no_net = getenv("HV_NO_NET") != NULL};
+                     .ram_mb = ram_mb, .ncpus = ncpus, .log = log, .no_net = getenv("HV_NO_NET") != NULL,
+                     .installer = install_ipsw != NULL};
     if (getenv("HV_JIT_MB")) vc.jit_bytes = (size_t)atoi(getenv("HV_JIT_MB")) << 20; /* debugging: a small region flushes often */
     char err[256];
     if (hv_vm_create(&vc, err, sizeof err) != 0) {
@@ -227,6 +243,15 @@ int main(int argc, char **argv) {
     m.chain = !no_chain && brk == ~0ull; /* breakpoints need every block to come back */
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+    if (install_ipsw) {
+        char work[1024];
+        snprintf(work, sizeof work, "%s.restore", disk_path);
+        mkdir(work, 0755);
+        if (hv_install_start(board.vusb, install_ipsw, work, ecid, install_progress, NULL) != 0) {
+            fprintf(stderr, "hengevm: cannot start the installer\n");
+            return 1;
+        }
+    }
     int pvg_on = 0;
     if (use_pvg) {
         if (hv_pvg_attach(&board, screenshot) != 0) fprintf(stderr, "hengevm: ParavirtualizedGraphics device unavailable; graphics stays inert\n");

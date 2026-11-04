@@ -77,7 +77,7 @@ static uint32_t usb_xfer(HvBdif *b, uint64_t chain, int write, uint8_t *buf, uin
 /* Queue 0 has a buffer and the host has a request: fill it. */
 static void usb_deliver(HvBdif *b) {
     HvBdifUsbQ *q = &b->usb_q[0];
-    if (!b->usb || !q->pending || q->done) return;
+    if (!b->usb || !b->usb->rom_on || !q->pending || q->done) return;
     HvVusbMsg m;
     if (!hv_vusb_take_request(b->usb, &m)) return;
     uint32_t room = 0;
@@ -105,6 +105,7 @@ void hv_bdif_poll(HvBdif *b) {
 static void usb_write(HvBdif *b, uint64_t reg, uint64_t v) {
     switch (reg) {
     case REG_UNK2: /* (re)enable: a new stage of the boot chain connecting */
+        b->usb->rom_on = v != 0;
         hv_vusb_set_online(b->usb, v != 0);
         memset(b->usb_q, 0, sizeof b->usb_q);
         b->usb_q[0].done = b->usb_q[1].done = 1; /* idle: nothing submitted */
@@ -121,6 +122,7 @@ static void usb_write(HvBdif *b, uint64_t reg, uint64_t v) {
             break;
         }
         /* A response: take it now. */
+        if (!b->usb->rom_on) break;
         uint32_t room = 0;
         usb_xfer(b, v, 0, NULL, 0, &room);
         uint8_t *tmp = room ? malloc(room) : NULL;

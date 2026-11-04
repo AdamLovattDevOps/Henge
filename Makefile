@@ -32,8 +32,18 @@ SLIRP_LIBS = $(shell pkg-config --libs slirp)
 $(B)/net_slirp.o: host/net_slirp.c host/*.h devices/*.h core/*.h | $(B)
 	$(CC) $(CFLAGS) $(SLIRP_CFLAGS) -c $< -o $@
 
-$(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/audio_mac.o $(B)/vm.o $(B)/usb_host.o
-	$(CC) $(CFLAGS) host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/audio_mac.o $(B)/vm.o $(B)/usb_host.o $(SLIRP_LIBS) -framework AudioToolbox -framework ParavirtualizedGraphics -framework Metal \
+RB = $(B)/restore
+RESTORE_PKGS = libplist-2.0 libusbmuxd-2.0 libimobiledevice-1.0 libimobiledevice-glue-1.0 libtatsu-1.0 libzip libcurl
+RESTORE_CFLAGS = -O2 -w -DHAVE_CONFIG_H -Ithird_party/restore_config -Ithird_party -Ithird_party/libusb-1.0 \
+                 -Ithird_party/libirecovery/include $(shell pkg-config --cflags $(RESTORE_PKGS) 2>/dev/null)
+RESTORE_LIBS = $(shell pkg-config --libs $(RESTORE_PKGS) 2>/dev/null) -lz
+IRECV_SRC = third_party/libirecovery/src/libirecovery.c
+MUXD_SRC = $(wildcard third_party/usbmuxd/src/*.c)
+IDR_SRC = $(wildcard third_party/idevicerestore/src/*.c)
+RESTORE_OBJ = $(patsubst third_party/%.c,$(RB)/%.o,$(IRECV_SRC) $(MUXD_SRC) $(IDR_SRC))
+
+$(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/audio_mac.o $(B)/vm.o $(B)/usb_host.o $(B)/libusb_shim.o $(B)/install.o $(RESTORE_OBJ)
+	$(CC) $(CFLAGS) host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/audio_mac.o $(B)/vm.o $(B)/usb_host.o $(B)/libusb_shim.o $(B)/install.o $(RESTORE_OBJ) $(RESTORE_LIBS) $(SLIRP_LIBS) -framework AudioToolbox -framework ParavirtualizedGraphics -framework Metal \
 	    -framework Foundation -framework CoreGraphics -framework ImageIO -framework CoreFoundation \
 	    -framework AppKit -framework QuartzCore -o $@
 
@@ -104,3 +114,24 @@ $(IB)/libhengevm.a: $(IOS_OBJ)
 	xcrun --sdk iphoneos libtool -static -o $@ $(IOS_OBJ)
 ios-lib: $(IB)/libhengevm.a
 .PHONY: ios-lib
+
+# The installer: libirecovery, usbmuxd and idevicerestore (third_party, vendored
+# sources) linked against host/libusb_shim.c, so they restore the virtual Mac
+# through its USB port the way Virtualization.framework's installer does.
+# Mac build: the libraries they need come from Homebrew (libimobiledevice,
+# libtatsu, libplist, libzip).
+$(RB)/libirecovery/%.o: third_party/libirecovery/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(RESTORE_CFLAGS) -DPACKAGE_VERSION='"1.3.1-henge"' -c $< -o $@
+$(RB)/usbmuxd/%.o: third_party/usbmuxd/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(RESTORE_CFLAGS) -DPACKAGE_NAME='"usbmuxd"' -DPACKAGE_VERSION='"1.1.1-henge"' -Dmain=usbmuxd_main -Dlog_level=usbmuxd_log_level -c $< -o $@
+$(RB)/idevicerestore/%.o: third_party/idevicerestore/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(RESTORE_CFLAGS) -Ithird_party/idevicerestore/src -DIDEVICERESTORE_NOMAIN -DPACKAGE_NAME='"idevicerestore"' -DPACKAGE_VERSION='"1.0.0-henge"' -c $< -o $@
+$(B)/libusb_shim.o: host/libusb_shim.c host/*.h devices/*.h | $(B)
+	$(CC) $(CFLAGS) -Ithird_party -c $< -o $@
+$(B)/install.o: host/install.c host/*.h devices/*.h | $(B)
+	$(CC) $(CFLAGS) $(RESTORE_CFLAGS) -c $< -o $@
+restore-objs: $(RESTORE_OBJ)
+.PHONY: restore-objs

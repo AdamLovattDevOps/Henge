@@ -63,6 +63,7 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     ncpus = c->ncpus < 1 ? 1 : c->ncpus > HV_MAX_CPUS ? HV_MAX_CPUS : c->ncpus;
     m.big_lock_on = ncpus > 1 && getenv("HV_BIG_LOCK"); /* debugging: one CPU in guest code at a time */
     HvCfgParams cfg = {.nr_cpus = (uint32_t)ncpus, .ecid = c->ecid, .seed = c->seed, .mac_en0 = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01}};
+    if (c->installer) cfg.run_installer1 = cfg.run_installer2 = 1;
     if (getenv("HV_RUN_INSTALLER")) { /* experiment: "a,b" for the two installer words */
         unsigned a = 0, b2 = 0;
         sscanf(getenv("HV_RUN_INSTALLER"), "%u,%u", &a, &b2);

@@ -53,6 +53,7 @@ typedef struct HvVirtioUsb {
     uint32_t session;              /* bumps on every connect and disconnect */
     int online;                    /* a front-end is connected */
     int pci_on;                    /* the PCI front-end saw DRIVER_OK */
+    int rom_on;                    /* the ROM's front-end (bdif) owns the port; off once the kernel's driver takes it */
     int log;
 } HvVirtioUsb;
 
