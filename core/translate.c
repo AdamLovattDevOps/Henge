@@ -1770,7 +1770,7 @@ int hv_translate_place(HvMachine *m, HvBlock *b) {
         m->slots[slot] = (uint64_t)(uintptr_t)code;
         int64_t off = code - (dst + e->site[k].at);
         if (off >= -(1 << 25) && off < (1 << 25)) e->w[e->site[k].at] = 0x14000000u | (uint32_t)(off & 0x3ffffff);
-        m->stats.chained_early++;
+        if (m->stats_interval) m->stats.chained_early++;
     }
     hv_jit_write(&m->jit, dst, e->w, e->pool_at * 4);
     hv_jit_write(&m->jit, dst + e->pool_at, e->pool, e->npool * 8);

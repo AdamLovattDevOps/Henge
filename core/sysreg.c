@@ -296,7 +296,7 @@ static void irq_check(HvCpu *cpu) {
     (void)m;
     if (p && ((p->irq_line && !(cpu->daif & HV_PSTATE_I)) || (p->fiq_line && !(cpu->daif & HV_PSTATE_F)))) {
         __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED);
-        m->stats.kick_src[4]++;
+        if (m->stats_interval) m->stats.kick_src[4]++;
     }
 }
 
@@ -454,7 +454,7 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
                     if (r < 0) why = 3;
                 }
                 if (done) continue;
-                m->stats.posted_kind[why]++;
+                if (m->stats_interval) m->stats.posted_kind[why]++;
                 seq[i] = hv_cpu_post_tlbi(c, op1, crn, crm, op2, xt);
             }
             for (int i = 0; i < m->ncpus; i++)

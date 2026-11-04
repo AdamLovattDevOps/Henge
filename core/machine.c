@@ -95,7 +95,7 @@ static uint64_t post_locked_done(HvCpu *target, HvPerCpu *p) {
     pthread_mutex_unlock(&p->req_mu);
     __atomic_store_n(&target->exit_req, 1, __ATOMIC_SEQ_CST);
     __asm__ volatile("sev" ::: "memory"); /* a WFE waiting in place (wfe() in dispatch.c) sees it now */
-    target->m->stats.kick_src[0]++;
+    if (target->m->stats_interval) target->m->stats.kick_src[0]++;
     return seq;
 }
 
@@ -199,7 +199,7 @@ void hv_cpu_kick(HvCpu *cpu) {
 void hv_cpu_wake(HvCpu *cpu) {
     __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_SEQ_CST);
     __asm__ volatile("sev" ::: "memory");
-    cpu->m->stats.kick_src[1]++;
+    if (cpu->m->stats_interval) cpu->m->stats.kick_src[1]++;
     HvPerCpu *p = cpu->pc_state;
     pthread_mutex_lock(&p->wake_mu);
     p->wake_pending = 1;
@@ -208,7 +208,7 @@ void hv_cpu_wake(HvCpu *cpu) {
 }
 
 void hv_machine_kick_all(HvMachine *m) {
-    m->stats.kick_src[2]++;
+    if (m->stats_interval) m->stats.kick_src[2]++;
     for (int i = 0; i < m->ncpus; i++)
         if (m->cpus[i]) __atomic_store_n(&m->cpus[i]->exit_req, 1, __ATOMIC_SEQ_CST);
     __asm__ volatile("sev" ::: "memory");
@@ -216,7 +216,7 @@ void hv_machine_kick_all(HvMachine *m) {
 
 /* Device work is for CPU 0, which polls the devices. */
 void hv_machine_wake(HvMachine *m) {
-    m->stats.kick_src[3]++;
+    if (m->stats_interval) m->stats.kick_src[3]++;
     if (m->cpu) hv_cpu_wake(m->cpu);
 }
 

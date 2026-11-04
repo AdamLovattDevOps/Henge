@@ -209,7 +209,7 @@ static uint32_t wfe(HvCpu *cpu) {
         sleep_ok = mach_absolute_time() - t0 < 24 * 20;
     }
     uint64_t deadline = mach_absolute_time() + 24 * 50; /* 50 us at 24 MHz */
-    cpu->m->stats.wfe_waits++;
+    if (cpu->m->stats_interval) cpu->m->stats.wfe_waits++;
     for (;;) {
         uint64_t v;
         switch (size) { /* LDAXR arms the host monitor too, so the WFE below wakes on a write */
@@ -239,14 +239,14 @@ static void *fast_resume(HvCpu *cpu) {
     if (off < 0) off = getenv("HV_NO_FAST_RESUME") != NULL;
     HvMachine *m = cpu->m;
     HvPerCpu *p = cpu->pc_state;
-    if (off || !m->chain || m->trace || m->log >= 2 || !p || cpu->pc == m->stop_pc || cpu->halted || cpu->off) { m->stats.fr_fail[0]++; return NULL; }
+    if (off || !m->chain || m->trace || m->log >= 2 || !p || cpu->pc == m->stop_pc || cpu->halted || cpu->off) { if (m->stats_interval) m->stats.fr_fail[0]++; return NULL; }
     if (__atomic_load_n(&cpu->exit_req, __ATOMIC_RELAXED) || __atomic_load_n(&m->flush_pending, __ATOMIC_RELAXED) ||
         __atomic_load_n(&m->stw_active, __ATOMIC_RELAXED)) {
-        m->stats.fr_fail[1]++;
+        if (m->stats_interval) m->stats.fr_fail[1]++;
         return NULL;
     }
-    if ((p->irq_line && !(cpu->daif & HV_PSTATE_I)) || (p->fiq_line && !(cpu->daif & HV_PSTATE_F))) { m->stats.fr_fail[2]++; return NULL; }
-    if (cpu->timer_due && mach_absolute_time() >= cpu->timer_due) { m->stats.fr_fail[3]++; return NULL; }
+    if ((p->irq_line && !(cpu->daif & HV_PSTATE_I)) || (p->fiq_line && !(cpu->daif & HV_PSTATE_F))) { if (m->stats_interval) m->stats.fr_fail[2]++; return NULL; }
+    if (cpu->timer_due && mach_absolute_time() >= cpu->timer_due) { if (m->stats_interval) m->stats.fr_fail[3]++; return NULL; }
     uint32_t flags = block_flags(cpu);
     int kernel = flags & HV_BLOCK_EL1;
     uint64_t va = cpu->pc;
@@ -257,8 +257,8 @@ static void *fast_resume(HvCpu *cpu) {
     if (!code) code = hv_ijc_resolve(cpu, va, flags); /* made already but not cached: cache it */
     if (code) {
         cpu->exit_reason = HV_EXIT_BRANCH;
-        m->stats.fast_resumes++;
-    } else m->stats.fr_fail[4]++;
+        if (m->stats_interval) m->stats.fast_resumes++;
+    } else if (m->stats_interval) m->stats.fr_fail[4]++;
     return code;
 }
 
@@ -696,7 +696,7 @@ static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
             hv_jit_finish(&m->jit, site, 1);
         }
         m->stats.chained++;
-        m->stats.xchained++;
+        if (m->stats_interval) m->stats.xchained++;
         pthread_mutex_unlock(&m->tr_mu);
         return;
     }
