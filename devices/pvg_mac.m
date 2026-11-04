@@ -57,6 +57,7 @@ static atomic_ulong frames;
 static uint32_t width = 1920, height = 1080;
 static const char *shot_path;
 static double last_shot;
+static double shot_every = 5; /* seconds between named screenshots (HV_SHOT_SECS, for timing a boot) */
 
 /* ---- guest memory for the framework: every RAM region, by physical address ---- */
 
@@ -83,12 +84,12 @@ static void save_png(id<MTLTexture> tex) {
     CGImageRef img = CGBitmapContextCreateImage(ctx);
     /* The latest frame, and one per 5 s named by seconds since start, to see when things happened. */
     static long last_minute = -1;
-    long minute = (long)(([NSDate timeIntervalSinceReferenceDate] - attach_time) / 5);
+    long minute = (long)(([NSDate timeIntervalSinceReferenceDate] - attach_time) / shot_every);
     NSString *latest = [NSString stringWithUTF8String:shot_path];
     NSMutableArray *paths = [NSMutableArray arrayWithObject:latest];
     if (minute != last_minute) {
         last_minute = minute;
-        [paths addObject:[[latest stringByDeletingPathExtension] stringByAppendingFormat:@"-%04lds.png", minute * 5]];
+        [paths addObject:[[latest stringByDeletingPathExtension] stringByAppendingFormat:@"-%04lds.png", (long)(minute * shot_every)]];
     }
     for (NSString *path in paths) {
         CGImageDestinationRef dst =
@@ -218,7 +219,7 @@ static void new_frame(void) {
     atomic_fetch_add(&frames, 1);
     if (window_layer) show_frame();
     double now = [NSDate timeIntervalSinceReferenceDate];
-    if (!shot_path || now - last_shot < 3.0) return;
+    if (!shot_path || now - last_shot < (shot_every < 3.0 ? shot_every : 3.0)) return;
     last_shot = now;
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                                                                   width:width
@@ -280,6 +281,7 @@ static void swap_handlers(const char *name, uint64_t (*rd)(void *, uint64_t, uns
 int hv_pvg_attach(HvVmapple *b, const char *screenshot) {
     board = b;
     shot_path = screenshot;
+    if (getenv("HV_SHOT_SECS")) shot_every = atof(getenv("HV_SHOT_SECS"));
     attach_time = [NSDate timeIntervalSinceReferenceDate];
     @autoreleasepool {
         mtl = MTLCreateSystemDefaultDevice();
