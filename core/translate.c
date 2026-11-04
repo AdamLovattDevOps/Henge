@@ -492,7 +492,10 @@ static void translate_excl(Emit *e, uint32_t insn, uint64_t pc) {
         put(e, STR_X(a, 28, HV_CPU_EXCL_ADDR));
         put(e, 0x52800006u | (1u << size) << 5);                /* movz w6, #bytes */
         put(e, 0xb9000000u | (HV_CPU_EXCL_SIZE / 4) << 10 | 28 << 5 | 6); /* str w6, [x28, #excl_size] */
-        translate_mem(e, size << 30 | 0x39400000u | (uint32_t)rn << 5 | (uint32_t)rt, pc); /* ldr{b,h} rt, [rn] */
+        if ((insn >> 15) & 1) /* LDAXR: keep the acquire (other CPUs' stores must be seen in order) */
+            translate_mem(e, size << 30 | 0x08dffc00u | (uint32_t)rn << 5 | (uint32_t)rt, pc); /* ldar{b,h} rt, [rn] */
+        else
+            translate_mem(e, size << 30 | 0x39400000u | (uint32_t)rn << 5 | (uint32_t)rt, pc); /* ldr{b,h} rt, [rn] */
         put_store_field(e, rt, HV_CPU_EXCL_VAL);
         return;
     }

@@ -19,7 +19,7 @@
 static HvMachine m;
 static HvCpu cpus[HV_MAX_CPUS]; /* the board takes them as an array */
 #define cpu (cpus[0])
-static int ncpus = 1;
+static int ncpus = 3; /* --cpus: 3 boots as fast as 4 on a 2+4-core Mac and leaves room for the window */
 static HvVmapple board;
 static volatile sig_atomic_t interrupted;
 
