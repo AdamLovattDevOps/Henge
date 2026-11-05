@@ -222,6 +222,8 @@ typedef struct HvMachine {
     int chain;               /* block chaining and the indirect-branch cache are enabled */
     uint64_t *slots;         /* chainable exits' targets (0: not chained) */
     uint32_t **slot_site;    /* the B in each exit's stub that chaining rewrites to jump to the target */
+    uint32_t **slot_stub;    /* what that B goes to while it isn't chained */
+    uint32_t **slot_cond;    /* a conditional branch in a block's hot part that chaining may send straight to the target too */
     /* Exits to another page (see put_branch_exit): the host addend the target
        page's TLB entry must hold for the exit to go straight to the chained
        block (0: a same-page exit), and once chained, the target's physical page
@@ -277,6 +279,14 @@ int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,
 HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa);
 /* Drop the translations made from the RAM page holding pa (it was written, or the guest invalidated it). */
 void hv_invalidate_code(HvMachine *m, uint64_t pa);
+void hv_ret_clear(HvCpu *cpu);
+int hv_ic_ivau_drops(void);
+/* Settings that say how to translate or wait, to compare ways of doing it in one running guest
+   ("knob NAME VALUE" in HV_INPUT_FILE; a new way starts from an empty code cache). Each starts
+   from the environment variable named in hv_knob_names. */
+enum { HV_K_NO_RAS, HV_K_SUPERBLOCKS, HV_K_GROUPS, HV_K_WFI_SPIN, HV_K_TEST1, HV_K_TEST2, HV_K_TEST3, HV_K_COUNT };
+extern int hv_knob[HV_K_COUNT];
+int hv_knob_set(HvMachine *m, const char *name, int value);
 /* Debugging (HV_WATCH): which pages keep losing their translations. */
 extern uint32_t *hv_smc_counts;
 extern uint64_t *hv_smc_last;

@@ -383,6 +383,16 @@ void hv_tlbi_apply(HvCpu *cpu, uint32_t op1, uint32_t crn, uint32_t crm, uint32_
     }
 }
 
+/* Translations are never out of date: CPU writes to code pages and device DMA drop them as
+   they happen. So IC IVAU has nothing to do, though xnu issues it for pages nobody wrote, and
+   dropping them there meant translating them all again and every CPU's branch cache starting
+   over. HV_IC_IVAU: as before. */
+int hv_ic_ivau_drops(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("HV_IC_IVAU") != NULL;
+    return v;
+}
+
 int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
     uint32_t op1 = (insn >> 16) & 7, crn = (insn >> 12) & 0xf, crm = (insn >> 8) & 0xf, op2 = (insn >> 5) & 7;
     int rt = insn & 0x1f;
@@ -393,6 +403,7 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
         return hv_vmem_xfer(cpu, xt & ~63ull, (void *)zero, 64, 1, cpu->el, pc);
     }
     if (crn == 7 && op1 == 3 && crm == 5 && op2 == 1) { /* IC IVAU: just the page holding the address */
+        if (!hv_ic_ivau_drops()) return 0;
         HvWalk w;
         hv_mmu_walk(cpu, xt, HV_ACC_READ, cpu->el, &w);
         if (!w.fsc) hv_invalidate_code(cpu->m, w.pa);

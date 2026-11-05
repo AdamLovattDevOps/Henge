@@ -18,6 +18,26 @@ extern void hv_xjump_thunk(void);
 
 static int init_rest(HvMachine *m);
 
+int hv_knob[HV_K_COUNT];
+static const char *const hv_knob_names[HV_K_COUNT] = {"HV_NO_RAS", "HV_SUPERBLOCKS", "HV_GROUPS", "HV_WFI_SPIN", "HV_K1", "HV_K2", "HV_K3"};
+
+static void knobs_init(void) {
+    for (int i = 0; i < HV_K_COUNT; i++)
+        hv_knob[i] = getenv(hv_knob_names[i]) ? atoi(getenv(hv_knob_names[i])) : 0;
+    if (getenv("HV_NO_RAS") && !*getenv("HV_NO_RAS")) hv_knob[HV_K_NO_RAS] = 1;
+}
+
+int hv_knob_set(HvMachine *m, const char *name, int value) {
+    for (int i = 0; i < HV_K_COUNT; i++)
+        if (!strcmp(name, hv_knob_names[i])) {
+            hv_knob[i] = value;
+            __atomic_store_n(&m->flush_pending, 1, __ATOMIC_SEQ_CST);
+            hv_machine_kick_all(m);
+            return 1;
+        }
+    return 0;
+}
+
 int hv_machine_init(HvMachine *m, size_t jit_bytes) {
     memset(m, 0, sizeof *m);
     if (hv_jit_region_open(&m->jit, jit_bytes) != 0) return -1;
@@ -25,6 +45,7 @@ int hv_machine_init(HvMachine *m, size_t jit_bytes) {
 }
 
 int hv_machine_init_jit(HvMachine *m, void *rx, void *rw, size_t jit_bytes) {
+    knobs_init();
     memset(m, 0, sizeof *m);
     if (hv_jit_region_attach(&m->jit, rx, rw, jit_bytes) != 0) return -1;
     return init_rest(m);
@@ -44,10 +65,12 @@ static int init_rest(HvMachine *m) {
     m->chain = 1;
     m->slots = calloc(m->max_slots, sizeof *m->slots);
     m->slot_site = calloc(m->max_slots, sizeof *m->slot_site);
+    m->slot_stub = calloc(m->max_slots, sizeof *m->slot_stub);
+    m->slot_cond = calloc(m->max_slots, sizeof *m->slot_cond);
     m->slot_xa = calloc(m->max_slots, sizeof *m->slot_xa);
     m->slot_xpa = calloc(m->max_slots, sizeof *m->slot_xpa);
     m->xchained = calloc(m->max_slots, sizeof *m->xchained);
-    if (!m->slots || !m->slot_site || !m->slot_xa || !m->slot_xpa || !m->xchained) return -1;
+    if (!m->slots || !m->slot_site || !m->slot_stub || !m->slot_cond || !m->slot_xa || !m->slot_xpa || !m->xchained) return -1;
     pthread_mutex_init(&m->big_mu, NULL);
     pthread_cond_init(&m->big_cv, NULL);
     pthread_mutexattr_t ra;
@@ -197,6 +220,12 @@ void hv_cpu_kick(HvCpu *cpu) {
     __asm__ volatile("sev" ::: "memory");
 }
 
+/* Return tables: nothing to return to. A tag is never 0: salts are not, and no VA has their bits. */
+void hv_ret_clear(HvCpu *cpu) {
+    memset(cpu->ret_tab, 0, sizeof cpu->ret_tab);
+    cpu->ret_salt[0] = cpu->ret_salt[1] = 1ull << 48;
+}
+
 void hv_cpu_wake(HvCpu *cpu) {
     __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_SEQ_CST);
     __asm__ volatile("sev" ::: "memory");
@@ -234,6 +263,8 @@ void hv_machine_free(HvMachine *m) {
     }
     free(m->slots);
     free(m->slot_site);
+    free(m->slot_stub);
+    free(m->slot_cond);
     free(m->slot_xa);
     free(m->slot_xpa);
     free(m->xchained);
@@ -310,7 +341,7 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
         __atomic_store_n(&m->slots[idx], 0, __ATOMIC_RELEASE);
         uint32_t *site = m->slot_site[idx];
         if (site) {
-            uint32_t insn = 0x14000001u; /* b next: the stub */
+            uint32_t insn = 0x14000000u | (uint32_t)((m->slot_stub[idx] - site) & 0x3ffffff); /* back to its stub */
             hv_jit_write(&m->jit, site, &insn, 4);
             hv_jit_finish(&m->jit, site, 1);
         }
@@ -441,6 +472,7 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
     cpu->ijc = (uint64_t)(uintptr_t)p->ijc;
     cpu->lines_ptr = (uint64_t)(uintptr_t)&p->irq_line;
     for (int t = 0; t < HV_IJC_TABLES; t++) cpu->ijc_tab[t] = (uint64_t)(uintptr_t)(p->ijc + (size_t)t * (HV_IJC_TABLE_BYTES / 8));
+    hv_ret_clear(cpu);
     cpu->next_cid = 1;
     cpu->kernel_gen = 1;
     cpu->ijc_salt[1] = 1ull << 48; /* tags of an all-zero table never match */

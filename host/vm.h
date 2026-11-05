@@ -30,6 +30,7 @@ int hv_vm_create(const HvVmConfig *cfg, char *err, size_t errlen);
 HvMachine *hv_vm_machine(void);
 HvVmapple *hv_vm_board(void);
 HvCpu *hv_vm_cpu(int index);
+extern void (*hv_prof_register)(void); /* debugging: each thread that will run guest code calls this */
 /* Frames go to this CAMetalLayer, drawn by the GPU, instead of hv_vm_boot_display. */
 void hv_vm_set_display_layer(void *layer);
 uint64_t hv_vm_gpu_frames(void);

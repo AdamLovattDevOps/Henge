@@ -19,11 +19,21 @@ typedef struct HvTlbEntry {
     int64_t addend;
 } HvTlbEntry;
 
+/* exec_tag is the page's VA and its addend in one word: a block chained across pages checks
+   the mapping is what it was with one comparison. Given the addend it gives the VA back. */
+static inline uint64_t hv_exec_key(uint64_t page_va, int64_t addend) {
+    return page_va ^ ((uint64_t)addend >> 20 | (uint64_t)addend << 44);
+}
+
 #define HV_TLB_PAGE_BITS 14
 #define HV_TLB_ADJ 15
 #define HV_TLB_INVALID 0x8080808080808080ull /* what memset(0x80) leaves */
 #define HV_TLB_BITS 14 /* 16384 entries per EL: 256 MB of 16 KB pages (xnu's working set overflowed 64 MB) */
 #define HV_TLB_SIZE (1u << HV_TLB_BITS)
+#define HV_IJC_TABLES 16
+#define HV_RET_BITS 13 /* entries in a return table */
+#define HV_RET_TAB_BYTES ((1u << HV_RET_BITS) * 16)
+#define HV_CPU_RET_TAB 0x201000 /* just past the TLB */
 
 /* Guest CPU state. While a translated block runs, host x28 points here and the
    guest's x0..x17, x19..x27, x29 and x30 live in the same host registers.
@@ -76,10 +86,18 @@ typedef struct HvCpu {
     uint64_t ijc_tab[16];    /* 0x440: each flags value's branch-cache table (ijc + flags * table size) */
     uint64_t gaddend[4];     /* 0x4c0: host addends of the pages groups of accesses on one base register were checked in (translate_mem) */
     uint64_t xjump_thunk;    /* 0x4e0: hv_xjump_thunk */
-    /* 0x500: [0] EL0 and unprivileged accesses, [1] EL1, [2] EL1 with PSTATE.PAN set,
+    /* 0x500: what tags in the return tables (ret_tab) are xored with, [0] user, [1] kernel.
+       Bits 63..48, as ijc_salt; a new value empties that half of the tables. */
+    uint64_t ret_salt[2] __attribute__((aligned(128)));
+    /* 0x580: [0] EL0 and unprivileged accesses, [1] EL1, [2] EL1 with PSTATE.PAN set,
        so toggling PAN (the kernel does it around every user copy) flushes nothing.
        [slot][EL0, EL1, EL1 with PAN, unused]: a slot's three in one 128-byte cache line. */
     HvTlbEntry tlb[HV_TLB_SIZE][4] __attribute__((aligned(128)));
+    /* Each flags value's return table: {tag, host address} of the code after a call, by the
+       return address's low bits (see put_call). At a multiple of 4 KB from the HvCpu, as the
+       translated code adds it with one ADD. */
+    char ret_pad[HV_CPU_RET_TAB - 0x580 - (HV_TLB_SIZE * 4 * 32)];
+    uint8_t ret_tab[HV_IJC_TABLES][HV_RET_TAB_BYTES];
 
     /* The rest is only touched by C. */
     struct HvMachine *m;
@@ -176,14 +194,14 @@ typedef struct HvCpu {
 #define HV_CPU_SPSEL       0x3fc
 #define HV_CPU_SP_EL1      0x398
 #define HV_CPU_IJC_TAB     0x440
-#define HV_CPU_TLB         0x500
+#define HV_CPU_TLB         0x580
+#define HV_CPU_RET_SALT    0x500
 #define HV_CPU_GADDEND     0x4c0
 #define HV_CPU_XJUMP_THUNK 0x4e0
 
 /* Indirect-branch cache: one table per block-flags value, 64K entries of 16 bytes,
    indexed by ((va ^ va >> 16) >> 2) so code at the same offset in different pages spreads out. */
 #define HV_IJC_BITS 18
-#define HV_IJC_TABLES 16
 #define HV_UCODE_BITS 18
 #define HV_IJC_TABLE_BYTES ((1u << HV_IJC_BITS) * 16)
 #define HV_CPU_TLB_EL      32 /* between a slot's tables */
@@ -200,6 +218,8 @@ _Static_assert(offsetof(HvCpu, fpsr) == HV_CPU_FPSR, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, helper_routine) == HV_CPU_HELPER, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, helper_ret) == HV_CPU_HELPER_RET, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, tlb) == HV_CPU_TLB, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, ret_salt) == HV_CPU_RET_SALT, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, ret_tab) == HV_CPU_RET_TAB, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, gaddend) == HV_CPU_GADDEND, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, xjump_thunk) == HV_CPU_XJUMP_THUNK, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, tpidr_el0) == HV_CPU_TPIDR_EL0, "HvCpu layout");

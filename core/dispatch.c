@@ -22,6 +22,7 @@ void hv_flush_blocks(HvMachine *m) {
         if (m->cpus[i]) {
             hv_ijc_reset(m->cpus[i], 0);
             hv_ijc_reset(m->cpus[i], 1);
+            hv_ret_clear(m->cpus[i]); /* they point at code that is going */
             memset(m->percpu[i].jc, 0, sizeof m->percpu[i].jc);
         }
     memset(m->hash, 0, sizeof m->hash);
@@ -439,6 +440,28 @@ static int wait_for_interrupt(HvCpu *cpu) {
     /* Sleep until the next timer event or until a device thread has work for us. */
     hv_big_unlock(m); /* let the other CPUs run while this one sleeps */
     park(cpu);
+    /* A thread on another CPU often has something for this one microseconds later
+       (a pipe, a Mach message: macOS is made of these), and waking a sleeping host
+       thread takes far longer than that: watch for it a little first. HV_WFI_SPIN: microseconds. */
+    int spin_us = hv_knob[HV_K_WFI_SPIN];
+    if (spin_us) {
+        static int sleep_ok = -1; /* does the host's WFE come back soon by itself? (see wfe()) */
+        if (sleep_ok < 0) {
+            __asm__ volatile("sevl; wfe" ::: "memory");
+            uint64_t t = mach_absolute_time();
+            __asm__ volatile("wfe" ::: "memory");
+            sleep_ok = mach_absolute_time() - t < 24 * 20;
+        }
+        uint64_t until = mach_absolute_time() + (uint64_t)spin_us * 24;
+        for (;;) {
+            uint32_t v;
+            __asm__ volatile("ldaxr %w0, [%1]" : "=r"(v) : "r"(&p->wake_pending) : "memory"); /* a store to it wakes the WFE */
+            if (v || mach_absolute_time() >= until) break;
+            if (sleep_ok) __asm__ volatile("wfe" ::: "memory");
+            else __asm__ volatile("yield" ::: "memory");
+        }
+        __asm__ volatile("clrex" ::: "memory");
+    }
     pthread_mutex_lock(&p->wake_mu);
     if (!p->wake_pending) {
         struct timespec ts = {(time_t)(wait_ticks / 24000000), (long)(wait_ticks % 24000000) * 1000 / 24};
@@ -735,6 +758,14 @@ static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
         uint32_t insn = 0x14000000u | (uint32_t)(off & 0x3ffffff);
         hv_jit_write(&m->jit, site, &insn, 4);
         hv_jit_finish(&m->jit, site, 1);
+    }
+    uint32_t *cond = m->slot_cond[idx];
+    if (cond) { /* the conditional branch to that stub, too */
+        uint32_t insn = *cond;
+        if (hv_branch_retarget(&insn, b->code - cond)) {
+            hv_jit_write(&m->jit, cond, &insn, 4);
+            hv_jit_finish(&m->jit, cond, 1);
+        }
     }
     m->stats.chained++;
 }

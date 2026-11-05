@@ -10,6 +10,8 @@
 #include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
+#include <dlfcn.h>
 #include <CommonCrypto/CommonDigest.h>
 
 #include "dispatch.h"
@@ -64,6 +66,151 @@ static void *profile_thread(void *unused) {
         if (cpu_port) sample_cpu();
     }
     return NULL;
+}
+
+/* Debugging: HV_PROF_ALL=1 samples every guest CPU's thread 1000 times a second; "prof NAME" in
+   the input file writes what it saw since the last time to NAME: where the host was, and
+   which guest code. Guest addresses are symbolized afterwards (scratch/prof.py). */
+#define PROF_SLOTS (1u << 18)
+typedef struct { uint64_t va; uint32_t n, el; } ProfBlock;
+static ProfBlock prof_blocks[PROF_SLOTS];
+static struct { void *start; const char *name; uint32_t n; } prof_fn[512];
+static int prof_nfn;
+static uint64_t prof_total, prof_idle, prof_el[2], prof_unknown, prof_spin;
+/* Per host instruction too, to see where translated code stalls. */
+#define PROF_PCS (1u << 20)
+typedef struct { uint32_t *pc; uint32_t n; } ProfPc;
+static ProfPc *prof_pcs;
+static pthread_mutex_t prof_mu = PTHREAD_MUTEX_INITIALIZER;
+static void prof_sample(thread_act_t th) {
+    arm_thread_state64_t st;
+    mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
+    thread_basic_info_data_t ti;
+    mach_msg_type_number_t ni = THREAD_BASIC_INFO_COUNT;
+    if (thread_info(th, THREAD_BASIC_INFO, (thread_info_t)&ti, &ni) != KERN_SUCCESS) return;
+    if (ti.run_state != TH_STATE_RUNNING) { /* asleep (WFI) or waiting for a lock */
+        pthread_mutex_lock(&prof_mu);
+        prof_total++, prof_idle++;
+        pthread_mutex_unlock(&prof_mu);
+        return;
+    }
+    if (thread_suspend(th) != KERN_SUCCESS) return;
+    kern_return_t kr = thread_get_state(th, ARM_THREAD_STATE64, (thread_state_t)&st, &n);
+    thread_resume(th);
+    if (kr != KERN_SUCCESS) return;
+    uint32_t *pc = (uint32_t *)(uintptr_t)arm_thread_state64_get_pc(st);
+    HvMachine *hm = hv_vm_machine();
+    pthread_mutex_lock(&prof_mu);
+    prof_total++;
+    if (pc >= hm->jit.base && pc < hm->jit.base + hm->jit.capacity && hm->nblocks) {
+        int lo = 0, hi = hm->nblocks - 1;
+        while (lo < hi) {
+            int mid = (lo + hi + 1) / 2;
+            if (hm->blocks[mid].code && hm->blocks[mid].code <= pc) lo = mid;
+            else hi = mid - 1;
+        }
+        HvBlock *b = &hm->blocks[lo];
+        int el = (b->flags & HV_BLOCK_EL1) ? 1 : 0;
+        prof_el[el]++;
+        if (prof_pcs) {
+            uint32_t h = (uint32_t)(((uint64_t)(uintptr_t)pc >> 2) * 0x9e3779b1u) & (PROF_PCS - 1);
+            for (int k = 0; k < 16; k++, h = (h + 1) & (PROF_PCS - 1))
+                if (!prof_pcs[h].n || prof_pcs[h].pc == pc) {
+                    prof_pcs[h].pc = pc, prof_pcs[h].n++;
+                    break;
+                }
+        }
+        uint32_t h = (uint32_t)((b->va >> 2) * 0x9e3779b1u) & (PROF_SLOTS - 1);
+        for (int p = 0; p < 32; p++, h = (h + 1) & (PROF_SLOTS - 1)) {
+            if (!prof_blocks[h].n || prof_blocks[h].va == b->va) {
+                prof_blocks[h].va = b->va, prof_blocks[h].el = el, prof_blocks[h].n++;
+                break;
+            }
+        }
+    } else {
+        Dl_info di;
+        void *start = dladdr(pc, &di) ? di.dli_saddr : NULL;
+        if (!start) prof_unknown++;
+        else {
+            int k = 0;
+            while (k < prof_nfn && prof_fn[k].start != start) k++;
+            if (k == prof_nfn && prof_nfn < 512) prof_fn[prof_nfn].start = start, prof_fn[prof_nfn].name = di.dli_sname ? di.dli_sname : "?", prof_nfn++;
+            if (k < prof_nfn) prof_fn[k].n++;
+        }
+    }
+    pthread_mutex_unlock(&prof_mu);
+}
+
+static thread_act_t prof_threads[HV_MAX_CPUS];
+static _Atomic int prof_nthreads;
+void hv_prof_register_thread(void) {
+    if (getenv("HV_PROF_ALL")) prof_threads[atomic_fetch_add(&prof_nthreads, 1)] = mach_thread_self();
+}
+
+static void *prof_thread(void *unused) {
+    (void)unused;
+    for (;;) {
+        usleep(1000);
+        for (int i = 0; i < atomic_load(&prof_nthreads); i++) prof_sample(prof_threads[i]);
+    }
+    return NULL;
+}
+
+static int prof_cmp_fn(const void *a, const void *b) {
+    return (int)((const __typeof__(prof_fn[0]) *)b)->n - (int)((const __typeof__(prof_fn[0]) *)a)->n;
+}
+static int prof_cmp_pc(const void *a, const void *b) {
+    const ProfPc *x = a, *y = b;
+    return x->pc < y->pc ? -1 : x->pc > y->pc;
+}
+static int prof_cmp_block(const void *a, const void *b) {
+    return (int)((const ProfBlock *)b)->n - (int)((const ProfBlock *)a)->n;
+}
+
+static void prof_dump(const char *path) {
+    pthread_mutex_lock(&prof_mu);
+    FILE *f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "total %llu idle %llu el0 %llu el1 %llu unknown %llu\n", (unsigned long long)prof_total, (unsigned long long)prof_idle, (unsigned long long)prof_el[0], (unsigned long long)prof_el[1], (unsigned long long)prof_unknown);
+        { /* the kernel's slide, from where its SHA-256 routine is */
+            static const uint8_t sig[] = {0x5f, 0x24, 0x03, 0xd5, 0x03, 0x00, 0x00, 0x90, 0x41, 0x00, 0x00, 0xb5, 0xc0, 0x03, 0x5f, 0xd6, 0x63, 0x00, 0x36, 0x91, 0xe4, 0x43, 0x04, 0xd1, 0xff, 0x43, 0x04, 0xd1, 0x80, 0x28, 0x9f, 0x4c};
+            HvVmapple *bd = hv_vm_board();
+            HvCpu *c0 = hv_vm_cpu(0);
+            HvWalk wv;
+            hv_mmu_walk(c0, c0->vbar_el1, HV_ACC_READ, 1, &wv);
+            uint8_t *at = memmem(bd->ram, bd->ram_size, sig, sizeof sig);
+            if (at && !wv.fsc) fprintf(f, "kslide %llx\n", (unsigned long long)(c0->vbar_el1 + (0x70000000ull + (uint64_t)(at - bd->ram) - wv.pa) - 0xfffffe002b76de80ull));
+        }
+        qsort(prof_fn, (size_t)prof_nfn, sizeof prof_fn[0], prof_cmp_fn);
+        for (int i = 0; i < prof_nfn && prof_fn[i].n; i++) fprintf(f, "fn %u %s\n", prof_fn[i].n, prof_fn[i].name);
+        static ProfBlock sorted[PROF_SLOTS];
+        memcpy(sorted, prof_blocks, sizeof sorted);
+        qsort(sorted, PROF_SLOTS, sizeof sorted[0], prof_cmp_block);
+        for (uint32_t i = 0; i < 20000 && sorted[i].n; i++) fprintf(f, "b %u %llx %u\n", sorted[i].n, (unsigned long long)sorted[i].va, sorted[i].el);
+        if (prof_pcs) { /* each hot run of host code as it stands, with its samples */
+            qsort(prof_pcs, PROF_PCS, sizeof prof_pcs[0], prof_cmp_pc);
+            HvMachine *pm = hv_vm_machine();
+            for (uint32_t i = 0; i < PROF_PCS; i++) {
+                if (!prof_pcs[i].n || (prof_pcs[i].n < 8 && !(getenv("HV_PROF_PCS") && atoi(getenv("HV_PROF_PCS")) > 1))) continue;
+                fprintf(f, "p %u %llx %08x\n", prof_pcs[i].n, (unsigned long long)(uintptr_t)prof_pcs[i].pc, *prof_pcs[i].pc);
+            }
+            (void)pm;
+            /* a window of code around the hottest instructions */
+            for (uint32_t i = 0; i < PROF_PCS; i++) {
+                if (prof_pcs[i].n < 40) continue;
+                uint32_t *c = prof_pcs[i].pc;
+                fprintf(f, "w %llx", (unsigned long long)(uintptr_t)(c - 24));
+                for (int k = -24; k < 8; k++) fprintf(f, " %08x", c[k]);
+                fprintf(f, "\n");
+            }
+            memset(prof_pcs, 0, PROF_PCS * sizeof prof_pcs[0]);
+        }
+        fclose(f);
+    }
+    memset(prof_blocks, 0, sizeof prof_blocks);
+    for (int i = 0; i < prof_nfn; i++) prof_fn[i].n = 0;
+    prof_total = prof_idle = prof_el[0] = prof_el[1] = prof_unknown = prof_spin = 0;
+    pthread_mutex_unlock(&prof_mu);
 }
 
 /* Walks the pointer to a spot on the screen, watching where the display says
@@ -380,6 +527,21 @@ static void *input_thread(void *unused) {
         }
         else if (sscanf(line, "wait %d", &x) == 1) sleep((unsigned)x);
         else if (!strncmp(line, "type ", 5)) type_text(line + 5);
+        else if (!strncmp(line, "prof ", 5)) prof_dump(line + 5);
+        else if (!strncmp(line, "knob ", 5)) {
+            char name[32];
+            if (sscanf(line, "knob %31s %d", name, &x) == 2 && !hv_knob_set(hv_vm_machine(), name, x))
+                fprintf(stderr, "hengevm: no knob %s\n", name);
+        }
+        else if (!strncmp(line, "kdump ", 6)) { /* the guest kernel's image, from where its first byte is mapped now */
+            static const uint8_t sig[] = {0x5f, 0x24, 0x03, 0xd5, 0x03, 0x00, 0x00, 0x90, 0x41, 0x00, 0x00, 0xb5, 0xc0, 0x03, 0x5f, 0xd6, 0x63, 0x00, 0x36, 0x91, 0xe4, 0x43, 0x04, 0xd1, 0xff, 0x43, 0x04, 0xd1, 0x80, 0x28, 0x9f, 0x4c};
+            HvVmapple *bd = hv_vm_board();
+            uint8_t *at = memmem(bd->ram, bd->ram_size, sig, sizeof sig);
+            FILE *kf = fopen(line + 6, "wb");
+            if (at && kf) fwrite(at - (0xfffffe002b76de80ull - 0xfffffe0028604000ull), 1, 0x4800000, kf);
+            if (kf) fclose(kf);
+            fprintf(stderr, "hengevm: kernel image written\n");
+        }
         else if (!strncmp(line, "hooksha ", 8)) {
             if (hv_vm_machine()->stop_hook) continue;
             FILE *pf = fopen(line + 8, "rb");
@@ -745,6 +907,7 @@ int main(int argc, char **argv) {
                      .ram_mb = ram_mb, .ncpus = ncpus, .log = log, .no_net = getenv("HV_NO_NET") != NULL,
                      .installer = install_ipsw != NULL};
     if (getenv("HV_JIT_MB")) vc.jit_bytes = (size_t)atoi(getenv("HV_JIT_MB")) << 20; /* debugging: a small region flushes often */
+    hv_prof_register = hv_prof_register_thread;
     char err[256];
     if (hv_vm_create(&vc, err, sizeof err) != 0) {
         fprintf(stderr, "hengevm: %s\n", err);
@@ -790,6 +953,11 @@ int main(int argc, char **argv) {
     if (getenv("HV_CLICKS")) {
         pthread_t cl;
         pthread_create(&cl, NULL, click_thread, NULL);
+    }
+    if (getenv("HV_PROF_PCS")) prof_pcs = calloc(PROF_PCS, sizeof *prof_pcs);
+    if (getenv("HV_PROF_ALL")) {
+        pthread_t pr;
+        pthread_create(&pr, NULL, prof_thread, NULL);
     }
     if (getenv("HV_INPUT_FILE")) {
         pthread_t in;

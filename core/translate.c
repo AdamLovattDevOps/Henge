@@ -8,19 +8,29 @@
 #include "mmu.h"
 #include "operands.h"
 
-/* A block is laid out as: entry `ldr x0, [x28]`, the translated instructions,
-   out-of-line code (taken-branch exits and memory slow paths), then the literal
-   pool. Code is built in a static buffer and copied into the JIT region once. */
+/* A block has two parts. The hot part is the code that runs every time: the translated
+   instructions. The cold part is what hardly ever does: exits not chained yet, memory slow
+   paths, branch-cache misses, and the literal pool. In a region of 1 MB (the reach of the
+   short branches between them) hot parts grow from the bottom and cold parts from the top,
+   so code that runs sits together. What runs is a small part of what a translation holds,
+   and macOS runs so much code, so thinly, that how much fits in the CPU's caches and branch
+   tables is a large part of how fast it goes. HV_K2=1: one part, in the order written.
+
+   Each part is built in a static buffer and copied into the JIT region once. Branches between
+   them are put right when it is known where they went (rel, hv_translate_place). */
 
 #define MAX_WORDS 16384
 #define MAX_LITS 2048
 #define MAX_OOL 1024
 #define WORDS_PER_INSN_MAX 96 /* stop the block before the buffer could overflow */
+#define MAX_RELS 8192
+#define JIT_CHUNK_WORDS (256u * 1024) /* 1 MB: CBZ, B.cond and LDR (literal) reach both ways from anywhere in it */
 
 enum { FIX_LDR, FIX_ADR };
 
 typedef struct {
     uint32_t at, kind, idx;
+    uint8_t cold; /* the instruction is in the cold part */
 } LitFix;
 
 enum { OOL_EXIT, OOL_SLOW, OOL_SYS, OOL_MRS, OOL_GROUP };
@@ -61,17 +71,25 @@ typedef struct {
 } Group;
 
 typedef struct {
-    uint32_t w[MAX_WORDS];
-    uint32_t n;
+    uint32_t hot[MAX_WORDS], cold[MAX_WORDS];
+    uint32_t *w;        /* the part being written */
+    uint32_t n;         /* its words so far */
+    uint32_t other_n;   /* the other part's */
+    int in_cold;        /* writing what belongs in the cold part */
+    int flat;           /* HV_K2: all in one, in the order written */
+    struct { uint32_t at, target; uint8_t from_cold; } rel[MAX_RELS]; /* a branch in one part to a word in the other */
+    uint32_t nrel;
+    uint32_t nhot, ncold; /* the finished block's parts in words, ncold with the pool */
     uint64_t pool[MAX_LITS];
     uint32_t npool;
     LitFix fix[MAX_LITS];
     uint32_t nfix;
     Ool ool[MAX_OOL];
     uint32_t nool;
-    struct { uint32_t slot, at, flags; uint64_t target; } site[MAX_OOL]; /* chainable exits: their slot, the B chaining patches, where to */
+    struct { uint32_t slot, at, flags, stub, cond_at; uint64_t target; uint8_t cold, stub_cold, has_cond; } site[MAX_OOL]; /* chainable exits: their slot, the B chaining patches, its stub, where to; the hot part's conditional branch to it if chaining may patch that too */
+    int site_direct;    /* the exit just written needs nothing done before its B: no check, no restores */
     uint32_t nsite;
-    uint32_t pool_at, total; /* the finished block: code words, then the literal pool */
+    uint32_t pool_at;    /* where the literal pool is, in the cold part */
     uint32_t flags;
     int slow_mem;
     uint64_t page;       /* guest VA of the 16 KB page the block is in */
@@ -124,10 +142,47 @@ static void put(Emit *e, uint32_t w) {
     e->n++;
 }
 
+/* Write the cold part for a while. */
+static void cold_on(Emit *e) {
+    e->in_cold = 1;
+    if (e->flat) return;
+    uint32_t n = e->n;
+    e->n = e->other_n, e->other_n = n;
+    e->w = e->cold;
+}
+
+static void cold_off(Emit *e) {
+    e->in_cold = 0;
+    if (e->flat) return;
+    uint32_t n = e->n;
+    e->n = e->other_n, e->other_n = n;
+    e->w = e->hot;
+}
+
+/* The branch at `at` in one part goes to `target` in that part or the other. */
+static void plink(Emit *e, uint32_t at, int from_cold, uint32_t target, int to_cold) {
+    if (e->flat || from_cold == to_cold) {
+        uint32_t *w = e->flat || !from_cold ? e->hot : e->cold;
+        patch_branch(&w[at], (int64_t)target - at);
+        return;
+    }
+    if (e->nrel < MAX_RELS) {
+        e->rel[e->nrel].at = at, e->rel[e->nrel].target = target, e->rel[e->nrel].from_cold = (uint8_t)from_cold;
+        e->nrel++;
+    } else {
+        e->overflow = 1;
+    }
+}
+
+/* To the next word to be written. */
+static void link_here(Emit *e, uint32_t at, int from_cold) {
+    plink(e, at, from_cold, e->n, e->in_cold);
+}
+
 /* ldr xR, =value */
 static void put_lit(Emit *e, int reg, uint64_t value) {
     e->pool[e->npool] = value;
-    e->fix[e->nfix++] = (LitFix){e->n, FIX_LDR, e->npool++};
+    e->fix[e->nfix++] = (LitFix){e->n, FIX_LDR, e->npool++, (uint8_t)(e->in_cold && !e->flat)};
     put(e, 0x58000000u | reg);
 }
 
@@ -158,6 +213,7 @@ static void put_ijc_jump(Emit *e, int check) {
         put(e, BR_X(1));
         return;
     }
+    int p0 = e->in_cold;
     uint32_t to_exit = 0;
     if (check) {
         put(e, 0xb9400000u | (HV_CPU_EXIT_REQ / 4) << 10 | 28 << 5 | 6); /* ldr w6, [x28, #exit_req] */
@@ -180,7 +236,8 @@ static void put_ijc_jump(Emit *e, int check) {
     put(e, CBNZ_X(7));
     put(e, LDR_X(6, 6, 8));
     put(e, BR_X(6));                                        /* hit: x0, x1 are the guest's */
-    patch_branch(&e->w[to_way1], (int64_t)e->n - to_way1);
+    if (!p0) cold_on(e);
+    link_here(e, to_way1, p0);
     put(e, LDR_X(7, 6, 16));                                /* way 1's */
     put(e, 0xca000000u | 15 << 16 | 7 << 5 | 7);
     uint32_t to_miss = e->n;
@@ -199,7 +256,7 @@ static void put_ijc_jump(Emit *e, int check) {
     if (check) {
         uint32_t to_common = e->n;
         put(e, B_OP);
-        patch_branch(&e->w[to_exit], (int64_t)e->n - to_exit);  /* exit_req: x15 is the VA */
+        link_here(e, to_exit, p0);                          /* exit_req: x15 is the VA */
         put(e, STP_X(0, 1, 28, 0));
         put(e, MOV_X(0, 15));
         patch_branch(&e->w[to_common], (int64_t)e->n - to_common);
@@ -209,6 +266,7 @@ static void put_ijc_jump(Emit *e, int check) {
     put(e, STR_X(1, 28, HV_CPU_MISS_SITE));
     put(e, LDR_X(1, 28, HV_CPU_EXIT));
     put(e, BR_X(1));
+    if (!p0) cold_off(e);
 }
 
 /* A direct branch to another page through hv_xjump_thunk (the cache lookup in
@@ -273,7 +331,7 @@ static uint64_t cross_addend(Emit *e, uint64_t target) {
     int table = !(e->flags & HV_BLOCK_EL1) ? 0 : (e->flags & HV_BLOCK_PAN) ? 2 : 1;
     const HvTlbEntry *te = &cpu->tlb[(target >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1)][table];
     uint64_t tpage = target & ~((1ull << HV_TLB_PAGE_BITS) - 1);
-    if (te->exec_tag == tpage) return (uint64_t)te->addend;
+    if (te->exec_tag == hv_exec_key(tpage, te->addend)) return (uint64_t)te->addend;
     HvWalk w;
     hv_mmu_walk(cpu, target, HV_ACC_EXEC, (e->flags & HV_BLOCK_EL1) ? 1 : 0, &w);
     if (w.fsc || w.block_size < (1ull << HV_TLB_PAGE_BITS)) return 0;
@@ -291,6 +349,8 @@ static int use_xjump(void) {
 
 static void put_branch_exit(Emit *e, uint64_t target, int plain) {
     int check = !(plain && target > e->cur_pc && !check_exits_always());
+    int p0 = e->in_cold;
+    e->site_direct = 0;
     uint32_t slot_index = ~0u;
     int same_page = (target & ~((1ull << HV_TLB_PAGE_BITS) - 1)) == e->page;
     uint64_t xa = same_page ? 0 : cross_addend(e, target);
@@ -310,6 +370,7 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
     uint64_t *slot = &e->m->slots[slot_index];
     *slot = 0;
     e->m->slot_site[slot_index] = NULL; /* until placed: what it held is a dropped block's */
+    e->m->slot_cond[slot_index] = NULL;
     e->m->slot_xa[slot_index] = xa;
     e->m->slot_xpa[slot_index] = 0;
     uint32_t to_exit = ~0u;
@@ -320,31 +381,35 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
     }
     uint32_t to_miss = ~0u;
     if (xa) {
-        /* The target page's fetch tag and addend, against what they were. */
+        /* The target page's fetch tag: its VA and addend, against what they were. */
         int table = !(e->flags & HV_BLOCK_EL1) ? 0 : (e->flags & HV_BLOCK_PAN) ? 2 : 1;
         uint32_t off = HV_CPU_TLB + (((uint32_t)(target >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1)) << 7) + table * HV_CPU_TLB_EL + 16;
-        put(e, 0x91400000u | (off >> 12) << 10 | 28 << 5 | 6);  /* add x6, x28, #off & ~0xfff */
-        put(e, LDR_X(7, 6, off & 0xfff));                       /* exec tag */
-        put(e, LDR_X(6, 6, (off & 0xfff) + 8));                 /* addend */
-        put_lit(e, 15, target & ~((1ull << HV_TLB_PAGE_BITS) - 1));
+        put(e, 0x91400000u | (off >> 12) << 10 | 28 << 5 | 7);  /* add x7, x28, #off & ~0xfff */
+        put(e, LDR_X(7, 7, off & 0xfff));
+        put_lit(e, 15, hv_exec_key(target & ~((1ull << HV_TLB_PAGE_BITS) - 1), (int64_t)xa));
         put(e, 0xca000000u | 15 << 16 | 7 << 5 | 7);            /* eor x7, x7, x15 */
-        put_lit(e, 15, xa);
-        put(e, 0xca000000u | 15 << 16 | 6 << 5 | 6);            /* eor x6, x6, x15 */
-        put(e, 0xaa000000u | 6 << 16 | 7 << 5 | 7);             /* orr x7, x7, x6 */
         to_miss = e->n;
         put(e, CBNZ_X(7));                                      /* not mapped so now: the branch cache */
     }
     /* Chaining rewrites this B to go straight to the target block (one aligned
        B may be rewritten while other CPUs run it); until then, or when the
-       target is out of B's range, it falls through to hv_chain_thunk. */
+       target is out of B's range, it goes to the stub, into hv_chain_thunk. */
+    uint32_t site_at = e->n;
+    put(e, B_OP | 1);
+    if (!p0) cold_on(e);
+    link_here(e, site_at, p0);
     if (e->nsite < MAX_OOL) {
         e->site[e->nsite].slot = slot_index;
         e->site[e->nsite].flags = e->flags;
         e->site[e->nsite].target = target;
-        e->site[e->nsite++].at = e->n;
+        e->site[e->nsite].at = site_at;
+        e->site[e->nsite].cold = (uint8_t)(p0 && !e->flat);
+        e->site[e->nsite].stub = e->n;
+        e->site[e->nsite].has_cond = 0;
+        e->site[e->nsite++].stub_cold = (uint8_t)(e->in_cold && !e->flat);
+        e->site_direct = !check && !xa;
     }
-    put(e, B_OP | 1);                                                 /* b next */
-    if (check) patch_branch(&e->w[to_exit], (int64_t)e->n - to_exit);
+    if (check) link_here(e, to_exit, p0);
     put(e, STR_X(30, 28, HV_CPU_X(30)));
     put(e, LDR_X(15, 28, HV_CPU_CHAIN_THUNK));
     if ((e->n & 1) == 0) put(e, 0xd503201f);                         /* nop: the data starts 8-byte aligned */
@@ -354,13 +419,14 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
     put(e, (uint32_t)target);
     put(e, (uint32_t)(target >> 32));
     if (xa) {
-        patch_branch(&e->w[to_miss], (int64_t)e->n - to_miss);
+        link_here(e, to_miss, p0);
         if (use_xjump()) put_xjump(e, target, 0); /* exit_req was checked above if it had to be */
         else {
             put_lit(e, 15, target);
             put_ijc_jump(e, 0);
         }
     }
+    if (!p0) cold_off(e);
 }
 
 /* Call hv_helper(cpu, info) and continue unless it leaves. */
@@ -506,7 +572,15 @@ static void translate_copy(Emit *e, uint32_t insn) {
         }
     }
     spill(e, regs, n);
-    for (int k = 0; k < n; k++) put(e, LDR_X(scratch_of[k], 28, slot_of(guest_of[k])));
+    /* All copied forms only write Rd but for MOVK and BFM (BFI, BFXIL), so what is in Rd alone
+       needs no loading first. */
+    int rd_read = (insn & 0x7f800000) == 0x72800000 || (insn & 0x7f800000) == 0x33000000 || hv_knob[HV_K_TEST3];
+    for (int k = 0; k < n; k++) {
+        int read = 0;
+        for (int f = 0; f < 4; f++)
+            if (stolen[f] == guest_of[k] && (f || rd_read)) read = 1;
+        if (read) put(e, LDR_X(scratch_of[k], 28, slot_of(guest_of[k])));
+    }
     uint32_t out = insn;
     for (int f = 0; f < 4; f++) {
         if (stolen[f] < 0) continue;
@@ -588,9 +662,7 @@ static void translate_pac(Emit *e, uint32_t insn) {
 /* HV_SUPERBLOCKS=1: a conditional branch does not end its block; the block goes
    on with the instruction after it (the taken side leaves out of line). */
 static int superblocks(void) {
-    static int v = -1;
-    if (v < 0) v = getenv("HV_SUPERBLOCKS") && atoi(getenv("HV_SUPERBLOCKS"));
-    return v;
+    return hv_knob[HV_K_SUPERBLOCKS];
 }
 
 /* The block may go on past a conditional branch at pc: the next instruction is
@@ -599,11 +671,75 @@ static int go_on(Emit *e, uint64_t pc) {
     return ((pc + 4) & ~((1ull << HV_TLB_PAGE_BITS) - 1)) == e->page && e->cur_i + 1 < 48;
 }
 
+/* Calls and returns the way the host's CPU can predict them. It keeps a stack of return
+   addresses of its own, filled by its BL and used by its RET, and those are right nearly
+   always, even in code run for the first time. A return reached through a register-indirect
+   branch gets none of that, and a mispredicted branch costs some twenty instructions' time.
+   So a guest call is a host BL, whose return address (H: the code for what follows the call)
+   goes in a table by the guest's return address; a guest return that finds its own address
+   there is a host RET to H. Otherwise the indirect-branch cache, as ever.
+
+   A table and not a stack, so calls and returns don't wait for each other: a stack's top has
+   to go through memory from each to the next. One table per block-flags value, so what H
+   assumes about the CPU's state still holds; tags are VA ^ ret_salt, which changes whenever
+   what is in the table may have gone out of date (see ret_new in mmu.c). Host x6, x7 and x15
+   are free at a call and a return, and x30 is about to be set.
+
+       bl   L
+    H: (exit to the block after the call)
+    L: add  x7, x28, #entry, lsl #12
+       str  x30, [x7, #entry & 0xfff + 8]
+       ldr  x30, =return address
+       ldr  x6, [x28, #salt]
+       eor  x6, x6, x30
+       str  x6, [x7, #entry & 0xfff]                                    */
+static int use_ras(const Emit *e) {
+    return !hv_knob[HV_K_NO_RAS] && !e->no_ijc; /* HV_NO_RAS: every return through the indirect-branch cache */
+}
+
+static void put_call(Emit *e, uint64_t ret) {
+    uint32_t off = HV_CPU_RET_TAB + (e->flags & (HV_IJC_TABLES - 1)) * HV_RET_TAB_BYTES + (((uint32_t)ret >> 2) & ((1u << HV_RET_BITS) - 1)) * 16;
+    uint32_t to_l = e->n;
+    put(e, 0x94000000u); /* bl L */
+    put_branch_exit(e, ret, 1);
+    patch_branch(&e->w[to_l], (int64_t)e->n - to_l);
+    put(e, 0x91400000u | (off >> 12) << 10 | 28 << 5 | 7);                /* add x7, x28, #off, lsl #12 */
+    put(e, STR_X(30, 7, (off & 0xfff) + 8));
+    put_lit(e, 30, ret);
+    put(e, LDR_X(6, 28, HV_CPU_RET_SALT + 8 * (e->flags & HV_BLOCK_EL1)));
+    put(e, 0xca000000u | 30 << 16 | 6 << 5 | 6);                          /* eor x6, x6, x30 */
+    put(e, STR_X(6, 7, off & 0xfff));
+}
+
+/* The other half: a return. A miss goes through the indirect-branch cache. */
+static void put_return(Emit *e) {
+    uint32_t tab = HV_CPU_RET_TAB + (e->flags & (HV_IJC_TABLES - 1)) * HV_RET_TAB_BYTES;
+    put(e, UBFM_X(7, 30, 2, 2 + HV_RET_BITS - 1));                        /* ubfx x7, x30, #2, #bits */
+    put(e, ADD_LSL(7, 28, 7, 4));
+    put(e, 0x91400000u | (tab >> 12) << 10 | 7 << 5 | 7);                 /* add x7, x7, #tab, lsl #12 */
+    put(e, 0xa9400000u | 6 << 10 | 7 << 5 | 15);                          /* ldp x15, x6, [x7] */
+    put(e, LDR_X(7, 28, HV_CPU_RET_SALT + 8 * (e->flags & HV_BLOCK_EL1)));
+    put(e, 0xca000000u | 30 << 16 | 7 << 5 | 7);                          /* eor x7, x7, x30 */
+    put(e, 0xca000000u | 7 << 16 | 15 << 5 | 15);                         /* eor x15, x15, x7 */
+    uint32_t to_miss = e->n;
+    put(e, CBNZ_X(15));
+    put(e, 0xd65f0000u | 6 << 5);                                         /* ret x6 */
+    int p0 = e->in_cold;
+    if (!p0) cold_on(e);
+    link_here(e, to_miss, p0);
+    put(e, MOV_X(15, 30));
+    put_ijc_jump(e, 1);
+    if (!p0) cold_off(e);
+}
+
 /* Ends the block (returns 1), or 0 for a conditional branch the block goes on past. */
 static int translate_branch(Emit *e, uint32_t insn, uint64_t pc) {
     if ((insn & 0x7c000000) == 0x14000000) { /* B, BL */
         uint64_t target = pc + (sext(insn & 0x3ffffff, 26) << 2);
-        if (insn >> 31) put_const_to(e, 30, pc + 4);
+        if (insn >> 31) {
+            if (use_ras(e)) put_call(e, pc + 4);
+            else put_const_to(e, 30, pc + 4);
+        }
         put_branch_exit(e, target, 1);
         return 1;
     }
@@ -652,9 +788,16 @@ static void translate_branch_reg(Emit *e, uint32_t insn, uint64_t pc) {
     uint32_t opc = (insn >> 21) & 3;
     int rn = (insn >> 5) & 0x1f;
     if (opc == 2 && ((insn >> 11) & 0x1f) == 1) rn = 30; /* RETAA, RETAB: the Rn field is all ones, the target is x30 */
+    if (opc == 2 && rn == 30 && use_ras(e)) { /* RET, the usual way out of a function */
+        put_return(e);
+        return;
+    }
     if (is_stolen(rn)) put(e, LDR_X(15, 28, slot_of(rn)));
     else put(e, MOV_X(15, rn));                             /* 31 is XZR here */
-    if (opc == 1) put_lit(e, 30, pc + 4);                   /* BLR: after reading Rn */
+    if (opc == 1) {                                         /* BLR: after reading Rn */
+        if (use_ras(e)) put_call(e, pc + 4);
+        else put_lit(e, 30, pc + 4);
+    }
     put_ijc_jump(e, 1);
 }
 
@@ -752,6 +895,8 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
     if (!op.vec) used |= 1u << op.rt | (pair ? 1u << op.rt2 : 0);
     if (rm_used) used |= 1u << op.rm;
     if (rmw) used |= 1u << op.rs;
+    /* Guest x6, x7 and x15 live in the HvCpu: their host registers are as free as ever. */
+    if (!hv_knob[HV_K_TEST3]) used &= ~(1u << 6 | 1u << 7 | 1u << 15);
     uint8_t s[3];
     for (int i = 0; i < 3; i++) s[i] = pick(&used);
     int A = s[0], T = s[1], U = s[2];
@@ -894,8 +1039,9 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
     }
     if (rs_stolen) put(e, LDR_X(rs, 28, slot_of(op.rs)));
     /* Only RMW forms have an Rs; elsewhere bits 20..16 are immediate bits. */
-    if (rt_stolen && !(rmw && rs_stolen && rt == rs)) put(e, LDR_X(rt, 28, slot_of(op.rt)));
-    if (rt2_stolen && rt2 != rt) put(e, LDR_X(rt2, 28, slot_of(op.rt2)));
+    int plain_load = op.load && !rmw && !hv_knob[HV_K_TEST3]; /* it only overwrites them */
+    if (rt_stolen && !plain_load && !(rmw && rs_stolen && rt == rs)) put(e, LDR_X(rt, 28, slot_of(op.rt)));
+    if (rt2_stolen && rt2 != rt && !plain_load) put(e, LDR_X(rt2, 28, slot_of(op.rt2)));
 
     uint32_t out;
     switch (op.kind) {
@@ -1439,6 +1585,7 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
             translate_dc_zva(e, insn, pc);
             return 0;
         }
+        if (crn == 7 && op1 == 3 && crm == 5 && op2 == 1 && !hv_ic_ivau_drops()) return 0; /* IC IVAU: nothing to do, see there */
         if (crn == 7 && op1 == 3 && crm == 5 && op2 == 1 && (e->flags & HV_BLOCK_EL1) && !e->slow_mem && e->m->main_ram) {
             translate_ic_ivau(e, insn, pc);
             return 0;
@@ -1506,10 +1653,31 @@ static void patch_branch(uint32_t *w, int64_t off) {
     else *w = (op & ~(0x7ffffu << 5)) | (uint32_t)(off & 0x7ffff) << 5; /* B.cond, CBZ, LDR literal */
 }
 
+/* The hot-part branch at `at` to the next cold word. TBZ and TBNZ reach only 32 KB, so they
+   go through one word at the end of the hot part. */
+static uint32_t link_site(Emit *e, uint32_t at) {
+    if (!e->flat && (e->hot[at] & 0x7e000000) == 0x36000000) {
+        uint32_t v = e->other_n++;
+        if (v < MAX_WORDS) e->hot[v] = B_OP;
+        patch_branch(&e->hot[at], (int64_t)v - at);
+        at = v;
+    }
+    link_here(e, at, 0);
+    return at;
+}
+
+/* Written in the cold part; everything it branches back to is in the hot one. */
 static void emit_ool(Emit *e) {
     for (uint32_t i = 0; i < e->nool; i++) {
         Ool *o = &e->ool[i];
-        patch_branch(&e->w[o->at], (int64_t)e->n - o->at);
+        int refill = o->kind == OOL_SLOW && o->rflags;
+        uint32_t retry = o->retry;
+        if (refill && !e->flat) { /* the refill's way back counts words, so a word near it to go on from */
+            retry = e->n;
+            put(e, B_OP);
+            plink(e, retry, 1, o->retry, 0);
+        }
+        uint32_t site_at = link_site(e, o->at);
         if (o->recheck) { /* the fast check refuses a page's last 15 bytes: check exactly, and go back if it fits */
             put(e, LDR_X(o->u, o->t, o->tag_off));
             put(e, SUB_X(o->u, o->addr, o->u));
@@ -1517,33 +1685,39 @@ static void emit_ool(Emit *e) {
             put(e, UBFM_X(o->u, o->u, HV_TLB_PAGE_BITS, 63));
             put(e, CBNZ_X(o->u) | 2u << 5); /* cbnz u, +2: a real miss */
             put(e, B_OP);
-            patch_branch(&e->w[e->n - 1], (int64_t)(o->at + 1) - (e->n - 1));
+            plink(e, e->n - 1, 1, o->at + 1, 0);
         }
         if (o->kind == OOL_GROUP) {
             unspill(e, o->restore, o->nrestore);
             put(e, B_OP);
-            patch_branch(&e->w[e->n - 1], (int64_t)e->grp[o->pc].copy_at - (e->n - 1));
+            plink(e, e->n - 1, 1, e->grp[o->pc].copy_at, 0);
             continue;
         }
-        if (o->kind == OOL_SLOW && o->rflags) {
+        if (refill) {
             /* A TLB miss: hv_helper_thunk tries the light refill first (x7 = the
                address; x7 is never a guest register) and, if it filled the TLB,
                comes back to run the access again; else it is the usual helper. */
             put(e, MOV_X(7, o->addr));
             unspill(e, o->restore, o->nrestore);
-            put_helper_refill(e, o->pc, o->insn, o->rflags, o->retry);
+            put_helper_refill(e, o->pc, o->insn, o->rflags, retry);
             put(e, B_OP);
-            patch_branch(&e->w[e->n - 1], (int64_t)o->join - (e->n - 1));
+            plink(e, e->n - 1, 1, o->join, 0);
             continue;
         }
         unspill(e, o->restore, o->nrestore);
         if (o->kind == OOL_EXIT) {
             e->cur_pc = o->site;
             put_branch_exit(e, o->pc, o->plain); /* branches, and exits for interrupts let through */
+            /* With nothing to do on the way, chaining can take the hot part's own branch there:
+               a taken branch that goes where it means to, like the guest's, in place of two. */
+            if (e->site_direct && !o->nrestore && (e->flat || (e->hot[site_at] & 0x7e000000) != 0x36000000)) {
+                e->site[e->nsite - 1].has_cond = 1;
+                e->site[e->nsite - 1].cond_at = site_at;
+            }
         } else {
             put_helper(e, o->pc, o->insn, o->kind == OOL_SYS ? HV_OP_SYS : o->kind == OOL_MRS ? HV_OP_MRS : HV_OP_MEM);
             put(e, B_OP);
-            patch_branch(&e->w[e->n - 1], (int64_t)o->join - (e->n - 1));
+            plink(e, e->n - 1, 1, o->join, 0);
         }
     }
 }
@@ -1677,15 +1851,17 @@ static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32
 int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail) {
     /* HV_GROUPS=1: group accesses (off by default: measured no faster, and the
        plain copies make the code about 15% bigger, so the JIT region fills sooner). */
-    static int off = -1;
-    if (off < 0) off = !(getenv("HV_GROUPS") && atoi(getenv("HV_GROUPS")));
-    if (!off && translate_emit(m, b, code, avail, 0) == 0) return 0;
+    if (hv_knob[HV_K_GROUPS] && translate_emit(m, b, code, avail, 0) == 0) return 0;
     return translate_emit(m, b, code, avail, 1);
 }
 
 static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail, int nogroup) {
     Emit *e = &E;
-    e->n = e->npool = e->nfix = e->nool = e->nsite = 0;
+    e->n = e->other_n = e->npool = e->nfix = e->nool = e->nsite = e->nrel = 0;
+    e->w = e->hot;
+    e->in_cold = 0;
+    e->flat = hv_knob[HV_K_TEST2];
+    e->overflow = 0;
     e->flags = b->flags;
     e->slow_mem = m->slow_mem;
     e->page = b->va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
@@ -1715,47 +1891,91 @@ static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32
         }
         e->after[i] = e->n;
         i++;
-        if (e->n + WORDS_PER_INSN_MAX * 2 > MAX_WORDS || e->npool + 8 > MAX_LITS || e->nool + 4 > MAX_OOL) break;
+        if (e->n + WORDS_PER_INSN_MAX * 2 > MAX_WORDS || e->other_n + WORDS_PER_INSN_MAX * 2 > MAX_WORDS || e->npool + 8 > MAX_LITS || e->nool + 4 > MAX_OOL || e->nrel + 256 > MAX_RELS) break;
     }
     if (!ended) put_branch_exit(e, b->va + 4ull * i, 1);
     b->ninsns = i;
     uint32_t inline_words = e->n;
     if (!e->nogroup && e->ngrp && emit_group_copies(e, code, b->va, i) != 0) return -1;
+    cold_on(e);
     emit_ool(e);
     if (m->stats_interval) {
         m->stats.words_inline += inline_words;
-        m->stats.words_ool += e->n - inline_words;
+        m->stats.words_ool += e->n - (e->flat ? inline_words : 0);
         m->stats.words_pool += e->npool * 2;
     }
 
-    /* Pool after the code, 8-byte aligned; blocks start 8-byte aligned. */
+    /* Pool after the cold code, 8-byte aligned; both parts start 8-byte aligned. */
     if (e->n & 1) put(e, 0xd503201f);
     uint32_t pool_at = e->n;
-    uint32_t total = e->n + e->npool * 2;
-    if (total > MAX_WORDS) return -1;
+    uint32_t ncold = e->n + e->npool * 2;
+    cold_off(e);
+    if (e->n & 1) put(e, 0xd503201f);
+    if (e->flat) e->ncold = 0, e->nhot = ncold;
+    else e->ncold = ncold, e->nhot = e->n;
+    if (e->nhot > MAX_WORDS || e->ncold > MAX_WORDS || e->overflow) return -1;
 
     for (uint32_t k = 0; k < e->nfix; k++) {
         LitFix *f = &e->fix[k];
-        int64_t off = (int64_t)(pool_at + f->idx * 2) - f->at;
-        if (f->kind == FIX_LDR) {
-            patch_branch(&e->w[f->at], off);
-        } else {
-            int64_t bytes = off * 4;
-            e->w[f->at] |= (uint32_t)(bytes & 3) << 29 | (uint32_t)((bytes >> 2) & 0x7ffff) << 5;
-        }
+        plink(e, f->at, f->cold, pool_at + f->idx * 2, !e->flat);
     }
 
     e->pool_at = pool_at;
-    e->total = total;
     return 0;
 }
 
-uint32_t hv_translate_last_words(void) { return E.pool_at; } /* code words (no pool) of this thread's last block */
+uint32_t hv_translate_last_words(void) { return E.flat ? E.pool_at : E.nhot; } /* hot words (no pool) of this thread's last block */
+
+/* A B, B.cond, CBZ or CBNZ now going off words away, if it reaches. 1 if it does. */
+int hv_branch_retarget(uint32_t *w, int64_t off) {
+    uint32_t op = *w;
+    if ((op & 0x7c000000) == B_OP) {
+        if (off < -(1 << 25) || off >= (1 << 25)) return 0;
+        *w = (op & 0xfc000000) | (off & 0x3ffffff);
+        return 1;
+    }
+    if (off < -(1 << 18) || off >= (1 << 18)) return 0;
+    *w = (op & ~(0x7ffffu << 5)) | (uint32_t)(off & 0x7ffff) << 5;
+    return 1;
+}
+
+/* Each CPU places code in its own 1 MB at a time. */
+static __thread struct {
+    HvMachine *m;
+    uint64_t gen;
+    uint32_t *hot, *cold;
+} chunk;
+
+static int chunk_take(HvMachine *m, uint32_t hot, uint32_t cold, uint32_t **hot_at, uint32_t **cold_at) {
+    uint64_t gen = __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST);
+    if (chunk.m != m || chunk.gen != gen || !chunk.hot || (size_t)(chunk.cold - chunk.hot) < (size_t)hot + cold) {
+        size_t want = JIT_CHUNK_WORDS;
+        if (want > m->jit.capacity) want = m->jit.capacity;
+        if (want < (size_t)hot + cold) want = (size_t)hot + cold;
+        uint32_t *p = hv_jit_reserve(&m->jit, want);
+        if (!p) {
+            chunk.hot = NULL;
+            return -1;
+        }
+        chunk.m = m, chunk.gen = gen, chunk.hot = p, chunk.cold = p + ((want + 1) & ~(size_t)1);
+    }
+    *hot_at = chunk.hot;
+    chunk.hot += hot;
+    chunk.cold -= cold;
+    *cold_at = chunk.cold;
+    return 0;
+}
 
 int hv_translate_place(HvMachine *m, HvBlock *b) {
     Emit *e = &E;
-    uint32_t *dst = hv_jit_reserve(&m->jit, e->total);
-    if (!dst) return -1;
+    uint32_t pad = hv_knob[HV_K_TEST1] & ~1u; /* HV_K1: words of nothing after each block's hot part, to see what density is worth */
+    uint32_t *dst, *cold;
+    if (chunk_take(m, e->nhot + pad, e->ncold, &dst, &cold) != 0) return -1;
+    for (uint32_t k = 0; k < e->nrel; k++) {
+        uint32_t at = e->rel[k].at, target = e->rel[k].target;
+        if (e->rel[k].from_cold) patch_branch(&e->cold[at], (dst + target) - (cold + at));
+        else patch_branch(&e->hot[at], (cold + target) - (dst + at));
+    }
     /* Exits in the page to blocks that exist already (or back to this one's
        start) are chained now, in the copy about to be written: no trip through
        the dispatcher to do it. As chain() does for the rest. */
@@ -1774,15 +1994,28 @@ int hv_translate_place(HvMachine *m, HvBlock *b) {
         }
         if (!code) continue;
         m->slots[slot] = (uint64_t)(uintptr_t)code;
-        int64_t off = code - (dst + e->site[k].at);
-        if (off >= -(1 << 25) && off < (1 << 25)) e->w[e->site[k].at] = 0x14000000u | (uint32_t)(off & 0x3ffffff);
+        uint32_t at = e->site[k].at;
+        int64_t off = code - ((e->site[k].cold ? cold : dst) + at);
+        if (off >= -(1 << 25) && off < (1 << 25)) (e->site[k].cold ? e->cold : e->hot)[at] = 0x14000000u | (uint32_t)(off & 0x3ffffff);
+        if (e->site[k].has_cond) hv_branch_retarget(&e->hot[e->site[k].cond_at], code - (dst + e->site[k].cond_at));
         if (m->stats_interval) m->stats.chained_early++;
     }
-    hv_jit_write(&m->jit, dst, e->w, e->pool_at * 4);
-    hv_jit_write(&m->jit, dst + e->pool_at, e->pool, e->npool * 8);
-    hv_jit_finish(&m->jit, dst, e->total);
+    if (e->flat) {
+        hv_jit_write(&m->jit, dst, e->hot, e->pool_at * 4);
+        hv_jit_write(&m->jit, dst + e->pool_at, e->pool, e->npool * 8);
+    } else {
+        hv_jit_write(&m->jit, dst, e->hot, e->nhot * 4);
+        hv_jit_write(&m->jit, cold, e->cold, e->pool_at * 4);
+        hv_jit_write(&m->jit, cold + e->pool_at, e->pool, e->npool * 8);
+        hv_jit_finish(&m->jit, cold, e->ncold);
+    }
+    hv_jit_finish(&m->jit, dst, e->nhot);
     b->code = dst;
-    for (uint32_t k = 0; k < e->nsite; k++) m->slot_site[e->site[k].slot] = dst + e->site[k].at;
+    for (uint32_t k = 0; k < e->nsite; k++) {
+        m->slot_site[e->site[k].slot] = (e->site[k].cold ? cold : dst) + e->site[k].at;
+        m->slot_stub[e->site[k].slot] = (e->site[k].stub_cold ? cold : dst) + e->site[k].stub;
+        m->slot_cond[e->site[k].slot] = e->site[k].has_cond ? dst + e->site[k].cond_at : NULL;
+    }
     return 0;
 }
 

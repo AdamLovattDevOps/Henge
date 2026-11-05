@@ -194,6 +194,7 @@ static void on_ill(int sig, siginfo_t *info, void *ctx) {
 }
 
 static void *display_layer;
+void (*hv_prof_register)(void);
 
 void hv_vm_set_display_layer(void *layer) {
     display_layer = layer;
@@ -263,6 +264,7 @@ void hv_vm_prepare_cpu_thread(void) {
     static __thread int done;
     if (done) return;
     done = 1;
+    if (hv_prof_register) hv_prof_register();
     stack_t ss = {.ss_sp = malloc(1u << 16), .ss_size = 1u << 16, .ss_flags = 0};
     if (ss.ss_sp) sigaltstack(&ss, NULL);
     sigset_t set;
