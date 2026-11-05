@@ -13,6 +13,7 @@
 #import <IOSurface/IOSurfaceRef.h>
 
 #include <mach/mach.h>
+#include <stdatomic.h>
 #include <mach/vm_map.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -83,9 +84,16 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     NSMutableDictionary<NSNumber *, HvObject *> *surfaces;
     NSMutableSet<NSString *> *complaints;
     uint64_t execs, draws, failed;
-    /* The newest frame, BGRA, for hv_pvg_metal_frame. */
-    uint8_t *frame;
+    BOOL pipeline_set; /* in the open encoder */
+    /* The newest frame, BGRA, for hv_pvg_metal_frame, and the same without the pointer on it. */
+    uint8_t *frame, *base;
     uint32_t frame_w, frame_h;
+    /* The pointer: macOS sends it apart from the screen, for the display hardware to overlay. */
+    uint8_t *cursor;
+    uint32_t cursor_w, cursor_h, cursor_stride;
+    int cursor_hot_x, cursor_hot_y;
+    BOOL cursor_shown;
+    int drawn_x, drawn_y, drawn_w, drawn_h; /* where it is on the frame now */
     double last_capture;
     id<MTLBuffer> readback;
     const char *shot;
@@ -93,6 +101,7 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
 }
 - (void)complain:(NSString *)what;
 - (HvObject *)object:(uint32_t)ref task:(uint32_t)task;
+- (void)drawCursor;
 @end
 
 /* What Metal asks while it reads a serialized pipeline. */
@@ -559,8 +568,14 @@ typedef struct {
 
 /* One serialized call. Tags are the guest's. */
 - (void)render:(id<MTLRenderCommandEncoder>)e tag:(uint32_t)tag rec:(Rec)r task:(uint32_t)task {
+    if (!pipeline_set && (tag == 1 || tag == 3 || tag == 6 || tag == 7 || tag == 155 || tag == 162)) return;
     switch (tag) {
-    case 116: [e setRenderPipelineState:[self get:U32(0) task:task]]; break;
+    case 116: { /* Metal crashes on a missing pipeline, and on drawing without one */
+        id state = [self get:U32(0) task:task];
+        if (state) [e setRenderPipelineState:state];
+        pipeline_set = state != nil;
+        break;
+    }
     case 125: case 110: case 157: { /* vertex, fragment, tile buffers: {index, count}, {ref, offset}... */
         uint32_t index = U32(0), count = U32(4);
         if (count > 31) break;
@@ -670,8 +685,14 @@ typedef struct {
 
 /* Compute calls. Tags start at 200. */
 - (void)compute:(id<MTLComputeCommandEncoder>)e tag:(uint32_t)tag rec:(Rec)r task:(uint32_t)task {
+    if (!pipeline_set && (tag == 200 || tag == 202)) return;
     switch (tag) {
-    case 208: [e setComputePipelineState:[self get:U32(0) task:task]]; break;
+    case 208: {
+        id state = [self get:U32(0) task:task];
+        if (state) [e setComputePipelineState:state];
+        pipeline_set = state != nil;
+        break;
+    }
     case 203: {
         uint32_t index = U32(0), count = U32(4);
         if (count > 31) break;
@@ -900,7 +921,7 @@ typedef struct {
             }
             continue;
         }
-        if (!e && type == 1) e = [cb computeCommandEncoder];
+        if (!e && type == 1) e = [cb computeCommandEncoder], pipeline_set = NO;
         if (!e && type == 2) e = [cb blitCommandEncoder];
         etype = type;
         @try {
@@ -912,6 +933,7 @@ typedef struct {
                 if (etype == 0 && tag == 26) {
                     if (e) [e endEncoding];
                     e = [self beginPass:r task:task commandBuffer:cb];
+                    pipeline_set = NO;
                 } else if (e) {
                     if (etype == 0) [self render:e tag:tag rec:r task:task];
                     else if (etype == 1) [self compute:e tag:tag rec:r task:task];
@@ -957,6 +979,68 @@ static const uint8_t *half_to_byte(void) {
     return t;
 }
 
+/* Op 4: a new pointer image in the kernel task's memory, premultiplied BGRA:
+   {port, 0, offset, mapped length, stride, width, height, hot x, hot y, sum}. */
+- (void)cursorGlyph:(const uint32_t *)a length:(uint32_t)n {
+    if (n < 0x2c) return;
+    uint64_t off, stride;
+    memcpy(&off, a + 2, 8), memcpy(&stride, a + 6, 8);
+    uint16_t w, h, hx, hy;
+    memcpy(&w, (const uint8_t *)a + 0x20, 2), memcpy(&h, (const uint8_t *)a + 0x22, 2);
+    memcpy(&hx, (const uint8_t *)a + 0x24, 2), memcpy(&hy, (const uint8_t *)a + 0x26, 2);
+    if (!w || !h || w > 512 || h > 512 || stride < (uint64_t)w * 4 || stride > 8192) return;
+    uint8_t *bits = malloc((size_t)stride * h);
+    if (hv_pvg_lite_task_read(lite, 0, off, bits, (uint32_t)stride * h)) {
+        free(bits);
+        [self complain:@"pointer image unreadable"];
+        return;
+    }
+    free(cursor);
+    cursor = bits, cursor_w = w, cursor_h = h, cursor_stride = (uint32_t)stride, cursor_hot_x = hx, cursor_hot_y = hy;
+    if (getenv("HV_PVG_CURSOR_LOG")) fprintf(stderr, "pvgcursor glyph %ux%u hot %d,%d stride %u first alpha %u\n", w, h, hx, hy, (uint32_t)stride, bits[(size_t)(h / 2) * stride + (size_t)(w / 2) * 4 + 3]);
+    [self drawCursor];
+}
+
+/* Puts back what the pointer covered, and draws it where the shared page says it is now. */
+- (void)drawCursor {
+    if (!frame || !base) return;
+    uint32_t w = frame_w, h = frame_h;
+    for (int y = drawn_y; y < drawn_y + drawn_h; y++) memcpy(frame + (size_t)y * w * 4 + (size_t)drawn_x * 4, base + (size_t)y * w * 4 + (size_t)drawn_x * 4, (size_t)drawn_w * 4);
+    drawn_w = drawn_h = 0;
+    const uint8_t *page = hv_pvg_lite_display_page(lite);
+    if (!page || !cursor || !(cursor_shown || page[0xe04])) return;
+    uint32_t where = __atomic_load_n((const uint32_t *)(page + 0xe00), __ATOMIC_ACQUIRE);
+    if (getenv("HV_PVG_CURSOR_LOG")) {
+        static uint32_t last;
+        if (where != last) fprintf(stderr, "pvgcursor at %u,%u shown %d flag %d\n", where & 0xffff, where >> 16, cursor_shown, page[0xe04]);
+        last = where;
+    }
+    if (where == 0xffffffff) return;
+    /* 1080p shrunk onto a phone would make a normal pointer a few dots across. The hot spot stays where it points. */
+#if TARGET_OS_IPHONE
+    const int scale = 3;
+#else
+    const int scale = 1;
+#endif
+    int x = (int)(where & 0xffff) - cursor_hot_x * scale, y = (int)(where >> 16) - cursor_hot_y * scale;
+    int cw = (int)cursor_w * scale, ch = (int)cursor_h * scale;
+    int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+    int x1 = x + cw > (int)w ? (int)w : x + cw, y1 = y + ch > (int)h ? (int)h : y + ch;
+    if (x1 <= x0 || y1 <= y0) return;
+    for (int py = y0; py < y1; py++) {
+        const uint8_t *row = cursor + (size_t)((py - y) / scale) * cursor_stride;
+        uint8_t *dst = frame + (size_t)py * w * 4 + (size_t)x0 * 4;
+        for (int px = x0; px < x1; px++, dst += 4) {
+            const uint8_t *src = row + (size_t)((px - x) / scale) * 4;
+            uint32_t keep = 255u - src[3];
+            dst[0] = (uint8_t)(src[0] + (dst[0] * keep + 127) / 255);
+            dst[1] = (uint8_t)(src[1] + (dst[1] * keep + 127) / 255);
+            dst[2] = (uint8_t)(src[2] + (dst[2] * keep + 127) / 255);
+        }
+    }
+    drawn_x = x0, drawn_y = y0, drawn_w = x1 - x0, drawn_h = y1 - y0;
+}
+
 /* What the display should show: copied to memory the host can read, at most a few times a second. */
 - (void)present:(uint64_t)mapping {
     id<MTLTexture> t = mapped_textures[@(mapping)];
@@ -968,7 +1052,16 @@ static const uint8_t *half_to_byte(void) {
     if (!surface) return;
     NSUInteger bpp = t.pixelFormat == MTLPixelFormatRGBA16Float ? 8 : 4, row = surface->row;
     uint32_t w = (uint32_t)t.width, h = (uint32_t)t.height;
-    uint8_t *out = frame && frame_w == w && frame_h == h ? frame : malloc((size_t)w * h * 4);
+    if (!frame || !base || frame_w != w || frame_h != h) {
+        free(base);
+        base = malloc((size_t)w * h * 4);
+        uint8_t *old = frame;
+        frame = calloc((size_t)w * h, 4); /* the old one may be on screen for a moment yet: a small leak beats a crash */
+        (void)old;
+        frame_w = w, frame_h = h;
+        drawn_w = drawn_h = 0;
+    }
+    uint8_t *out = base;
     const uint8_t *src = surface->mapped + surface->first;
     const uint8_t *lut = half_to_byte();
     if (bpp == 8) {
@@ -982,11 +1075,15 @@ static const uint8_t *half_to_byte(void) {
     } else {
         for (uint32_t y = 0; y < h; y++) memcpy(out + (size_t)y * w * 4, src + y * row, (size_t)w * 4);
     }
-    if (out != frame) free(frame);
-    frame = out, frame_w = w, frame_h = h;
+    memcpy(frame, base, (size_t)w * h * 4);
+    drawn_w = drawn_h = 0;
+    [self drawCursor];
+    out = frame;
 #if !TARGET_OS_IPHONE
     static double last_shot;
-    if (shot && now - last_shot >= 5) {
+    static double shot_every;
+    if (!shot_every) shot_every = getenv("HV_PVG_SHOT_SECS") ? atof(getenv("HV_PVG_SHOT_SECS")) : 5;
+    if (shot && now - last_shot >= shot_every) {
         last_shot = now;
         char path[1100];
         snprintf(path, sizeof path, "%s-%04u.png", shot, shots++);
@@ -1050,6 +1147,12 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
                 } else {
                     hv_pvg_lite_command(lite, cmd, len);
                     if (op == 8 && n >= 16) [r present:(uint64_t)args[3] << 32 | args[2]];
+                    if (op == 4) [r cursorGlyph:args length:n];
+                    if (op == 5 && n >= 8) {
+                        r->cursor_shown = args[1] & 1;
+                        if (getenv("HV_PVG_CURSOR_LOG")) fprintf(stderr, "pvgcursor show %u\n", args[1]);
+                        [r drawCursor];
+                    }
                 }
             } @catch (NSException *x) {
                 [r complain:[NSString stringWithFormat:@"exception: %@", x.reason]];
@@ -1057,6 +1160,16 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
             hv_pvg_lite_complete(lite, ch, cmd[2]);
             free(cmd);
         }
+    });
+}
+
+void hv_pvg_metal_cursor_moved(HvPvgMetal *m) {
+    HvReplay *r = (__bridge HvReplay *)m;
+    static _Atomic int queued;
+    if (atomic_exchange(&queued, 1)) return; /* one is already on its way, and it will read the newest position */
+    dispatch_async(r->worker, ^{
+        atomic_store(&queued, 0);
+        [r drawCursor];
     });
 }
 

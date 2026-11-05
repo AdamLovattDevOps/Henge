@@ -5,6 +5,7 @@
 #include <pthread.h>
 #include <pthread/qos.h>
 #include <signal.h>
+#include <sys/ucontext.h>
 #include <stdio.h>
 #include <time.h>
 
@@ -105,8 +106,29 @@ static int fail(char *err, size_t n, const char *msg) {
     return -1;
 }
 
+/* An illegal instruction in translated code means a branch landed where no
+   translation is: say where, for a crash report cannot. */
+static struct sigaction prior_ill;
+static void on_ill(int sig, siginfo_t *info, void *ctx) {
+    ucontext_t *uc = ctx;
+    uint64_t pc = uc->uc_mcontext->__ss.__pc, rx = (uint64_t)(uintptr_t)m.jit.base, size = (uint64_t)m.jit.capacity * 4;
+    if (pc >= rx && pc < rx + size) {
+        fprintf(stderr, "hengevm: illegal instruction in translated code at +%llx of %llx (used %llx), word %08x, full flushes %llu, lr %llx\n",
+                (unsigned long long)(pc - rx), (unsigned long long)size, (unsigned long long)m.jit.used * 4, *(uint32_t *)(uintptr_t)pc, (unsigned long long)m.stats.flush_full, (unsigned long long)uc->uc_mcontext->__ss.__lr);
+        for (int i = 0; i < ncpus; i++)
+            fprintf(stderr, "  cpu %d: guest pc %llx el%u\n", i, (unsigned long long)cpus[i].pc, cpus[i].el);
+    } else {
+        fprintf(stderr, "hengevm: illegal instruction outside translated code at %llx (region %llx size %llx), info addr %p\n", (unsigned long long)pc, (unsigned long long)rx, (unsigned long long)size, info->si_addr);
+    }
+    fflush(stderr);
+    sigaction(sig, &prior_ill, NULL);
+}
+
 int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     if (!c->rom || !c->disk || !c->aux) return fail(err, errlen, "The ROM, disk and auxiliary storage are all needed.");
+    struct sigaction ill = {.sa_flags = SA_SIGINFO | SA_ONSTACK};
+    ill.sa_sigaction = on_ill;
+    sigaction(SIGILL, &ill, &prior_ill);
     if (hv_disk_open(&disk, c->disk, 0, 0) != 0) return fail(err, errlen, "Cannot open the disk image.");
     if (hv_disk_open(&aux, c->aux, c->aux_offset ? c->aux_offset : 16384, 0) != 0)
         return fail(err, errlen, "Cannot open the auxiliary storage.");

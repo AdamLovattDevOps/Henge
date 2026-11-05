@@ -391,6 +391,10 @@ const uint8_t *hv_pvg_lite_surface(HvPvgLite *p, uint32_t mapping) {
     return hv_phys_ptr(p->m, ((uint64_t)(*e & ~1u) << 12) + (mapping % 16) * 0x400ull, 0x400);
 }
 
+uint8_t *hv_pvg_lite_display_page(HvPvgLite *p) {
+    return p->display_pa ? hv_phys_ptr(p->m, p->display_pa, 0x4000) : NULL;
+}
+
 void hv_pvg_lite_command(HvPvgLite *p, const uint32_t *cmd, uint32_t len) {
     uint32_t op = cmd[0] & 0xffff, skip = cmd[0] >> 16 ? 8 : 0;
     uint32_t n = len > 12 + skip ? len - 12 - skip : 0;
@@ -528,6 +532,7 @@ static void gfx_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
     else if (off == 0x1020 && v < MAX_CHANNELS) p->chan_pending |= 1u << v;
     else if (p->log && off != 0x1020) fprintf(stderr, "hengevm: pvg-lite: write +%llx = %llx\n", (unsigned long long)off, (unsigned long long)v);
     if (off == 0x1008 || off == 0x1020) hv_machine_kick_all(p->m);
+    if (off == 0x1220 && p->metal) hv_pvg_metal_cursor_moved(p->metal); /* the display's doorbell: the pointer moved */
 }
 
 static uint64_t iosfc_read(void *opaque, uint64_t off, unsigned size) {

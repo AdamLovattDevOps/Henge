@@ -78,6 +78,15 @@ static void *type_thread(void *unused) {
         hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
         usleep(20000);
     }
+    if (getenv("HV_TYPE_NO_KEYS")) { /* out into the open, for a screenshot */
+        for (int i = 0; i < 60; i++) {
+            hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_X, 12);
+            hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_Y, 8);
+            hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+            usleep(20000);
+        }
+        return NULL;
+    }
     static const uint16_t keys[3] = {30, 48, 46}; /* a, b, c */
     for (int i = 0; i < 3; i++) {
         hv_xhci_key_linux(board.usb, keys[i], 1);
