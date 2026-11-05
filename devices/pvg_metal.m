@@ -8,6 +8,7 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 #include <stdatomic.h>
+#include <os/lock.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -103,6 +104,10 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     NSMutableDictionary<NSNumber *, HvObject *> *surfaces;
     NSMutableSet<NSString *> *complaints;
     uint64_t execs, draws, failed, heap_bytes, synced, remaps;
+    /* Work the GPU has not finished. Stamps are given back in the order they came: the
+       GPU's completion handlers run in the order of commit. */
+    _Atomic int inflight;
+    id<MTLCommandBuffer> last_cb;
     double encode_time, gpu_wait_time;
     BOOL pipeline_set; /* in the open encoder */
     BOOL tess_factors; /* so is a tessellation factor buffer */
@@ -128,8 +133,12 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     id<MTLTexture> cursor_tex;
     id<MTLSamplerState> screen_sampler;
     uint64_t on_screen; /* the mapping showing */
-    _Atomic int drawables_out;
     uint64_t gpu_frames;
+    dispatch_queue_t presenter;
+    os_unfair_lock screen_lock; /* what to show, and the pointer as the presenter reads it */
+    id<MTLTexture> screen_tex;
+    BOOL screen_half, screen_dirty, presenter_running;
+    uint32_t screen_w, screen_h;
     id<MTLBuffer> test_readback; /* HV_PVG_GPU_TEST: the drawable's pixels for screenshots */
     id<MTLBuffer> readback;
     const char *shot;
@@ -792,8 +801,7 @@ static BOOL has_guest_pages(HvObject *o) {
     }
     [blit endEncoding];
     if (cb) {
-        [cb commit];
-        [cb waitUntilCompleted];
+        [self commit:cb channel:0 stamp:0 complete:NO];
         synced++;
     }
 }
@@ -1142,6 +1150,18 @@ typedef struct {
         draws++;
         break;
     }
+    case 9: { /* {primitive, index type, ref, count 16, offset 16, instances 16} */
+        id<MTLBuffer> b = [self get:U32(4) task:task];
+        if (b) [e drawIndexedPrimitives:(MTLPrimitiveType)U16(0) indexCount:U16(8) indexType:(MTLIndexType)U16(2) indexBuffer:b indexBufferOffset:U16(10) instanceCount:U16(12)];
+        draws++;
+        break;
+    }
+    case 8: { /* {primitive, index type, ref, count 64, offset 64, instances 64} */
+        id<MTLBuffer> b = [self get:U32(4) task:task];
+        if (b) [e drawIndexedPrimitives:(MTLPrimitiveType)U16(0) indexCount:(NSUInteger)U64(8) indexType:(MTLIndexType)U16(2) indexBuffer:b indexBufferOffset:(NSUInteger)U64(16) instanceCount:(NSUInteger)U64(24)];
+        draws++;
+        break;
+    }
     case 155: {
         MTLSize s;
         memcpy(&s, r.p, sizeof s);
@@ -1408,9 +1428,38 @@ typedef struct {
 }
 
 /* One exec: {task, resources, buffers}, {ref, flags} per resource, {offset, length} per buffer. */
-- (void)exec:(const uint32_t *)a length:(uint32_t)len {
+/* Commits without waiting: the next batch can be encoded while the GPU does this one. */
+- (void)commit:(id<MTLCommandBuffer>)cb channel:(uint32_t)ch stamp:(uint32_t)stamp complete:(BOOL)complete {
+    static int sync = -1; /* HV_PVG_SYNC: wait for the GPU after every batch */
+    if (sync < 0) sync = getenv("HV_PVG_SYNC") != NULL;
+    HvPvgLite *l = lite;
+    atomic_fetch_add(&inflight, 1);
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        if (done.error) {
+            self->failed++;
+            fprintf(stderr, "hengevm: pvg-metal: command buffer: %s\n", done.error.localizedDescription.UTF8String);
+        }
+        if (complete) hv_pvg_lite_complete(l, ch, stamp);
+        atomic_fetch_sub(&self->inflight, 1);
+    }];
+    [cb commit];
+    last_cb = cb;
+    if (sync) [cb waitUntilCompleted];
+}
+
+/* A command that used the GPU not at all, or waited for by others: its stamp after everything before it. */
+- (void)finishChannel:(uint32_t)ch stamp:(uint32_t)stamp {
+    if (atomic_load(&inflight) == 0) {
+        hv_pvg_lite_complete(lite, ch, stamp);
+        return;
+    }
+    [self commit:[queue commandBuffer] channel:ch stamp:stamp complete:YES];
+}
+
+/* Returns YES if the GPU's completion gives the stamp back. */
+- (BOOL)exec:(const uint32_t *)a length:(uint32_t)len channel:(uint32_t)ch stamp:(uint32_t)stamp {
     uint32_t task = a[0], nres = a[1], nbuf = a[2];
-    if (12 + nres * 8ull + nbuf * 16ull > len) return;
+    if (12 + nres * 8ull + nbuf * 16ull > len) return NO;
     const uint32_t *res = a + 3;
     const uint8_t *bufs = (const uint8_t *)(res + nres * 2);
     static const char *trace_file;
@@ -1528,20 +1577,16 @@ typedef struct {
         [back endEncoding];
     }
     double t1 = now_seconds();
-    [cb commit];
-    [cb waitUntilCompleted];
+    [self commit:cb channel:ch stamp:stamp complete:YES];
     double t2 = now_seconds();
     encode_time += t1 - t_begin, gpu_wait_time += t2 - t1;
-    if (cb.error) {
-        failed++;
-        [self complain:[NSString stringWithFormat:@"command buffer: %@", cb.error.localizedDescription]];
-    }
     if (++execs % 2000 == 0) {
         static double t0;
         if (!t0) t0 = now_seconds();
         fprintf(stderr, "hengevm: pvg-metal: %llu execs, %llu draws, %llu failed, %llu synced, %llu remaps, %.0f s; encoding %.2f s, waiting for the GPU %.2f s\n", (unsigned long long)execs, (unsigned long long)draws, (unsigned long long)failed, (unsigned long long)synced, (unsigned long long)remaps, now_seconds() - t0, encode_time, gpu_wait_time);
         encode_time = gpu_wait_time = 0;
     }
+    return YES;
 }
 
 /* The surface is linear light in half floats: every possible value, to a display byte. */
@@ -1579,11 +1624,14 @@ static const uint8_t *half_to_byte(void) {
         return;
     }
     free(cursor);
-    cursor = bits, cursor_w = w, cursor_h = h, cursor_stride = (uint32_t)stride, cursor_hot_x = hx, cursor_hot_y = hy;
     MTLTextureDescriptor *ct = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h mipmapped:NO];
     ct.storageMode = MTLStorageModeShared;
-    cursor_tex = [device newTextureWithDescriptor:ct];
-    [cursor_tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:bits bytesPerRow:(NSUInteger)stride];
+    id<MTLTexture> glyph = [device newTextureWithDescriptor:ct];
+    [glyph replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:bits bytesPerRow:(NSUInteger)stride];
+    os_unfair_lock_lock(&screen_lock);
+    cursor = bits, cursor_w = w, cursor_h = h, cursor_stride = (uint32_t)stride, cursor_hot_x = hx, cursor_hot_y = hy;
+    cursor_tex = glyph;
+    os_unfair_lock_unlock(&screen_lock);
     if (getenv("HV_PVG_CURSOR_LOG")) fprintf(stderr, "pvgcursor glyph %ux%u hot %d,%d stride %u first alpha %u\n", w, h, hx, hy, (uint32_t)stride, bits[(size_t)(h / 2) * stride + (size_t)(w / 2) * 4 + 3]);
     [self drawCursor];
 }
@@ -1591,7 +1639,7 @@ static const uint8_t *half_to_byte(void) {
 /* Puts back what the pointer covered, and draws it where the shared page says it is now. */
 - (void)drawCursor {
     if (layer) {
-        if (on_screen) [self present:on_screen];
+        [self screenChanged];
         return;
     }
     if (!frame || !base) return;
@@ -1681,15 +1729,20 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
     return YES;
 }
 
-/* The display, drawn by the GPU, after everything the guest submitted: its surface, then the pointer over it. */
+/* The display, drawn by the GPU. Waiting for a drawable can take until the screen's next
+   refresh, so that happens on a thread of its own and never holds up the guest's GPU work:
+   this only says what to show next. Whatever is newest when a drawable comes is what is shown. */
+- (void)kickPresenter {
+    /* screen_lock held */
+    if (presenter_running) return;
+    presenter_running = YES;
+    dispatch_async(presenter, ^{ [self presentLoop]; });
+}
+
 - (void)showOnLayer:(uint64_t)mapping {
     HvObject *surface = surfaces[@(mapping)];
     if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
     on_screen = mapping;
-    if (![self prepareScreen]) return;
-    /* Never wait for a drawable here, where the guest's GPU work waits behind us. */
-    if (atomic_load(&drawables_out) >= 2) { late_mapping = mapping, late = YES; return; }
-    late = NO;
     BOOL half = surface->fourcc == 'RGhA';
     if (!surface->scanout) {
         MTLTextureDescriptor *t = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:half ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm
@@ -1699,95 +1752,126 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
         surface->scanout = [(id<MTLBuffer>)surface->object newTextureWithDescriptor:t offset:surface->first bytesPerRow:surface->row];
         if (!surface->scanout) { [self complain:[NSString stringWithFormat:@"no scanout for surface %llu, row %llu", mapping, surface->row]]; return; }
     }
-    CGSize want = CGSizeMake(surface->surface_w, surface->surface_h);
-    if (!CGSizeEqualToSize(layer.drawableSize, want)) {
-        [CATransaction begin];
-        [CATransaction setDisableActions:YES];
-        layer.drawableSize = want;
-        [CATransaction commit];
+    os_unfair_lock_lock(&screen_lock);
+    screen_tex = surface->scanout, screen_half = half, screen_w = surface->surface_w, screen_h = surface->surface_h;
+    screen_dirty = YES;
+    [self kickPresenter];
+    os_unfair_lock_unlock(&screen_lock);
+}
+
+/* The pointer moved or changed: the screen again, with no need to go through the GPU queue's worker. */
+- (void)screenChanged {
+    os_unfair_lock_lock(&screen_lock);
+    if (screen_tex) {
+        screen_dirty = YES;
+        [self kickPresenter];
     }
-    id<CAMetalDrawable> drawable = [layer nextDrawable];
-    if (!drawable) { late_mapping = mapping, late = YES; return; }
-    id<MTLCommandBuffer> cb = [queue commandBuffer];
-    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
-    pass.colorAttachments[0].texture = drawable.texture;
-    pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
-    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-    id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:pass];
-    [e setRenderPipelineState:half ? linear_pipe : screen_pipe];
-    float rect[4] = {-1, -1, 2, 2};
-    [e setVertexBytes:rect length:sizeof rect atIndex:0];
-    [e setFragmentTexture:surface->scanout atIndex:0];
-    [e setFragmentSamplerState:screen_sampler atIndex:0];
-    [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
-    const uint8_t *page = hv_pvg_lite_display_page(lite);
-    uint32_t where = page ? __atomic_load_n((const uint32_t *)(page + 0xe00), __ATOMIC_ACQUIRE) : 0xffffffff;
-    if (cursor_tex && where != 0xffffffff && (cursor_shown || page[0xe04])) {
-#if TARGET_OS_IPHONE
-        const float scale = 3;
-#else
-        const float scale = 1;
-#endif
-        float W = surface->surface_w, H = surface->surface_h;
-        float x = (float)(where & 0xffff) - cursor_hot_x * scale, y = (float)(where >> 16) - cursor_hot_y * scale;
-        float cw = cursor_w * scale, ch = cursor_h * scale;
-        float r[4] = {x / W * 2 - 1, 1 - (y + ch) / H * 2, cw / W * 2, ch / H * 2};
-        [e setRenderPipelineState:cursor_pipe];
-        [e setVertexBytes:r length:sizeof r atIndex:0];
-        [e setFragmentTexture:cursor_tex atIndex:0];
+    os_unfair_lock_unlock(&screen_lock);
+}
+
+- (void)presentLoop {
+    for (;;) @autoreleasepool {
+        os_unfair_lock_lock(&screen_lock);
+        if (!screen_dirty) {
+            presenter_running = NO;
+            os_unfair_lock_unlock(&screen_lock);
+            return;
+        }
+        screen_dirty = NO;
+        id<MTLTexture> tex = screen_tex, ctex = cursor_tex;
+        BOOL half = screen_half, shown = cursor_shown;
+        uint32_t W = screen_w, H = screen_h, cw0 = cursor_w, ch0 = cursor_h;
+        int hx = cursor_hot_x, hy = cursor_hot_y;
+        os_unfair_lock_unlock(&screen_lock);
+        if (![self prepareScreen]) continue;
+        CGSize want = CGSizeMake(W, H);
+        if (!CGSizeEqualToSize(layer.drawableSize, want)) {
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            layer.drawableSize = want;
+            [CATransaction commit];
+        }
+        id<CAMetalDrawable> drawable = [layer nextDrawable]; /* the wait is here */
+        if (!drawable) {
+            os_unfair_lock_lock(&screen_lock);
+            screen_dirty = YES;
+            os_unfair_lock_unlock(&screen_lock);
+            usleep(4000);
+            continue;
+        }
+        /* Something newer came during the wait? Then that is the frame to show. */
+        os_unfair_lock_lock(&screen_lock);
+        tex = screen_tex, half = screen_half, ctex = cursor_tex, shown = cursor_shown;
+        cw0 = cursor_w, ch0 = cursor_h, hx = cursor_hot_x, hy = cursor_hot_y;
+        BOOL same_size = screen_w == W && screen_h == H;
+        screen_dirty = NO;
+        os_unfair_lock_unlock(&screen_lock);
+        if (!same_size) { /* a mode change: start over with the right size */
+            os_unfair_lock_lock(&screen_lock);
+            screen_dirty = YES;
+            os_unfair_lock_unlock(&screen_lock);
+            continue;
+        }
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass.colorAttachments[0].texture = drawable.texture;
+        pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:pass];
+        [e setRenderPipelineState:half ? linear_pipe : screen_pipe];
+        float rect[4] = {-1, -1, 2, 2};
+        [e setVertexBytes:rect length:sizeof rect atIndex:0];
+        [e setFragmentTexture:tex atIndex:0];
+        [e setFragmentSamplerState:screen_sampler atIndex:0];
         [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
-    }
-    [e endEncoding];
-#if !TARGET_OS_IPHONE
-    if (getenv("HV_PVG_GPU_TEST")) { /* the same pixels for a screenshot: this is the path a phone runs */
-        NSUInteger bytes = (NSUInteger)surface->surface_w * surface->surface_h * 4;
-        if (!test_readback || test_readback.length < bytes) test_readback = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-        id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
-        [b copyFromTexture:drawable.texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(surface->surface_w, surface->surface_h, 1)
-                  toBuffer:test_readback destinationOffset:0 destinationBytesPerRow:(NSUInteger)surface->surface_w * 4 destinationBytesPerImage:bytes];
-        [b endEncoding];
-        uint32_t tw = surface->surface_w, th = surface->surface_h;
-        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
-            (void)done;
-            dispatch_async(self->worker, ^{
-                if (!self->frame || self->frame_w != tw || self->frame_h != th) {
-                    self->frame = malloc((size_t)tw * th * 4), self->frame_w = tw, self->frame_h = th;
-                }
-                memcpy(self->frame, self->test_readback.contents, (size_t)tw * th * 4);
-                self->frames++;
-            });
-        }];
-    }
+        const uint8_t *page = hv_pvg_lite_display_page(lite);
+        uint32_t where = page ? __atomic_load_n((const uint32_t *)(page + 0xe00), __ATOMIC_ACQUIRE) : 0xffffffff;
+        if (ctex && where != 0xffffffff && (shown || page[0xe04])) {
+#if TARGET_OS_IPHONE
+            const float scale = 3;
+#else
+            const float scale = 1;
 #endif
-    [cb presentDrawable:drawable];
-    atomic_fetch_add(&drawables_out, 1);
-    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
-        (void)done;
-        atomic_fetch_sub(&self->drawables_out, 1);
-        dispatch_async(self->worker, ^{
-            if (self->late) [self present:self->late_mapping];
-        });
-    }];
-    [cb commit];
-    gpu_frames++;
+            float x = (float)(where & 0xffff) - hx * scale, y = (float)(where >> 16) - hy * scale;
+            float cw = cw0 * scale, ch = ch0 * scale;
+            float r[4] = {x / W * 2 - 1, 1 - (y + ch) / H * 2, cw / W * 2, ch / H * 2};
+            [e setRenderPipelineState:cursor_pipe];
+            [e setVertexBytes:r length:sizeof r atIndex:0];
+            [e setFragmentTexture:ctex atIndex:0];
+            [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        }
+        [e endEncoding];
+#if !TARGET_OS_IPHONE
+        if (getenv("HV_PVG_GPU_TEST")) { /* the same pixels for a screenshot: this is the path a phone runs */
+            NSUInteger bytes = (NSUInteger)W * H * 4;
+            if (!test_readback || test_readback.length < bytes) test_readback = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+            id<MTLBuffer> rb = test_readback;
+            id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+            [b copyFromTexture:drawable.texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(W, H, 1)
+                      toBuffer:rb destinationOffset:0 destinationBytesPerRow:(NSUInteger)W * 4 destinationBytesPerImage:bytes];
+            [b endEncoding];
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+                (void)done;
+                dispatch_async(self->worker, ^{
+                    if (!self->frame || self->frame_w != W || self->frame_h != H) {
+                        self->frame = malloc((size_t)W * H * 4), self->frame_w = W, self->frame_h = H;
+                    }
+                    memcpy(self->frame, rb.contents, (size_t)W * H * 4);
+                    self->frames++;
+                });
+            }];
+        }
+#endif
+        [cb presentDrawable:drawable];
+        [cb commit];
+        gpu_frames++;
+    }
 }
 
 /* What the display should show: at most a few times a second by CPU, for tests and the boot's first frames. */
 - (void)present:(uint64_t)mapping {
     double now = now_seconds();
     if (layer) {
-        if (now - last_capture < 0.015) { /* more than a display shows */
-            late_mapping = mapping, late = YES;
-            if (!late_queued) {
-                late_queued = YES;
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC), worker, ^{
-                    self->late_queued = NO;
-                    if (self->late) [self present:self->late_mapping];
-                });
-            }
-            return;
-        }
-        last_capture = now;
         [self showOnLayer:mapping];
         return;
     }
@@ -1806,6 +1890,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
     HvObject *surface = surfaces[@(mapping)];
     if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
     last_capture = now;
+    [last_cb waitUntilCompleted]; /* the CPU copies the pixels here, so the GPU must be done with them */
     NSUInteger bpp = surface->fourcc == 'RGhA' ? 8 : 4, row = surface->row;
     uint32_t w = surface->surface_w, h = surface->surface_h;
     if (!frame || !base || frame_w != w || frame_h != h) {
@@ -1874,7 +1959,9 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
         r->lite = lite;
         r->device = dev;
         r->queue = [dev newCommandQueueWithMaxCommandBufferCount:64];
-        r->worker = dispatch_queue_create("hengevm.pvg", DISPATCH_QUEUE_SERIAL);
+        r->worker = dispatch_queue_create("hengevm.pvg", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+        r->presenter = dispatch_queue_create("hengevm.present", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+        r->screen_lock = OS_UNFAIR_LOCK_INIT;
         r->tasks = [NSMutableDictionary new];
         r->mapped_textures = [NSMutableDictionary new];
         r->surfaces = [NSMutableDictionary new];
@@ -1906,9 +1993,10 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
             uint32_t op = cmd[0] & 0xffff, skip = cmd[0] >> 16 ? 8 : 0;
             const uint32_t *args = (const uint32_t *)((const uint8_t *)cmd + 12 + skip);
             uint32_t n = len > 12 + skip ? len - 12 - skip : 0;
+            BOOL gpu_completes = NO;
             @try {
                 if ((op == 0x43 || op == 0x45) && n >= 12) {
-                    [r exec:args length:n];
+                    gpu_completes = [r exec:args length:n channel:ch stamp:cmd[2]];
                 } else if ((op == 0x25 || op == 0x28) && n >= 8) { /* {task, ref} or {task, tag, size, ref} */
                     uint32_t ref = op == 0x25 ? args[1] : (n >= 16 ? args[3] : 0);
                     [r->tasks[@(args[0])] removeObjectForKey:@(ref)];
@@ -1937,7 +2025,7 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
             } @catch (NSException *x) {
                 [r complain:[NSString stringWithFormat:@"exception: %@", x.reason]];
             }
-            hv_pvg_lite_complete(lite, ch, cmd[2]);
+            if (!gpu_completes) [r finishChannel:ch stamp:cmd[2]];
             free(cmd);
         }
     });
@@ -1958,6 +2046,10 @@ uint64_t hv_pvg_metal_gpu_frames(HvPvgMetal *m) {
 
 void hv_pvg_metal_cursor_moved(HvPvgMetal *m) {
     HvReplay *r = (__bridge HvReplay *)m;
+    if (r->layer) { /* no need to queue behind the guest's GPU work */
+        [r screenChanged];
+        return;
+    }
     static _Atomic int queued;
     if (atomic_exchange(&queued, 1)) return; /* one is already on its way, and it will read the newest position */
     dispatch_async(r->worker, ^{

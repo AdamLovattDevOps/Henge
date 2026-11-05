@@ -275,8 +275,12 @@ void hv_pvg_lite_complete(HvPvgLite *p, uint32_t ch, uint32_t stamp) {
     uint64_t buf = (uint64_t)reg(p, 0x1030) << 14;
     uint32_t *s = buf ? guest32(p, buf + 4 * ch) : NULL;
     if (s) __atomic_store_n(s, stamp, __ATOMIC_RELEASE);
-    __atomic_fetch_or(&p->stamps_pending, 1u << ch, __ATOMIC_RELEASE);
-    hv_machine_kick_all(p->m);
+    /* The interrupt now, from this thread: the GIC wakes the CPU it goes to. Left for
+       CPU 0's next poll this could wait for its timer, up to 10 ms if it is idle, and
+       the guest waits for this between the many batches of work in a frame. */
+    __atomic_fetch_or(&p->status, 1u << ch, __ATOMIC_ACQ_REL);
+    hv_gicv3_pend(p->gic, p->gfx_irq);
+    if (p->m->ncpus == 1) hv_machine_wake(p->m);
 }
 
 void hv_pvg_lite_set_layer(HvPvgLite *p, void *layer) {
@@ -521,59 +525,49 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
     if (any) {
         uint32_t *stamp = guest32(p, buf + 4 * ch);
         if (stamp) __atomic_store_n(stamp, last, __ATOMIC_RELEASE);
-        p->status |= 1u << ch;
+        __atomic_fetch_or(&p->status, 1u << ch, __ATOMIC_ACQ_REL);
     }
 }
 
+/* The mapper's ring: surfaces coming and going. The guest waits for its interrupt. */
+static void do_mapper(HvPvgLite *p) {
+    if (p->tally) {
+        uint64_t ring = p->io_regs[0], table = p->io_regs[0x10 / 8], size = p->io_regs[0x8 / 8], want = p->io_regs[0x18 / 8];
+        for (uint64_t i = p->io_regs[0x20 / 8]; i < want && size; i++) {
+            uint32_t *e = hv_phys_ptr(p->m, ring + (i % size) * 16, 16);
+            uint32_t *t = table ? hv_phys_ptr(p->m, table, 64) : NULL;
+            if (!e || !t) continue;
+            fprintf(stderr, "pvgmap op %u id %u table %x %x %x %x\n", e[0], e[1], t[0], t[1], t[2], t[3]);
+            uint32_t seg = e[1] / 16, idx = e[1] % 16;
+            uint32_t *ta = hv_phys_ptr(p->m, table + seg * 4, 4);
+            uint32_t *d = ta ? hv_phys_ptr(p->m, ((uint64_t)(*ta & ~1u) << 12) + idx * 0x400ull, 0x400) : NULL;
+            if (d && e[0] == 1) {
+                fprintf(stderr, "pvgdesc");
+                for (int k = 0; k < 64; k++) fprintf(stderr, " %08x", d[k]);
+                fprintf(stderr, "\n");
+            }
+        }
+    }
+    if (p->metal) {
+        uint64_t ring = p->io_regs[0], size = p->io_regs[0x8 / 8], want = p->io_regs[0x18 / 8];
+        for (uint64_t i = p->io_regs[0x20 / 8]; i < want && size; i++) {
+            uint32_t *e = hv_phys_ptr(p->m, ring + (i % size) * 16, 16);
+            if (e && e[0] == 2) hv_pvg_metal_unmap(p->metal, e[1]);
+        }
+    }
+    p->io_regs[0x20 / 8] = p->io_regs[0x18 / 8];
+    hv_gicv3_pend(p->gic, p->iosfc_irq);
+}
+
+/* Device work no doorbell took care of: a channel that had to wait for another one's work. */
 void hv_pvg_lite_poll(HvPvgLite *p) {
     if (!p) return;
-    int irq = 0;
-    if (p->root_pending) {
-        p->root_pending = 0;
-        do_root(p);
-        irq = 1;
-    }
     uint32_t chans = p->chan_pending;
     if (chans) {
         p->chan_pending = 0;
         for (uint32_t ch = 1; ch < MAX_CHANNELS; ch++)
             if (chans & (1u << ch)) do_channel(p, ch);
-        irq = 1;
-    }
-    uint32_t done = __atomic_exchange_n(&p->stamps_pending, 0, __ATOMIC_ACQ_REL);
-    if (done) {
-        p->status |= done;
-        irq = 1;
-    }
-    if (irq) hv_gicv3_pend(p->gic, p->gfx_irq);
-    if (p->iosfc_pending) {
-        p->iosfc_pending = 0;
-        if (p->tally) {
-            uint64_t ring = p->io_regs[0], table = p->io_regs[0x10 / 8], size = p->io_regs[0x8 / 8], want = p->io_regs[0x18 / 8];
-            for (uint64_t i = p->io_regs[0x20 / 8]; i < want && size; i++) {
-                uint32_t *e = hv_phys_ptr(p->m, ring + (i % size) * 16, 16);
-                uint32_t *t = table ? hv_phys_ptr(p->m, table, 64) : NULL;
-                if (!e || !t) continue;
-                fprintf(stderr, "pvgmap op %u id %u table %x %x %x %x\n", e[0], e[1], t[0], t[1], t[2], t[3]);
-                uint32_t seg = e[1] / 16, idx = e[1] % 16;
-                uint32_t *ta = hv_phys_ptr(p->m, table + seg * 4, 4);
-                uint32_t *d = ta ? hv_phys_ptr(p->m, ((uint64_t)(*ta & ~1u) << 12) + idx * 0x400ull, 0x400) : NULL;
-                if (d && e[0] == 1) {
-                    fprintf(stderr, "pvgdesc");
-                    for (int k = 0; k < 64; k++) fprintf(stderr, " %08x", d[k]);
-                    fprintf(stderr, "\n");
-                }
-            }
-        }
-        if (p->metal) {
-            uint64_t ring = p->io_regs[0], size = p->io_regs[0x8 / 8], want = p->io_regs[0x18 / 8];
-            for (uint64_t i = p->io_regs[0x20 / 8]; i < want && size; i++) {
-                uint32_t *e = hv_phys_ptr(p->m, ring + (i % size) * 16, 16);
-                if (e && e[0] == 2) hv_pvg_metal_unmap(p->metal, e[1]);
-            }
-        }
-        p->io_regs[0x20 / 8] = p->io_regs[0x18 / 8];
-        hv_gicv3_pend(p->gic, p->iosfc_irq);
+        if (__atomic_load_n(&p->status, __ATOMIC_ACQUIRE)) hv_gicv3_pend(p->gic, p->gfx_irq);
     }
 }
 
@@ -586,8 +580,7 @@ static uint64_t gfx_read(void *opaque, uint64_t off, unsigned size) {
         v = p->root_rp;
         break;
     case 0x1018:
-        v = p->status;
-        p->status = 0;
+        v = __atomic_exchange_n(&p->status, 0, __ATOMIC_ACQ_REL);
         break;
     case 0x122c: v = 1; break;
     default:
@@ -602,10 +595,16 @@ static void gfx_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
     HvPvgLite *p = opaque;
     (void)size;
     if (off >= 0x1000 && off < 0x2000) p->regs[(off - 0x1000) / 4] = (uint32_t)v;
-    if (off == 0x1008) p->root_pending = 1;
-    else if (off == 0x1020 && v < MAX_CHANNELS) p->chan_pending |= 1u << v;
-    else if (p->log && off != 0x1020) fprintf(stderr, "hengevm: pvg-lite: write +%llx = %llx\n", (unsigned long long)off, (unsigned long long)v);
-    if (off == 0x1008 || off == 0x1020) hv_machine_kick_all(p->m);
+    /* Doorbells are answered here, on the CPU that rang: no waiting for CPU 0 to come by. */
+    if (off == 0x1008) {
+        do_root(p);
+        hv_gicv3_pend(p->gic, p->gfx_irq);
+    } else if (off == 0x1020 && v < MAX_CHANNELS) {
+        do_channel(p, (uint32_t)v);
+        if (__atomic_load_n(&p->status, __ATOMIC_ACQUIRE)) hv_gicv3_pend(p->gic, p->gfx_irq);
+    } else if (p->log && off != 0x1020) {
+        fprintf(stderr, "hengevm: pvg-lite: write +%llx = %llx\n", (unsigned long long)off, (unsigned long long)v);
+    }
     if (off == 0x1220 && p->metal) hv_pvg_metal_cursor_moved(p->metal); /* the display's doorbell: the pointer moved */
 }
 
@@ -620,10 +619,7 @@ static void iosfc_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
     HvPvgLite *p = opaque;
     (void)size;
     if (off >= 0x1000 && off < 0x1040) p->io_regs[(off - 0x1000) / 8] = v;
-    if (off == 0x1018) {
-        p->iosfc_pending = 1;
-        hv_machine_kick_all(p->m);
-    }
+    if (off == 0x1018) do_mapper(p);
 }
 
 HvPvgLite *hv_pvg_lite_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint64_t iosfc_pa, int gfx_irq, int iosfc_irq) {
