@@ -65,9 +65,63 @@ static void *profile_thread(void *unused) {
     return NULL;
 }
 
-/* Debugging: HV_CLICKS="seconds:x,y;seconds:x,y" walks the pointer to a spot on
-   the screen (watching where the display says it is) and clicks, to drive a
-   guest's UI without a window. */
+/* Walks the pointer to a spot on the screen, watching where the display says
+   it is, in small steps as a hand makes: macOS accelerates big ones past the target. */
+static void pointer_to(int x, int y) {
+    const uint8_t *page = hv_pvg_lite_display_page(board.pvg);
+    for (int i = 0; page && i < 1500; i++) {
+        uint32_t at = *(const volatile uint32_t *)(page + 0xe00);
+        int dx = x - (int)(at & 0xffff), dy = y - (int)(at >> 16);
+        if (abs(dx) < 3 && abs(dy) < 3) break;
+        int sx = dx > 16 ? 16 : dx < -16 ? -16 : dx, sy = dy > 16 ? 16 : dy < -16 ? -16 : dy;
+        hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_X, sx);
+        hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_Y, sy);
+        hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+        usleep(30000);
+    }
+}
+
+static void click_here(void) {
+    hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, 1);
+    hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+    usleep(120000);
+    hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, 0);
+    hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+}
+
+static void key_event(int code, int down) {
+    hv_xhci_key_linux(board.usb, (uint16_t)code, down);
+    hv_virtio_input_send(board.keyboard, HV_EV_KEY, (uint16_t)code, down);
+    hv_virtio_input_send(board.keyboard, HV_EV_SYN, 0, 0);
+}
+
+static void key_press(int code, int shift) {
+    if (shift) key_event(42, 1), usleep(30000);
+    key_event(code, 1);
+    usleep(60000);
+    key_event(code, 0);
+    if (shift) usleep(30000), key_event(42, 0);
+    usleep(60000);
+}
+
+static void type_text(const char *t) {
+    static const char row1[] = "qwertyuiop", row2[] = "asdfghjkl", row3[] = "zxcvbnm", nums[] = "1234567890";
+    for (; *t; t++) {
+        int c = *t, up = c >= 'A' && c <= 'Z', code = 0;
+        if (up) c += 32;
+        const char *f;
+        if ((f = strchr(row1, c)) && c) code = 16 + (int)(f - row1);
+        else if ((f = strchr(row2, c)) && c) code = 30 + (int)(f - row2);
+        else if ((f = strchr(row3, c)) && c) code = 44 + (int)(f - row3);
+        else if ((f = strchr(nums, c)) && c) code = 2 + (int)(f - nums);
+        else if (c == ' ') code = 57;
+        else if (c == '.') code = 52;
+        else if (c == '-') code = 12;
+        if (code) key_press(code, up);
+    }
+}
+
+/* Debugging: HV_CLICKS="seconds:x,y;seconds:x,y" clicks on a timetable, to drive a guest's UI without a window. */
 static void *click_thread(void *unused) {
     (void)unused;
     const char *p = getenv("HV_CLICKS");
@@ -78,25 +132,53 @@ static void *click_thread(void *unused) {
         p += n;
         if (*p == ';') p++;
         while (time(NULL) - start < when) sleep(1);
-        const uint8_t *page = hv_pvg_lite_display_page(board.pvg);
-        for (int i = 0; page && i < 1500; i++) {
-            uint32_t at = *(const volatile uint32_t *)(page + 0xe00);
-            int dx = x - (int)(at & 0xffff), dy = y - (int)(at >> 16);
-            if (abs(dx) < 3 && abs(dy) < 3) break;
-            /* Small steps, as a hand makes: macOS accelerates big ones past the target. */
-            int sx = dx > 16 ? 16 : dx < -16 ? -16 : dx, sy = dy > 16 ? 16 : dy < -16 ? -16 : dy;
-            hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_X, sx);
-            hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_Y, sy);
-            hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
-            usleep(30000);
+        pointer_to(x, y);
+        fprintf(stderr, "hengevm: click (%d,%d) at %ld s\n", x, y, (long)(time(NULL) - start));
+        click_here();
+    }
+    return NULL;
+}
+
+/* Debugging: HV_INPUT_FILE=path follows a file of lines, for driving a running guest:
+   "click x y", "move x y", "key code" (Linux), "shiftkey code", "type words", "wait seconds". */
+static void *input_thread(void *unused) {
+    (void)unused;
+    FILE *f = fopen(getenv("HV_INPUT_FILE"), "a+");
+    if (!f) return NULL;
+    long at = 0;
+    for (;;) {
+        char line[512];
+        fseek(f, at, SEEK_SET);
+        if (!fgets(line, sizeof line, f) || !strchr(line, '\n')) {
+            clearerr(f);
+            usleep(200000);
+            continue;
         }
-        uint32_t at = page ? *(const volatile uint32_t *)(page + 0xe00) : 0;
-        fprintf(stderr, "hengevm: click at %u,%u (asked %d,%d) at %ld s\n", at & 0xffff, at >> 16, x, y, (long)(time(NULL) - start));
-        hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, 1);
-        hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
-        usleep(120000);
-        hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, 0);
-        hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+        at = ftell(f);
+        line[strcspn(line, "\n")] = 0;
+        int x, y;
+        if (sscanf(line, "click %d %d", &x, &y) == 2) pointer_to(x, y), click_here();
+        else if (sscanf(line, "move %d %d", &x, &y) == 2) pointer_to(x, y);
+        else if (sscanf(line, "key %d", &x) == 1) key_press(x, 0);
+        else if (sscanf(line, "shiftkey %d", &x) == 1) key_press(x, 1);
+        else if (sscanf(line, "wait %d", &x) == 1) sleep((unsigned)x);
+        else if (!strncmp(line, "type ", 5)) type_text(line + 5);
+        fprintf(stderr, "hengevm: input: %s\n", line);
+    }
+    return NULL;
+}
+
+/* Debugging: HV_WATCH=seconds says what each CPU is at, and how many frames the guest has shown. */
+static void *watch_thread(void *unused) {
+    (void)unused;
+    int secs = atoi(getenv("HV_WATCH"));
+    time_t start = time(NULL);
+    for (;;) {
+        sleep((unsigned)(secs > 0 ? secs : 5));
+        const uint8_t *page = hv_pvg_lite_display_page(board.pvg);
+        fprintf(stderr, "hengevm: watch %ld s: swaps %u on %u;", (long)(time(NULL) - start), page ? *(const volatile uint32_t *)(page + 0xf98) : 0, page ? *(const volatile uint32_t *)(page + 0xfb0) : 0);
+        for (int i = 0; i < ncpus; i++) fprintf(stderr, " %llx@%u", (unsigned long long)hv_vm_cpu(i)->pc, hv_vm_cpu(i)->el);
+        fprintf(stderr, "\n");
     }
     return NULL;
 }
@@ -371,6 +453,14 @@ int main(int argc, char **argv) {
     if (getenv("HV_CLICKS")) {
         pthread_t cl;
         pthread_create(&cl, NULL, click_thread, NULL);
+    }
+    if (getenv("HV_INPUT_FILE")) {
+        pthread_t in;
+        pthread_create(&in, NULL, input_thread, NULL);
+    }
+    if (getenv("HV_WATCH")) {
+        pthread_t wa;
+        pthread_create(&wa, NULL, watch_thread, NULL);
     }
     if (getenv("HV_TYPE_AT")) {
         pthread_t ty;

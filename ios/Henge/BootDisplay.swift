@@ -1,4 +1,5 @@
 import SwiftUI
+import QuartzCore
 
 /// The Mac's screen, refreshed a few times a second: what its GPU draws once
 /// macOS is up. Before that, the boot framebuffer, which only ever holds the
@@ -6,27 +7,38 @@ import SwiftUI
 /// over it is the app's own.
 struct BootDisplay: View {
     @State private var image: CGImage?
+    @State private var gpuLive = false
 
     var body: some View {
         ZStack {
             Color.black
-            if let image {
-                Image(decorative: image, scale: 1).resizable().interpolation(.medium).aspectRatio(contentMode: .fit)
-                if image.height > image.width {
+            if !gpuLive {
+                if let image {
+                    Image(decorative: image, scale: 1).resizable().interpolation(.medium).aspectRatio(contentMode: .fit)
+                    if image.height > image.width {
+                        Image(systemName: "apple.logo")
+                            .font(.system(size: 44))
+                            .foregroundStyle(.white)
+                    }
+                } else {
                     Image(systemName: "apple.logo")
                         .font(.system(size: 44))
                         .foregroundStyle(.white)
                 }
-            } else {
-                Image(systemName: "apple.logo")
-                    .font(.system(size: 44))
-                    .foregroundStyle(.white)
             }
+            GPUScreen().allowsHitTesting(false)
         }
         .task {
-            while !Task.isCancelled {
+            // Once macOS draws with the GPU the frames go straight to GPUScreen:
+            // nothing to copy here any more.
+            while !Task.isCancelled && !gpuLive {
+                if henge_vm_gpu_frames() > 0 {
+                    gpuLive = true
+                    image = nil
+                    break
+                }
                 image = Self.snapshot() ?? image
-                try? await Task.sleep(nanoseconds: 66_000_000)
+                try? await Task.sleep(nanoseconds: 100_000_000)
             }
         }
     }
@@ -43,4 +55,23 @@ struct BootDisplay: View {
                        space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: info, provider: provider, decode: nil,
                        shouldInterpolate: true, intent: .defaultIntent)
     }
+}
+
+/// A layer the engine draws the Mac's frames into, with the GPU, without the main thread.
+private struct GPUScreen: UIViewRepresentable {
+    final class Screen: UIView {
+        override class var layerClass: AnyClass { CAMetalLayer.self }
+    }
+
+    func makeUIView(context: Context) -> Screen {
+        let view = Screen()
+        view.backgroundColor = .clear
+        view.isOpaque = false
+        view.layer.contentsGravity = .resizeAspect
+        view.layer.isOpaque = false
+        henge_vm_set_display_layer(Unmanaged.passUnretained(view.layer).toOpaque())
+        return view
+    }
+
+    func updateUIView(_ view: Screen, context: Context) {}
 }

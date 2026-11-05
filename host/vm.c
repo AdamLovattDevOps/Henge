@@ -106,22 +106,72 @@ static int fail(char *err, size_t n, const char *msg) {
     return -1;
 }
 
-/* An illegal instruction in translated code means a branch landed where no
-   translation is: say where, for a crash report cannot. */
-static struct sigaction prior_ill;
+/* A branch landing where no translation is (an illegal instruction, or a fault
+   fetching one): say where, and which direct branches in translated code lead
+   there, for a crash report cannot. */
+static struct sigaction prior_ill, prior_bus, prior_segv;
 static void on_ill(int sig, siginfo_t *info, void *ctx) {
     ucontext_t *uc = ctx;
     uint64_t pc = uc->uc_mcontext->__ss.__pc, rx = (uint64_t)(uintptr_t)m.jit.base, size = (uint64_t)m.jit.capacity * 4;
-    if (pc >= rx && pc < rx + size) {
-        fprintf(stderr, "hengevm: illegal instruction in translated code at +%llx of %llx (used %llx), word %08x, full flushes %llu, lr %llx\n",
-                (unsigned long long)(pc - rx), (unsigned long long)size, (unsigned long long)m.jit.used * 4, *(uint32_t *)(uintptr_t)pc, (unsigned long long)m.stats.flush_full, (unsigned long long)uc->uc_mcontext->__ss.__lr);
+    uint64_t used = (uint64_t)m.jit.used * 4;
+    int in_rx = pc >= rx && pc < rx + size;
+    int fetch = (uint64_t)(uintptr_t)info->si_addr == pc;
+    if (sig == SIGILL || in_rx || fetch) {
+        fprintf(stderr, "hengevm: signal %d in translated code: pc %llx (rx %llx size %llx used %llx, pc is rx%+lld), full flushes %llu, lr %llx, addr %p\n",
+                sig, (unsigned long long)pc, (unsigned long long)rx, (unsigned long long)size, (unsigned long long)used, (long long)(pc - rx),
+                (unsigned long long)m.stats.block_flushes, (unsigned long long)uc->uc_mcontext->__ss.__lr, info->si_addr);
+        for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%llx%c", i, (unsigned long long)uc->uc_mcontext->__ss.__x[i], i % 6 == 5 ? '\n' : ' ');
+        fprintf(stderr, "\n");
         for (int i = 0; i < ncpus; i++)
-            fprintf(stderr, "  cpu %d: guest pc %llx el%u\n", i, (unsigned long long)cpus[i].pc, cpus[i].el);
-    } else {
-        fprintf(stderr, "hengevm: illegal instruction outside translated code at %llx (region %llx size %llx), info addr %p\n", (unsigned long long)pc, (unsigned long long)rx, (unsigned long long)size, info->si_addr);
+            fprintf(stderr, "  cpu %d: guest pc %llx el%u miss site %llx\n", i, (unsigned long long)cpus[i].pc, cpus[i].el, (unsigned long long)cpus[i].miss_site);
+        if (in_rx) { /* the code it ran up to here, as it stands */
+            uint64_t from = pc - 0x180 < rx ? rx : pc - 0x180;
+            fprintf(stderr, "  words from rx+%llx:", (unsigned long long)(from - rx));
+            for (uint64_t at = from; at < pc + 0x20 && at < rx + size; at += 4) {
+                if (((at - from) & 0x1f) == 0) fprintf(stderr, "\n   ");
+                fprintf(stderr, " %08x", *(const uint32_t *)(uintptr_t)at);
+            }
+            fprintf(stderr, "\n");
+        }
+        if (!in_rx || pc >= rx + used) {
+            /* Who branches there? */
+            const uint32_t *w = (const uint32_t *)(uintptr_t)rx;
+            int found = 0;
+            uint64_t words = used / 4 < m.jit.capacity ? used / 4 : m.jit.capacity;
+            for (uint64_t k = 0; k < words && found < 8; k++) {
+                uint32_t i = w[k];
+                int64_t off;
+                if ((i & 0x7c000000u) == 0x14000000u) off = (int64_t)(i << 6) >> 6;
+                else if ((i & 0xff000010u) == 0x54000000u || (i & 0x7e000000u) == 0x34000000u) off = (int64_t)(int32_t)(i << 8) >> 13;
+                else if ((i & 0x7e000000u) == 0x36000000u) off = (int64_t)(int32_t)(i << 13) >> 18;
+                else continue;
+                if (rx + k * 4 + (uint64_t)(off * 4) != pc) continue;
+                found++;
+                fprintf(stderr, "  branch at rx+%llx (word %08x) leads there; around it:", (unsigned long long)k * 4, i);
+                for (int64_t d = -6; d <= 3; d++)
+                    if ((int64_t)k + d >= 0 && (uint64_t)((int64_t)k + d) < words) fprintf(stderr, " %08x", w[k + d]);
+                fprintf(stderr, "\n");
+            }
+            if (!found) fprintf(stderr, "  no direct branch in %llu MB of code leads there\n", (unsigned long long)(used >> 20));
+            /* Which slot or cache entry holds it? */
+            for (uint32_t k = 0; k < m.max_slots; k++)
+                if (m.slots && m.slots[k] == pc) fprintf(stderr, "  chain slot %u holds it\n", k);
+        }
+        fflush(stderr);
     }
-    fflush(stderr);
-    sigaction(sig, &prior_ill, NULL);
+    struct sigaction *prior = sig == SIGILL ? &prior_ill : sig == SIGBUS ? &prior_bus : &prior_segv;
+    sigaction(sig, prior, NULL);
+}
+
+static void *display_layer;
+
+void hv_vm_set_display_layer(void *layer) {
+    display_layer = layer;
+    if (board.pvg) hv_pvg_lite_set_layer(board.pvg, layer);
+}
+
+uint64_t hv_vm_gpu_frames(void) {
+    return board.pvg ? hv_pvg_lite_gpu_frames(board.pvg) : 0;
 }
 
 int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
@@ -129,6 +179,9 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     struct sigaction ill = {.sa_flags = SA_SIGINFO | SA_ONSTACK};
     ill.sa_sigaction = on_ill;
     sigaction(SIGILL, &ill, &prior_ill);
+    sigaction(SIGBUS, &ill, &prior_bus);
+    sigaction(SIGSEGV, &ill, &prior_segv);
+    signal(SIGPIPE, SIG_IGN); /* a guest connection closing at the far end must not end the machine */
     if (hv_disk_open(&disk, c->disk, 0, 0) != 0) return fail(err, errlen, "Cannot open the disk image.");
     if (hv_disk_open(&aux, c->aux, c->aux_offset ? c->aux_offset : 16384, 0) != 0)
         return fail(err, errlen, "Cannot open the auxiliary storage.");
@@ -157,6 +210,7 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     if (board.snd && !c->no_sound) hv_audio_attach(board.snd);
     board.poll = board_poll;
     if (board.vusb && getenv("HV_VUSB_PROBE")) hv_usb_probe_start(board.vusb);
+    if (display_layer && board.pvg) hv_pvg_lite_set_layer(board.pvg, display_layer);
     return 0;
 }
 

@@ -51,6 +51,7 @@ struct HvPvgLite {
     int root_pending, iosfc_pending;
     uint64_t display_pa;
     uint64_t swaps;
+    void *layer; /* where frames go, once there is a replay */
     uint32_t task_root[512]; /* page of each task's root, by the id in commands */
     uint64_t task_objects[512], task_placement[512]; /* task offsets of its object lists */
     uint8_t obj_seen[512][8192];
@@ -228,6 +229,30 @@ uint32_t hv_pvg_lite_task_page(HvPvgLite *p, uint32_t task, uint64_t offset) {
     return page;
 }
 
+/* n pages' numbers from a task page on, 0 for those not mapped: a table at a time, for it is asked often. */
+void hv_pvg_lite_task_pages(HvPvgLite *p, uint32_t task, uint64_t first, uint64_t n, uint32_t *out) {
+    memset(out, 0, n * 4);
+    if (task >= 512 || !p->task_root[task]) return;
+    uint32_t *root = hv_phys_ptr(p->m, (uint64_t)p->task_root[task] << 14, 0x4000);
+    if (!root) return;
+    uint32_t top = root[0], depth = root[1];
+    if (depth < 1 || depth > 3) return;
+    for (uint64_t i = 0; i < n;) {
+        uint64_t vpn = first + i;
+        uint32_t page = top;
+        for (int level = (int)depth - 1; level >= 1 && page; level--) {
+            uint32_t *t = hv_phys_ptr(p->m, (uint64_t)page << 14, 0x4000);
+            page = t ? t[(vpn >> (12 * level)) & 0xfff] & 0x7fffffff : 0;
+        }
+        uint32_t *leaf = page ? hv_phys_ptr(p->m, (uint64_t)page << 14, 0x4000) : NULL;
+        uint64_t in = vpn & 0xfff, run = 4096 - in;
+        if (run > n - i) run = n - i;
+        if (leaf)
+            for (uint64_t k = 0; k < run; k++) out[i + k] = leaf[in + k] & 0x7fffffff;
+        i += run;
+    }
+}
+
 uint8_t *hv_pvg_lite_page(HvPvgLite *p, uint32_t guest_page) {
     return hv_phys_ptr(p->m, (uint64_t)guest_page << 14, 0x4000);
 }
@@ -247,6 +272,16 @@ void hv_pvg_lite_complete(HvPvgLite *p, uint32_t ch, uint32_t stamp) {
     if (s) __atomic_store_n(s, stamp, __ATOMIC_RELEASE);
     __atomic_fetch_or(&p->stamps_pending, 1u << ch, __ATOMIC_RELEASE);
     hv_machine_kick_all(p->m);
+}
+
+void hv_pvg_lite_set_layer(HvPvgLite *p, void *layer) {
+    if (!p) return;
+    p->layer = layer;
+    if (p->metal) hv_pvg_metal_set_layer(p->metal, layer);
+}
+
+uint64_t hv_pvg_lite_gpu_frames(HvPvgLite *p) {
+    return p && p->metal ? hv_pvg_metal_gpu_frames(p->metal) : 0;
 }
 
 int hv_pvg_lite_frame(HvPvgLite *p, const uint8_t **pixels, uint32_t *width, uint32_t *height) {
@@ -432,6 +467,7 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
         if (!p->metal_tried) {
             p->metal_tried = 1;
             if (!getenv("HV_PVG_NO_METAL")) p->metal = hv_pvg_metal_create(p);
+            if (p->metal && p->layer) hv_pvg_metal_set_layer(p->metal, p->layer);
         }
         channel_command(p, table, size, rd, hdr);
         if (p->metal) {

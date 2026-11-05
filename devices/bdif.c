@@ -63,7 +63,7 @@ static uint32_t usb_xfer(HvBdif *b, uint64_t chain, int write, uint8_t *buf, uin
             if (n) {
                 void *p = hv_phys_ptr(b->m, dsc[i].addr, n);
                 if (!p) break;
-                if (write) memcpy(p, buf + done, n);
+                if (write) memcpy(p, buf + done, n), hv_dma_written(b->m, dsc[i].addr, n);
                 else memcpy(buf + done, p, n);
                 done += n;
             }
@@ -165,7 +165,7 @@ static void command(HvBdif *b, HvDisk *disk, uint64_t req_pa) {
         if (hv_phys_read(b->m, req[0].addr, sector, sizeof sector) == 0 && req[1].len <= MAX_LEN &&
             req[1].flags == DATA_FLAGS_READ) {
             void *dst = hv_phys_ptr(b->m, req[1].addr, req[1].len);
-            if (dst && hv_disk_read(disk, (uint64_t)sector[2] * 512, dst, req[1].len) == 0) ret = 0;
+            if (dst && hv_disk_read(disk, (uint64_t)sector[2] * 512, dst, req[1].len) == 0) ret = 0, hv_dma_written(b->m, req[1].addr, req[1].len);
         }
     }
     if (b->m->log >= 2) {

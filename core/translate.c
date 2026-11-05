@@ -309,6 +309,7 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
     }
     uint64_t *slot = &e->m->slots[slot_index];
     *slot = 0;
+    e->m->slot_site[slot_index] = NULL; /* until placed: what it held is a dropped block's */
     e->m->slot_xa[slot_index] = xa;
     e->m->slot_xpa[slot_index] = 0;
     uint32_t to_exit = ~0u;

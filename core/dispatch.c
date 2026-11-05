@@ -40,7 +40,19 @@ static void park(HvCpu *cpu) {
 
 static void unpark(HvCpu *cpu) {
     HvPerCpu *p = cpu->pc_state;
-    __atomic_store_n(&p->active, 1, __ATOMIC_SEQ_CST);
+    HvMachine *m = cpu->m;
+    /* A flush rewrites every CPU's branch caches and their salts, taking "parked"
+       to mean nobody is using them. So not back while one runs: hv_cpu_process_requests
+       below may reach them, and a salt read before the flush and stored after it
+       brings the entries of dropped translations back to life. */
+    for (;;) {
+        __atomic_store_n(&p->active, 1, __ATOMIC_SEQ_CST);
+        if (!__atomic_load_n(&m->stw_active, __ATOMIC_SEQ_CST)) break;
+        __atomic_store_n(&p->active, 0, __ATOMIC_SEQ_CST);
+        pthread_mutex_lock(&m->stw_mu);
+        while (m->stw_active) pthread_cond_wait(&m->stw_cv, &m->stw_mu);
+        pthread_mutex_unlock(&m->stw_mu);
+    }
     __atomic_store_n(&p->tlb_live, 1, __ATOMIC_SEQ_CST);
     hv_cpu_process_requests(cpu); /* what came in while it was parked */
 }

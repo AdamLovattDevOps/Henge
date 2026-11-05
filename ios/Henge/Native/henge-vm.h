@@ -41,6 +41,10 @@ void henge_vm_mouse_button(int button, int down);
 
 /* The boot framebuffer (Apple logo and progress bar), 32-bit BGRA, or -1 if
    the kernel has not got that far. The pixels are the guest's live memory. */
+/// Where the Mac's GPU frames go: a CAMetalLayer. Keep it alive while the machine runs.
+void henge_vm_set_display_layer(void *layer);
+/// How many frames have gone to it.
+uint64_t henge_vm_gpu_frames(void);
 int henge_vm_boot_display(const uint8_t **pixels, int *width, int *height, int *stride);
 
 /* The largest single mapping the address space takes right now, in MB (the

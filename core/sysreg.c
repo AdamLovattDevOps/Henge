@@ -8,6 +8,7 @@
 #include "machine.h"
 #include "memop.h"
 #include "mmu.h"
+#include <stdlib.h>
 
 /* System registers are named by op0:op1:CRn:CRm:op2, which is bits 20..5 of MRS/MSR. */
 #define R(op0, op1, crn, crm, op2) ((op0) << 14 | (op1) << 11 | (crn) << 7 | (crm) << 3 | (op2))
@@ -397,9 +398,14 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
         if (!w.fsc) hv_invalidate_code(cpu->m, w.pa);
         return 0;
     }
-    if (crn == 7 && (crm == 1 || crm == 5)) { /* IC IALLUIS, IALLU: drop every translation */
-        cpu->m->flush_pending = 1;
+    if (crn == 7 && (crm == 1 || crm == 5)) { /* IC IALLUIS, IALLU */
+        /* Translations are never out of date: CPU writes to code pages and device
+           DMA drop them as they happen. Dropping them all here cost a full round of
+           translating everything again, many times a boot. HV_IC_FLUSH: as before. */
+        static int flush = -1;
+        if (flush < 0) flush = getenv("HV_IC_FLUSH") != NULL;
         cpu->m->stats.flush_ic++;
+        if (flush) cpu->m->flush_pending = 1;
         return 0;
     }
     if (crn == 7 && crm == 8 && op1 == 0 && op2 <= 3) { /* AT S1E1R, S1E1W, S1E0R, S1E0W */
