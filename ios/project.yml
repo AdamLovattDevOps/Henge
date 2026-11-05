@@ -27,7 +27,13 @@ targets:
           - "Resources/**"
           - "Info.plist"
           - "Henge.entitlements"
+          - "AppIcon.icon/**"
+          - "AppIcon.icon"
       - path: Henge/Resources
+        buildPhase: resources
+      # Icon Composer's document: the app icon, which iOS renders in Liquid Glass.
+      - path: Henge/AppIcon.icon
+        type: file
         buildPhase: resources
       # The messages the app and its JIT helper exchange.
       - path: HengeJITHelper/HengeJITMessages.swift
