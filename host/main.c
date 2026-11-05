@@ -516,6 +516,10 @@ static void *input_thread(void *unused) {
         int x, y;
         if (sscanf(line, "click %d %d", &x, &y) == 2) pointer_to(x, y), click_here();
         else if (sscanf(line, "move %d %d", &x, &y) == 2) pointer_to(x, y);
+        else if (!strncmp(line, "press", 5) || !strncmp(line, "release", 7)) {
+            hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, line[0] == 'p');
+            hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+        }
         else if (sscanf(line, "key %d", &x) == 1) key_press(x, 0);
         else if (sscanf(line, "shiftkey %d", &x) == 1) key_press(x, 1);
         else if (sscanf(line, "cmdkey %d", &x) == 1) { /* with Command held: 125 is the left one */

@@ -920,8 +920,9 @@ typedef struct {
 }
 
 - (void)render:(id<MTLRenderCommandEncoder>)e tag:(uint32_t)tag rec:(Rec)r task:(uint32_t)task {
-    if (!pipeline_set && (tag == 1 || tag == 3 || tag == 6 || tag == 7 || tag == 13 || tag == 155 || tag == 162)) return;
-    if (tracing && (tag == 1 || tag == 3 || tag == 6 || tag == 7 || tag == 8 || tag == 9 || tag == 155 || tag == 162)) fprintf(stderr, "trace:  draw tag %u\n", tag);
+    BOOL draw = tag <= 13 || tag == 16 || tag == 17 || tag == 28 || tag == 29 || tag == 155 || tag == 162;
+    if (!pipeline_set && draw) return;
+    if (tracing && draw) fprintf(stderr, "trace:  draw tag %u\n", tag);
     switch (tag) {
     case 24: { /* {fence, stages} */
         id f = [self get:U32(0) task:task];
@@ -1160,6 +1161,50 @@ typedef struct {
     case 8: { /* {primitive, index type, ref, count 64, offset 64, instances 64} */
         id<MTLBuffer> b = [self get:U32(4) task:task];
         if (b) [e drawIndexedPrimitives:(MTLPrimitiveType)U16(0) indexCount:(NSUInteger)U64(8) indexType:(MTLIndexType)U16(2) indexBuffer:b indexBufferOffset:(NSUInteger)U64(16) instanceCount:(NSUInteger)U64(24)];
+        draws++;
+        break;
+    }
+    case 0: /* {primitive 32, start 64, count 64} */
+        [e drawPrimitives:(MTLPrimitiveType)U32(0) vertexStart:(NSUInteger)U64(4) vertexCount:(NSUInteger)U64(12)];
+        draws++;
+        break;
+    case 2: /* {start 64, count 64, instances 64, primitive} */
+        [e drawPrimitives:(MTLPrimitiveType)U16(24) vertexStart:(NSUInteger)U64(0) vertexCount:(NSUInteger)U64(8) instanceCount:(NSUInteger)U64(16)];
+        draws++;
+        break;
+    case 4: /* {start 64, count 64, instances 64, base instance 64, primitive} */
+        [e drawPrimitives:(MTLPrimitiveType)U16(32) vertexStart:(NSUInteger)U64(0) vertexCount:(NSUInteger)U64(8) instanceCount:(NSUInteger)U64(16) baseInstance:(NSUInteger)U64(24)];
+        draws++;
+        break;
+    case 5: /* {start, count, instances, base instance, primitive}, all 16 */
+        [e drawPrimitives:(MTLPrimitiveType)U16(8) vertexStart:U16(0) vertexCount:U16(2) instanceCount:U16(4) baseInstance:U16(6)];
+        draws++;
+        break;
+    case 10: case 28: { /* {primitive, index type, ref, offset 64, count 64, instances 64, base vertex 64, base instance 64} */
+        id<MTLBuffer> b = [self get:U32(4) task:task];
+        if (b) [e drawIndexedPrimitives:(MTLPrimitiveType)U16(0) indexCount:(NSUInteger)U64(16) indexType:(MTLIndexType)U16(2) indexBuffer:b indexBufferOffset:(NSUInteger)U64(8)
+                          instanceCount:(NSUInteger)U64(24) baseVertex:(NSInteger)U64(32) baseInstance:(NSUInteger)U64(40)];
+        draws++;
+        break;
+    }
+    case 11: case 29: { /* {primitive, index type, ref, offset 16, count 16, instances 16, base vertex 16, base instance 16}; 29's base vertex can be negative */
+        id<MTLBuffer> b = [self get:U32(4) task:task];
+        NSInteger base_vertex = tag == 29 ? (NSInteger)(int16_t)U16(14) : (NSInteger)U16(14);
+        if (b) [e drawIndexedPrimitives:(MTLPrimitiveType)U16(0) indexCount:U16(10) indexType:(MTLIndexType)U16(2) indexBuffer:b indexBufferOffset:U16(8)
+                          instanceCount:U16(12) baseVertex:base_vertex baseInstance:U16(16)];
+        draws++;
+        break;
+    }
+    case 16: { /* {ref, primitive 16, 2 unused, offset 64} */
+        id<MTLBuffer> b = [self get:U32(0) task:task];
+        if (b) [e drawPrimitives:(MTLPrimitiveType)U16(4) indirectBuffer:b indirectBufferOffset:(NSUInteger)U64(8)];
+        draws++;
+        break;
+    }
+    case 17: { /* {primitive, index type, index ref, indirect ref, index offset 64, indirect offset 64} */
+        id<MTLBuffer> index = [self get:U32(4) task:task], indirect = [self get:U32(8) task:task];
+        if (index && indirect) [e drawIndexedPrimitives:(MTLPrimitiveType)U16(0) indexType:(MTLIndexType)U16(2) indexBuffer:index indexBufferOffset:(NSUInteger)U64(12)
+                                          indirectBuffer:indirect indirectBufferOffset:(NSUInteger)U64(20)];
         draws++;
         break;
     }

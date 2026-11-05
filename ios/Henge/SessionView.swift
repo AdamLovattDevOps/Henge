@@ -21,6 +21,8 @@ struct SessionView: View {
     @State private var lastDrag: CGPoint?
     @State private var dragDistance: CGFloat = 0
     @State private var dragStart = Date()
+    @State private var holding = false
+    @State private var holdTimer: Task<Void, Never>?
     @State private var showDetails = false
     @Environment(\.verticalSizeClass) private var verticalSize
 
@@ -31,7 +33,7 @@ struct SessionView: View {
                 if verticalSize != .compact {
                     Text(phase).font(.footnote).foregroundStyle(.secondary).padding(.top, 6)
                     if let error { Text(error).foregroundStyle(.red).padding(.horizontal) }
-                    Text("Drag to move the pointer, tap to click.").font(.footnote).foregroundStyle(.secondary).padding(.top, 2)
+                    Text("Drag to move the pointer, tap to click. Touch and hold, then drag, to drag something.").font(.footnote).foregroundStyle(.secondary).padding(.top, 2)
                     Spacer()
                 }
                 KeyboardCatcher(active: $typing).frame(width: 0, height: 0)
@@ -64,6 +66,7 @@ struct SessionView: View {
     }
 
     /// The Mac's screen, used like a trackpad: pointer speed suits a 1920-wide screen on a small one.
+    /// A finger held still for a moment presses the button, until it lifts: that is how to drag.
     private var screen: some View {
         BootDisplay()
             .aspectRatio(16.0 / 9.0, contentMode: .fit)
@@ -78,11 +81,26 @@ struct SessionView: View {
                         } else {
                             dragDistance = 0
                             dragStart = Date()
+                            holdTimer = Task {
+                                try? await Task.sleep(nanoseconds: 400_000_000)
+                                guard !Task.isCancelled, lastDrag != nil, dragDistance < 8 else { return }
+                                holding = true
+                                henge_vm_mouse_button(rightClick ? 1 : 0, 1)
+                                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                            }
                         }
                         lastDrag = value.location
                     }
                     .onEnded { _ in
                         lastDrag = nil
+                        holdTimer?.cancel()
+                        holdTimer = nil
+                        if holding {
+                            holding = false
+                            henge_vm_mouse_button(rightClick ? 1 : 0, 0)
+                            rightClick = false
+                            return
+                        }
                         guard dragDistance < 8, Date().timeIntervalSince(dragStart) < 0.4 else { return }
                         let button: Int32 = rightClick ? 1 : 0
                         henge_vm_mouse_button(button, 1)
