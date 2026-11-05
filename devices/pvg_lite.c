@@ -30,6 +30,7 @@
    descriptor table, +1008 size, +1018 submitted index, +1020 completed index.
    Ring entries are {op (1 map, 2 unmap, 3 test), mapping id, result, 0}. */
 
+#include <unistd.h>
 #include "pvg_lite.h"
 
 #include <stdio.h>
@@ -403,7 +404,7 @@ static void tally_exec(HvPvgLite *p, const uint32_t *table, uint32_t size, uint3
 
 /* Commands that do something even without a GPU to run them. */
 static void channel_command(HvPvgLite *p, const uint32_t *table, uint32_t size, uint32_t rd, const uint32_t *hdr) {
-    uint32_t op = hdr[0] & 0xffff, args[32], skip = hdr[0] >> 16 ? 8 : 0; /* a barrier comes first */
+    uint32_t op = hdr[0] & 0xffff, args[32], skip = (hdr[0] >> 16) * 8; /* the barriers come first */
     uint32_t n = hdr[1] > 12 + skip ? hdr[1] - 12 - skip : 0;
     if (n > sizeof args) n = sizeof args;
     if (op == 0x38) {
@@ -444,7 +445,7 @@ uint8_t *hv_pvg_lite_display_page(HvPvgLite *p) {
 }
 
 void hv_pvg_lite_command(HvPvgLite *p, const uint32_t *cmd, uint32_t len) {
-    uint32_t op = cmd[0] & 0xffff, skip = cmd[0] >> 16 ? 8 : 0;
+    uint32_t op = cmd[0] & 0xffff, skip = (cmd[0] >> 16) * 8;
     uint32_t n = len > 12 + skip ? len - 12 - skip : 0;
     const uint32_t *args = (const uint32_t *)((const uint8_t *)cmd + 12 + skip);
     if (op == 1 && n >= 8) display_set_page(p, (uint64_t)args[1] << 14);
@@ -479,18 +480,28 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
             break;
         }
         if (p->log) fprintf(stderr, "hengevm: pvg-lite: ch %u op %x len %x stamp %x\n", ch, hdr[0], hdr[1], hdr[2]);
+        {   /* HV_PVG_TRACE_FILE exists: the order commands reach the device in, with what a swap says */
+            static const char *tf; static int tf_read;
+            if (!tf_read) tf_read = 1, tf = getenv("HV_PVG_TRACE_FILE");
+            if (tf && access(tf, F_OK) == 0) {
+                uint32_t w[12] = {0};
+                ring_read(p, table, size, rd + 12, w, hdr[1] - 12 < sizeof w ? hdr[1] - 12 : sizeof w);
+                fprintf(stderr, "trace: dev ch %u op %x len %u stamp %x sub %x args %x %x %x %x %x %x %x %x\n", ch, hdr[0], hdr[1], hdr[2], p->submitted[ch], w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+            }
+        }
         if (!p->metal_tried) {
             p->metal_tried = 1;
             if (!getenv("HV_PVG_NO_METAL")) p->metal = hv_pvg_metal_create(p);
             if (p->metal && p->layer) hv_pvg_metal_set_layer(p->metal, p->layer);
         }
-        if (p->metal && (hdr[0] >> 16)) {
-            /* {channel, stamp}: this waits for that channel's work, such as a swap for
-               the drawing of the frame it shows. All of it goes through one worker in
-               order, so everything up to the stamp has to be handed over first, or the
-               screen shows a frame half drawn. */
+        int blocked = 0;
+        for (uint32_t k = 0; p->metal && k < hdr[0] >> 16 && !blocked; k++) {
+            /* {channel, stamp}, as many as bits 31..16 say: this waits for that channel's
+               work, such as a swap for the drawing of the frame it shows. All of it goes
+               through one worker in order, so everything up to the stamp has to be handed
+               over first, or the screen shows a frame half drawn. */
             uint32_t b[2] = {0, 0};
-            ring_read(p, table, size, rd + 12, b, 8);
+            ring_read(p, table, size, rd + 12 + 8 * k, b, 8);
             if (b[0] && b[0] < MAX_CHANNELS && b[0] != ch) {
                 p->barriers++;
                 if ((int32_t)(p->submitted[b[0]] - b[1]) < 0) {
@@ -501,6 +512,7 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
                     if (++p->barrier_waits[ch] < 20000) { /* not written yet: this channel waits for a later poll */
                         p->barrier_retries++;
                         p->chan_pending |= 1u << ch;
+                        blocked = 1;
                         break;
                     }
                     p->barrier_timeouts++;
@@ -509,6 +521,7 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
                 p->barrier_waits[ch] = 0;
             }
         }
+        if (blocked) break;
         channel_command(p, table, size, rd, hdr);
         p->submitted[ch] = hdr[2];
         if (p->metal) {

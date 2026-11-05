@@ -921,7 +921,7 @@ typedef struct {
 
 - (void)render:(id<MTLRenderCommandEncoder>)e tag:(uint32_t)tag rec:(Rec)r task:(uint32_t)task {
     if (!pipeline_set && (tag == 1 || tag == 3 || tag == 6 || tag == 7 || tag == 13 || tag == 155 || tag == 162)) return;
-    if (tracing && (tag == 1 || tag == 3 || tag == 6 || tag == 7 || tag == 155 || tag == 162)) fprintf(stderr, "trace:  draw tag %u\n", tag);
+    if (tracing && (tag == 1 || tag == 3 || tag == 6 || tag == 7 || tag == 8 || tag == 9 || tag == 155 || tag == 162)) fprintf(stderr, "trace:  draw tag %u\n", tag);
     switch (tag) {
     case 24: { /* {fence, stages} */
         id f = [self get:U32(0) task:task];
@@ -999,6 +999,7 @@ typedef struct {
         MTLScissorRect s;
         memcpy(&s, r.p, sizeof s);
         [e setScissorRect:s];
+        if (tracing) fprintf(stderr, "trace:  scissor %lu %lu %lu %lu\n", (unsigned long)s.x, (unsigned long)s.y, (unsigned long)s.width, (unsigned long)s.height);
         break;
     }
     case 130: {
@@ -1459,7 +1460,10 @@ typedef struct {
 /* Returns YES if the GPU's completion gives the stamp back. */
 - (BOOL)exec:(const uint32_t *)a length:(uint32_t)len channel:(uint32_t)ch stamp:(uint32_t)stamp {
     uint32_t task = a[0], nres = a[1], nbuf = a[2];
-    if (12 + nres * 8ull + nbuf * 16ull > len) return NO;
+    if (12 + nres * 8ull + nbuf * 16ull > len) { /* never quietly: a lost job is a frame that never gets drawn */
+        [self complain:[NSString stringWithFormat:@"exec of %u bytes dropped: task %u, %u resources, %u buffers", len, task, nres, nbuf]];
+        return NO;
+    }
     const uint32_t *res = a + 3;
     const uint8_t *bufs = (const uint8_t *)(res + nres * 2);
     static const char *trace_file;
@@ -1990,7 +1994,7 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
     HvReplay *r = (__bridge HvReplay *)m;
     dispatch_async(r->worker, ^{
         @autoreleasepool {
-            uint32_t op = cmd[0] & 0xffff, skip = cmd[0] >> 16 ? 8 : 0;
+            uint32_t op = cmd[0] & 0xffff, skip = (cmd[0] >> 16) * 8; /* the barriers come first */
             const uint32_t *args = (const uint32_t *)((const uint8_t *)cmd + 12 + skip);
             uint32_t n = len > 12 + skip ? len - 12 - skip : 0;
             BOOL gpu_completes = NO;
