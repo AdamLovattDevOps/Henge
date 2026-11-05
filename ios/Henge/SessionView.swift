@@ -64,7 +64,7 @@ struct SessionView: View {
     /// The translator's own tables (blocks, hash, slots) take about 400 MB more.
     private func guestRAM() -> UInt64 {
         let available = UInt64(henge_available_memory()) >> 20
-        let fits = available > 1400 ? (available - 900) / 512 * 512 : 0
+        let fits = available > 2000 ? (available - 1500) / 512 * 512 : 0 // the phone's log: 1.5 GB is not too much once the GPU is drawing
         return min(UInt64(mac.ramMB), fits)
     }
 
@@ -84,6 +84,7 @@ struct SessionView: View {
         started = Date()
         var lastBlocks = henge_vm_blocks()
         var lastTime = Date()
+        var tick = 0
         while !Task.isCancelled {
             state = henge_vm_state()
             cpusOn = henge_vm_cpus_on()
@@ -96,6 +97,8 @@ struct SessionView: View {
             framesIn = henge_vm_net_frames(0)
             log = Array(HengeLog.recentLines(200))
             if state == 2 { break }
+            tick += 1
+            if tick % 30 == 0 { HengeLog.logFootprint("session") } // how close to the limit, for a memory kill leaves no crash report
             try? await Task.sleep(nanoseconds: 1_000_000_000)
         }
     }

@@ -232,6 +232,10 @@ uint8_t *hv_pvg_lite_page(HvPvgLite *p, uint32_t guest_page) {
     return hv_phys_ptr(p->m, (uint64_t)guest_page << 14, 0x4000);
 }
 
+void *hv_pvg_lite_phys(HvPvgLite *p, uint64_t pa, uint64_t length) {
+    return hv_phys_ptr(p->m, pa, length);
+}
+
 uint64_t hv_pvg_lite_task_objects(HvPvgLite *p, uint32_t task) {
     return task < 512 ? p->task_objects[task] : 0;
 }
@@ -378,6 +382,15 @@ static void channel_command(HvPvgLite *p, const uint32_t *table, uint32_t size, 
     else display_swap(p, (uint64_t)args[3] << 32 | args[2], args);
 }
 
+/* The mapper's table: a u32 per 16 KB of descriptors (16 of them), physical
+   address >> 12 with bit 0 meaning present. */
+const uint8_t *hv_pvg_lite_surface(HvPvgLite *p, uint32_t mapping) {
+    uint64_t table = p->io_regs[0x10 / 8];
+    uint32_t *e = table ? hv_phys_ptr(p->m, table + (mapping / 16) * 4ull, 4) : NULL;
+    if (!e || !(*e & 1)) return NULL;
+    return hv_phys_ptr(p->m, ((uint64_t)(*e & ~1u) << 12) + (mapping % 16) * 0x400ull, 0x400);
+}
+
 void hv_pvg_lite_command(HvPvgLite *p, const uint32_t *cmd, uint32_t len) {
     uint32_t op = cmd[0] & 0xffff, skip = cmd[0] >> 16 ? 8 : 0;
     uint32_t n = len > 12 + skip ? len - 12 - skip : 0;
@@ -457,6 +470,30 @@ void hv_pvg_lite_poll(HvPvgLite *p) {
     if (irq) hv_gicv3_pend(p->gic, p->gfx_irq);
     if (p->iosfc_pending) {
         p->iosfc_pending = 0;
+        if (p->tally) {
+            uint64_t ring = p->io_regs[0], table = p->io_regs[0x10 / 8], size = p->io_regs[0x8 / 8], want = p->io_regs[0x18 / 8];
+            for (uint64_t i = p->io_regs[0x20 / 8]; i < want && size; i++) {
+                uint32_t *e = hv_phys_ptr(p->m, ring + (i % size) * 16, 16);
+                uint32_t *t = table ? hv_phys_ptr(p->m, table, 64) : NULL;
+                if (!e || !t) continue;
+                fprintf(stderr, "pvgmap op %u id %u table %x %x %x %x\n", e[0], e[1], t[0], t[1], t[2], t[3]);
+                uint32_t seg = e[1] / 16, idx = e[1] % 16;
+                uint32_t *ta = hv_phys_ptr(p->m, table + seg * 4, 4);
+                uint32_t *d = ta ? hv_phys_ptr(p->m, ((uint64_t)(*ta & ~1u) << 12) + idx * 0x400ull, 0x400) : NULL;
+                if (d && e[0] == 1) {
+                    fprintf(stderr, "pvgdesc");
+                    for (int k = 0; k < 64; k++) fprintf(stderr, " %08x", d[k]);
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
+        if (p->metal) {
+            uint64_t ring = p->io_regs[0], size = p->io_regs[0x8 / 8], want = p->io_regs[0x18 / 8];
+            for (uint64_t i = p->io_regs[0x20 / 8]; i < want && size; i++) {
+                uint32_t *e = hv_phys_ptr(p->m, ring + (i % size) * 16, 16);
+                if (e && e[0] == 2) hv_pvg_metal_unmap(p->metal, e[1]);
+            }
+        }
         p->io_regs[0x20 / 8] = p->io_regs[0x18 / 8];
         hv_gicv3_pend(p->gic, p->iosfc_irq);
     }

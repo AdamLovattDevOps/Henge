@@ -29,6 +29,7 @@
 @protocol HvMetalSPI
 - (id)newRenderPipelineDescriptorWithSerializedData:(dispatch_data_t)d deserializationContext:(id)c;
 - (id)newTileRenderPipelineDescriptorWithSerializedData:(dispatch_data_t)d deserializationContext:(id)c;
+- (id)newComputePipelineDescriptorWithSerializedData:(dispatch_data_t)d deserializationContext:(id)c;
 @end
 
 enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OBJ_LINEAR_TEXTURE = 8, OBJ_MAPPED_TEXTURE = 0xb };
@@ -49,6 +50,10 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     uint8_t tex_block_h;
     uint8_t *tex_layout; /* the mip table, 36 bytes each */
     BOOL guest_backed;
+    /* A surface: */
+    HvObject *surface;
+    uint64_t row;
+    uint32_t first;
 }
 @end
 
@@ -70,6 +75,7 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     dispatch_queue_t worker;
     NSMutableDictionary<NSNumber *, NSMutableDictionary<NSNumber *, HvObject *> *> *tasks;
     NSMutableDictionary<NSNumber *, id<MTLTexture>> *mapped_textures;
+    NSMutableDictionary<NSNumber *, HvObject *> *surfaces;
     NSMutableSet<NSString *> *complaints;
     uint64_t execs, draws, failed;
     /* The newest frame, BGRA, for hv_pvg_metal_frame. */
@@ -225,6 +231,21 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         if (!state) [self complain:[NSString stringWithFormat:@"pipeline %u: %@", tag, err.localizedDescription]];
         return state;
     }
+    if (tag == 0xb) { /* compute pipeline: {tag, size, ref, length, data} */
+        id<HvMetalSPI> spi = (id)device;
+        HvContext *ctx = [HvContext new];
+        ctx->replay = self, ctx->task = task;
+        dispatch_data_t data = dispatch_data_create((const uint8_t *)all.bytes + 16, w[3], NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+        id descriptor = [spi newComputePipelineDescriptorWithSerializedData:data deserializationContext:ctx];
+        if (!descriptor || ctx->failure) {
+            [self complain:[NSString stringWithFormat:@"compute descriptor: %@", ctx->failure]];
+            return nil;
+        }
+        NSError *err = nil;
+        id state = [device newComputePipelineStateWithDescriptor:descriptor options:MTLPipelineOptionNone reflection:nil error:&err];
+        if (!state) [self complain:[NSString stringWithFormat:@"compute pipeline: %@", err.localizedDescription]];
+        return state;
+    }
     if (tag == 3) { /* sampler: {tag, size, ref, bits, lod min, lod max, ...} */
         uint64_t bits;
         memcpy(&bits, w + 3, 8);
@@ -294,6 +315,14 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
 - (void)makeLinearTexture:(HvObject *)o at:(uint64_t)at task:(uint32_t)task {
     struct __attribute__((packed)) { uint32_t tag, size, ref, buffer; uint64_t offset, row; uint8_t d[32]; } h;
     if (hv_pvg_lite_task_read(lite, task, at, &h, sizeof h)) return;
+    if (h.tag == 0x34 || h.tag == 0x14) { /* no guest memory at all: {tag, size, ref, description} */
+        const uint8_t *desc = (const uint8_t *)&h.buffer;
+        MTLTextureDescriptor *t = h.tag == 0x34 ? descriptor_v2(desc) : descriptor_v1(desc);
+        t.storageMode = MTLStorageModePrivate;
+        o->object = [device newTextureWithDescriptor:t];
+        if (!o->object) [self complain:[NSString stringWithFormat:@"texture format %lu %lux%lu samples %lu failed", (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.sampleCount]];
+        return;
+    }
     if (h.tag != 9) { [self complain:[NSString stringWithFormat:@"linear texture tag %u", h.tag]]; return; }
     HvObject *b = [self object:h.buffer task:task];
     id<MTLBuffer> buffer = b ? b->object : nil;
@@ -305,21 +334,57 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     if (!o->object) [self complain:[NSString stringWithFormat:@"linear texture format %lu row %llu failed", (unsigned long)t.pixelFormat, h.row]];
 }
 
-/* A surface the display can show: {mapping id, tag, size, ref, description}. */
+/* A surface (IOSurface in the guest): a texture over its guest pages, so the
+   guest's CPU and the GPU see the same pixels, as they do through a real one.
+   {mapping id, tag, size, ref, description}. Its descriptor: page list at +0
+   (physical >> 12, bit 0 present, one per 16 KB), first-page offset +0x60,
+   allocation +0x18, bytes per row +0x30. */
 - (void)makeMappedTexture:(HvObject *)o at:(uint64_t)at task:(uint32_t)task {
     struct __attribute__((packed)) { uint64_t mapping; uint32_t tag, size, ref; uint8_t d[32]; } h;
     if (hv_pvg_lite_task_read(lite, task, at, &h, sizeof h)) return;
     NSNumber *key = @(h.mapping);
-    id<MTLTexture> tex = mapped_textures[key];
-    if (!tex) {
-        MTLTextureDescriptor *t = h.tag == 0x39 ? descriptor_v2(h.d) : descriptor_v1(h.d);
-        t.storageMode = MTLStorageModePrivate;
-        t.usage |= MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
-        tex = [device newTextureWithDescriptor:t];
-        if (tex) mapped_textures[key] = tex;
-        fprintf(stderr, "hengevm: pvg-metal: surface %llu: %lux%lu format %lu\n", h.mapping, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat);
+    HvObject *surface = surfaces[key];
+    MTLTextureDescriptor *t = h.tag == 0x39 ? descriptor_v2(h.d) : descriptor_v1(h.d);
+    if (!surface) {
+        const uint8_t *desc = hv_pvg_lite_surface(lite, (uint32_t)h.mapping);
+        if (!desc) { [self complain:[NSString stringWithFormat:@"surface %llu has no descriptor", h.mapping]]; return; }
+        uint32_t list, first;
+        uint64_t alloc, row;
+        memcpy(&list, desc, 4), memcpy(&alloc, desc + 0x18, 8), memcpy(&row, desc + 0x30, 8), memcpy(&first, desc + 0x60, 4);
+        surface = [HvObject new];
+        surface->length = (alloc + first + 0x3fff) & ~0x3fffull;
+        surface->row = row;
+        surface->first = first;
+        uint64_t n = surface->length >> 14;
+        vm_address_t base = 0;
+        const uint32_t *pages = (list & 1) ? hv_pvg_lite_phys(lite, (uint64_t)(list & ~1u) << 12, n * 4) : NULL;
+        if (!pages || vm_allocate(mach_task_self(), &base, surface->length, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
+            [self complain:[NSString stringWithFormat:@"surface %llu has no pages", h.mapping]];
+            return;
+        }
+        surface->mapped = (uint8_t *)base;
+        for (uint64_t i = 0; i < n; i++) {
+            if (!(pages[i] & 1)) continue;
+            uint8_t *src = hv_pvg_lite_phys(lite, (uint64_t)(pages[i] & ~1u) << 12, 0x4000);
+            if (!src) continue;
+            vm_address_t to = base + (i << 14);
+            vm_prot_t cur, max;
+            vm_remap(mach_task_self(), &to, 0x4000, 0, VM_FLAGS_OVERWRITE, mach_task_self(), (vm_address_t)src, FALSE, &cur, &max, VM_INHERIT_NONE);
+        }
+        surface->object = [device newBufferWithBytesNoCopy:surface->mapped length:surface->length options:MTLResourceStorageModeShared deallocator:nil];
+        surfaces[key] = surface;
+        fprintf(stderr, "hengevm: pvg-metal: surface %llu: %lux%lu format %lu, row %llu, %llu KB, fourcc %c%c%c%c planes %u\n", h.mapping, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat, row, alloc >> 10, desc[7], desc[6], desc[5], desc[4], desc[0x3e]);
     }
-    o->object = tex;
+    t.storageMode = MTLStorageModeShared;
+    t.usage |= MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+    o->surface = surface;
+    o->object = [(id<MTLBuffer>)surface->object newTextureWithDescriptor:t offset:surface->first bytesPerRow:surface->row];
+    if (!o->object) {
+        [self complain:[NSString stringWithFormat:@"surface %llu: format %lu row %llu not possible", h.mapping, (unsigned long)t.pixelFormat, surface->row]];
+        t.storageMode = MTLStorageModePrivate;
+        o->object = [device newTextureWithDescriptor:t]; /* something to bind: it stays empty */
+    }
+    mapped_textures[key] = o->object;
 }
 
 - (HvObject *)object:(uint32_t)ref task:(uint32_t)task {
@@ -341,7 +406,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     case OBJ_TEXTURE: [self makeTexture:o at:at size:size task:task]; break;
     case OBJ_FUNCTION: o->object = [self makeFunction:at task:task]; break;
     case OBJ_SERIALIZED: o->object = [self makeSerialized:at length:size task:task]; break;
-    case OBJ_LINEAR_TEXTURE: [self makeLinearTexture:o at:at task:task]; break;
+    case OBJ_LINEAR_TEXTURE: case 9: [self makeLinearTexture:o at:at task:task]; break;
     case OBJ_MAPPED_TEXTURE: [self makeMappedTexture:o at:at task:task]; break;
     default: [self complain:[NSString stringWithFormat:@"object type %u", type]]; break;
     }
@@ -428,7 +493,16 @@ typedef struct {
     if (!d.depthAttachment.texture) d.depthAttachment.loadAction = MTLLoadActionDontCare, d.depthAttachment.storeAction = MTLStoreActionDontCare;
     if (!d.stencilAttachment.texture) d.stencilAttachment.loadAction = MTLLoadActionDontCare, d.stencilAttachment.storeAction = MTLStoreActionDontCare;
     id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:d];
-    if (!e) [self complain:@"no render encoder"];
+    if (!e) {
+        NSMutableString *m = [NSMutableString stringWithString:@"no render encoder:"];
+        for (int i = 0; i < 8; i++) {
+            MTLRenderPassColorAttachmentDescriptor *c = d.colorAttachments[i];
+            uint32_t ref = U32(0x4c + (uint32_t)i * 0x3c);
+            if (ref) [m appendFormat:@" c%d ref %u %s %lux%lu fmt %lu load %lu store %lu usage %lu", i, ref, c.texture ? "ok" : "MISSING", (unsigned long)c.texture.width, (unsigned long)c.texture.height, (unsigned long)c.texture.pixelFormat, (unsigned long)c.loadAction, (unsigned long)c.storeAction, (unsigned long)c.texture.usage];
+        }
+        [m appendFormat:@" depth ref %u stencil ref %u", U32(0), U32(0x28)];
+        [self complain:m];
+    }
     return e;
 }
 
@@ -543,6 +617,178 @@ typedef struct {
     }
 }
 
+/* Compute calls. Tags start at 200. */
+- (void)compute:(id<MTLComputeCommandEncoder>)e tag:(uint32_t)tag rec:(Rec)r task:(uint32_t)task {
+    switch (tag) {
+    case 208: [e setComputePipelineState:[self get:U32(0) task:task]]; break;
+    case 203: {
+        uint32_t index = U32(0), count = U32(4);
+        if (count > 31) break;
+        __unsafe_unretained id<MTLBuffer> buffers[31];
+        id strong[31];
+        NSUInteger offsets[31];
+        for (uint32_t i = 0; i < count; i++) {
+            strong[i] = [self get:U32(8 + i * 12) task:task];
+            buffers[i] = strong[i];
+            offsets[i] = (NSUInteger)U64(12 + i * 12);
+        }
+        [e setBuffers:buffers offsets:offsets withRange:NSMakeRange(index, count)];
+        break;
+    }
+    case 207: [e setBufferOffset:(NSUInteger)U64(4) atIndex:U32(0)]; break;
+    case 206: {
+        uint32_t index = U32(0), count = U32(4);
+        if (count > 128) break;
+        __unsafe_unretained id<MTLTexture> items[128];
+        id strong[128];
+        for (uint32_t i = 0; i < count; i++) {
+            strong[i] = [self get:U32(8 + i * 4) task:task];
+            items[i] = strong[i];
+        }
+        [e setTextures:items withRange:NSMakeRange(index, count)];
+        break;
+    }
+    case 204: {
+        uint32_t index = U32(0), count = U32(4);
+        if (count > 16) break;
+        __unsafe_unretained id<MTLSamplerState> items[16];
+        id strong[16];
+        for (uint32_t i = 0; i < count; i++) {
+            strong[i] = [self get:U32(8 + i * 4) task:task];
+            items[i] = strong[i];
+        }
+        [e setSamplerStates:items withRange:NSMakeRange(index, count)];
+        break;
+    }
+    case 211: [e setThreadgroupMemoryLength:(NSUInteger)U64(0) atIndex:U32(8)]; break;
+    case 200: case 202: {
+        MTLSize a, b;
+        memcpy(&a, r.p, sizeof a), memcpy(&b, r.p + sizeof a, sizeof b);
+        if (tag == 200) [e dispatchThreadgroups:a threadsPerThreadgroup:b];
+        else [e dispatchThreads:a threadsPerThreadgroup:b];
+        break;
+    }
+    default:
+        [self complain:[NSString stringWithFormat:@"compute command %u (%u bytes) skipped", tag, r.size]];
+        break;
+    }
+}
+
+/* Blit calls. Tags start at 300. */
+- (void)blit:(id<MTLBlitCommandEncoder>)e tag:(uint32_t)tag rec:(Rec)r task:(uint32_t)task {
+    switch (tag) {
+    case 300: { /* buffer to texture */
+        id<MTLBuffer> b = [self get:U32(0) task:task];
+        id<MTLTexture> t = [self get:U32(4) task:task];
+        if (!b || !t) break;
+        MTLSize size;
+        MTLOrigin origin;
+        memcpy(&size, r.p + 0x20, sizeof size), memcpy(&origin, r.p + 0x38, sizeof origin);
+        [e copyFromBuffer:b sourceOffset:(NSUInteger)U64(8) sourceBytesPerRow:(NSUInteger)U64(0x10) sourceBytesPerImage:(NSUInteger)U64(0x18) sourceSize:size
+                toTexture:t destinationSlice:U16(0x50) destinationLevel:U16(0x52) destinationOrigin:origin options:(MTLBlitOption)U32(0x54)];
+        break;
+    }
+    case 301: { /* buffer to buffer */
+        id<MTLBuffer> a = [self get:U32(0) task:task], b = [self get:U32(4) task:task];
+        if (a && b) [e copyFromBuffer:a sourceOffset:(NSUInteger)U64(8) toBuffer:b destinationOffset:(NSUInteger)U64(0x10) size:(NSUInteger)U64(0x18)];
+        break;
+    }
+    case 302: { /* texture to buffer */
+        id<MTLTexture> t = [self get:U32(0) task:task];
+        id<MTLBuffer> b = [self get:U32(4) task:task];
+        if (!b || !t) break;
+        MTLOrigin origin;
+        MTLSize size;
+        memcpy(&origin, r.p + 8, sizeof origin), memcpy(&size, r.p + 0x20, sizeof size);
+        [e copyFromTexture:t sourceSlice:U16(0x50) sourceLevel:U16(0x52) sourceOrigin:origin sourceSize:size toBuffer:b
+            destinationOffset:(NSUInteger)U64(0x38) destinationBytesPerRow:(NSUInteger)U64(0x40) destinationBytesPerImage:(NSUInteger)U64(0x48) options:(MTLBlitOption)U16(0x54)];
+        break;
+    }
+    case 303: { /* texture to texture */
+        id<MTLTexture> a = [self get:U32(0) task:task], b = [self get:U32(4) task:task];
+        if (!a || !b) break;
+        MTLOrigin from, to;
+        MTLSize size;
+        memcpy(&from, r.p + 8, sizeof from), memcpy(&size, r.p + 0x20, sizeof size), memcpy(&to, r.p + 0x38, sizeof to);
+        [e copyFromTexture:a sourceSlice:U16(0x50) sourceLevel:U16(0x52) sourceOrigin:from sourceSize:size
+                 toTexture:b destinationSlice:U16(0x54) destinationLevel:U16(0x56) destinationOrigin:to];
+        break;
+    }
+    case 306: { /* fill: {ref, location, length, value} */
+        id<MTLBuffer> b = [self get:U32(0) task:task];
+        if (b) [e fillBuffer:b range:NSMakeRange((NSUInteger)U64(4), (NSUInteger)U64(12)) value:r.p[20]];
+        break;
+    }
+    case 307: {
+        id<MTLTexture> t = [self get:U32(0) task:task];
+        if (t) [e generateMipmapsForTexture:t];
+        break;
+    }
+    case 308: case 309: case 310: case 311: case 314: case 315: /* hints, and syncing memory Apple GPUs share */
+        break;
+    default:
+        [self complain:[NSString stringWithFormat:@"blit command %u (%u bytes) skipped", tag, r.size]];
+        break;
+    }
+}
+
+/* What the guest asks about objects, answered in its own buffers: tags start at
+   450, {ref, buffer ref, offset}. The guest's Metal puts these real host values
+   into its argument buffers. */
+- (void)info:(uint32_t)tag rec:(Rec)r task:(uint32_t)task {
+    uint32_t ref = U32(0), bufref = U32(4);
+    uint64_t off = U64(8);
+    if (tag == 460) { /* an object's identifier: {ref, kind, buffer ref, offset} */
+        bufref = U32(8);
+        off = U64(12);
+    }
+    HvObject *to = [self object:bufref task:task];
+    uint8_t *out = to && to->mapped && off + 28 <= to->length ? to->mapped + off : NULL;
+    id obj = [self get:ref task:task];
+    if (!out || !obj) {
+        [self complain:[NSString stringWithFormat:@"info %u: ref %u buffer %u offset %llu: %s", tag, ref, bufref, off, out ? "no object" : "no buffer"]];
+        return;
+    }
+    SEL index_sel = sel_registerName("resourceIndex");
+    uint64_t index = [obj respondsToSelector:index_sel] ? ((uint64_t (*)(id, SEL))objc_msgSend)(obj, index_sel) : 0;
+    switch (tag) {
+    case 460: {
+        SEL sel = sel_registerName("uniqueIdentifier");
+        uint64_t v = [obj respondsToSelector:sel] ? ((uint64_t (*)(id, SEL))objc_msgSend)(obj, sel) : (uint64_t)(uintptr_t)obj;
+        memcpy(out, &v, 8);
+        break;
+    }
+    case 457: { /* render pipeline: {max threads, imageblock length, tile match, indirect} */
+        id<MTLRenderPipelineState> p = obj;
+        uint32_t v[2] = {(uint32_t)p.maxTotalThreadsPerThreadgroup, (uint32_t)p.imageblockSampleLength};
+        memcpy(out, v, 8);
+        out[8] = p.threadgroupSizeMatchesTileSize, out[9] = p.supportIndirectCommandBuffers;
+        break;
+    }
+    case 450: { /* compute pipeline */
+        id<MTLComputePipelineState> p = obj;
+        uint64_t v[3] = {p.maxTotalThreadsPerThreadgroup, p.threadExecutionWidth, p.staticThreadgroupMemoryLength};
+        memcpy(out, v, 24);
+        out[24] = p.supportIndirectCommandBuffers;
+        break;
+    }
+    case 461: { /* buffer */
+        uint64_t a = [(id<MTLBuffer>)obj gpuAddress];
+        memcpy(out, &a, 8);
+        break;
+    }
+    case 462: case 464: case 466: case 467: case 468: { /* texture, sampler, render, compute, depth-stencil */
+        MTLResourceID id_ = ((MTLResourceID (*)(id, SEL))objc_msgSend)(obj, @selector(gpuResourceID));
+        memcpy(out, &id_, 8);
+        memcpy(out + 8, &index, 8);
+        break;
+    }
+    default:
+        [self complain:[NSString stringWithFormat:@"info command %u (%u bytes) skipped", tag, r.size]];
+        break;
+    }
+}
+
 /* One exec: {task, resources, buffers}, {ref, flags} per resource, {offset, length} per buffer. */
 - (void)exec:(const uint32_t *)a length:(uint32_t)len {
     uint32_t task = a[0], nres = a[1], nbuf = a[2];
@@ -555,10 +801,19 @@ typedef struct {
         HvObject *o = [self object:res[i * 2] task:task];
         if (!o) continue;
         if (o->mapped) refresh_pages(self, task, o);
+        if (getenv("HV_PVG_TALLY") && (o->entry[0] & 0xff) == OBJ_MAPPED_TEXTURE) {
+            static uint32_t seen[256];
+            uint32_t f = res[i * 2 + 1] & 0xff, key = res[i * 2] & 0xff;
+            if (seen[key] != f + 1) {
+                seen[key] = f + 1;
+                fprintf(stderr, "pvgres task %u ref %u mapped flags %x\n", task, res[i * 2], res[i * 2 + 1]);
+            }
+        }
         if ((res[i * 2 + 1] & 1) && o->guest_backed) [self upload:o task:task blit:&blit commandBuffer:cb];
     }
     [blit endEncoding];
-    id<MTLRenderCommandEncoder> e = nil;
+    id e = nil; /* the open encoder */
+    uint32_t etype = 0;
     for (uint32_t b = 0; b < nbuf; b++) {
         uint64_t off, blen;
         memcpy(&off, bufs + b * 16, 8);
@@ -577,20 +832,36 @@ typedef struct {
             p += 8;
         }
         uint32_t type = info & 0xff, cont = (info >> 8) & 0xff, more = (info >> 16) & 0xff;
-        if (type != 0) { [self complain:[NSString stringWithFormat:@"encoder type %u skipped", type]]; continue; }
         if (p + seglen < end) end = p + seglen;
         if (!cont && e) { [e endEncoding]; e = nil; }
+        if (type > 2) {
+            const uint8_t *q = p;
+            while (q + 8 <= end) {
+                uint32_t tag = *(const uint32_t *)q, sz = *(const uint32_t *)(q + 4);
+                if (sz < 8 || q + sz > end) break;
+                Rec r = {q + 8, sz - 8};
+                if (type == 4) [self info:tag rec:r task:task];
+                else [self complain:[NSString stringWithFormat:@"encoder type %u command %u (%u bytes) skipped", type, tag, sz]];
+                q += sz;
+            }
+            continue;
+        }
+        if (!e && type == 1) e = [cb computeCommandEncoder];
+        if (!e && type == 2) e = [cb blitCommandEncoder];
+        etype = type;
         @try {
             while (p + 8 <= end) {
                 uint32_t tag, size;
                 memcpy(&tag, p, 4), memcpy(&size, p + 4, 4);
                 if (size < 8 || p + size > end) break;
                 Rec r = {p + 8, size - 8};
-                if (tag == 26) {
+                if (etype == 0 && tag == 26) {
                     if (e) [e endEncoding];
                     e = [self beginPass:r task:task commandBuffer:cb];
                 } else if (e) {
-                    [self render:e tag:tag rec:r task:task];
+                    if (etype == 0) [self render:e tag:tag rec:r task:task];
+                    else if (etype == 1) [self compute:e tag:tag rec:r task:task];
+                    else [self blit:e tag:tag rec:r task:task];
                 }
                 p += size;
             }
@@ -626,18 +897,12 @@ static inline uint8_t to_byte(float v) {
     double now = now_seconds();
     if (now - last_capture < 0.2) return;
     last_capture = now;
-    NSUInteger bpp = t.pixelFormat == MTLPixelFormatRGBA16Float ? 8 : 4, row = t.width * bpp, size = row * t.height;
-    if (readback.length < size) readback = [device newBufferWithLength:size options:MTLResourceStorageModeShared];
-    id<MTLCommandBuffer> cb = [queue commandBuffer];
-    id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
-    [b copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(t.width, t.height, 1)
-              toBuffer:readback destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:size];
-    [b endEncoding];
-    [cb commit];
-    [cb waitUntilCompleted];
+    HvObject *surface = surfaces[@(mapping)];
+    if (!surface) return;
+    NSUInteger bpp = t.pixelFormat == MTLPixelFormatRGBA16Float ? 8 : 4, row = surface->row;
     uint32_t w = (uint32_t)t.width, h = (uint32_t)t.height;
     uint8_t *out = frame && frame_w == w && frame_h == h ? frame : malloc((size_t)w * h * 4);
-    const uint8_t *src = readback.contents;
+    const uint8_t *src = surface->mapped + surface->first;
     if (bpp == 8) {
         for (uint32_t y = 0; y < h; y++) {
             const __fp16 *in = (const __fp16 *)(src + y * row);
@@ -647,12 +912,14 @@ static inline uint8_t to_byte(float v) {
             }
         }
     } else {
-        memcpy(out, src, (size_t)w * h * 4);
+        for (uint32_t y = 0; y < h; y++) memcpy(out + (size_t)y * w * 4, src + y * row, (size_t)w * 4);
     }
     if (out != frame) free(frame);
     frame = out, frame_w = w, frame_h = h;
 #if !TARGET_OS_IPHONE
-    if (shot) {
+    static double last_shot;
+    if (shot && now - last_shot >= 5) {
+        last_shot = now;
         char path[1100];
         snprintf(path, sizeof path, "%s-%04u.png", shot, shots++);
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
@@ -689,6 +956,7 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
         r->worker = dispatch_queue_create("hengevm.pvg", DISPATCH_QUEUE_SERIAL);
         r->tasks = [NSMutableDictionary new];
         r->mapped_textures = [NSMutableDictionary new];
+        r->surfaces = [NSMutableDictionary new];
         r->complaints = [NSMutableSet new];
         r->shot = getenv("HV_PVG_SHOT");
         fprintf(stderr, "hengevm: pvg-metal: drawing on %s\n", dev.name.UTF8String);
@@ -704,7 +972,7 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
             const uint32_t *args = (const uint32_t *)((const uint8_t *)cmd + 12 + skip);
             uint32_t n = len > 12 + skip ? len - 12 - skip : 0;
             @try {
-                if (op == 0x43 && n >= 12) {
+                if ((op == 0x43 || op == 0x45) && n >= 12) {
                     [r exec:args length:n];
                 } else if ((op == 0x25 || op == 0x28) && n >= 8) { /* {task, ref} or {task, tag, size, ref} */
                     uint32_t ref = op == 0x25 ? args[1] : (n >= 16 ? args[3] : 0);
@@ -721,6 +989,14 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
             hv_pvg_lite_complete(lite, ch, cmd[2]);
             free(cmd);
         }
+    });
+}
+
+void hv_pvg_metal_unmap(HvPvgMetal *m, uint32_t mapping) {
+    HvReplay *r = (__bridge HvReplay *)m;
+    dispatch_async(r->worker, ^{
+        [r->surfaces removeObjectForKey:@(mapping)];
+        [r->mapped_textures removeObjectForKey:@(mapping)];
     });
 }
 
