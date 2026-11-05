@@ -140,13 +140,63 @@ static void *click_thread(void *unused) {
     return NULL;
 }
 
+uint64_t hook_pages;
+/* SHA-256 compression, to know what the guest's should come to. */
+static void sha_blocks(uint32_t st[8], const uint8_t *d, size_t n) {
+    static const uint32_t K[64] = {0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
+#define ROR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+    for (; n; n--, d += 64) {
+        uint32_t w[64], a[8];
+        for (int i = 0; i < 16; i++) w[i] = (uint32_t)d[i * 4] << 24 | d[i * 4 + 1] << 16 | d[i * 4 + 2] << 8 | d[i * 4 + 3];
+        for (int i = 16; i < 64; i++) w[i] = w[i - 16] + (ROR(w[i - 15], 7) ^ ROR(w[i - 15], 18) ^ (w[i - 15] >> 3)) + w[i - 7] + (ROR(w[i - 2], 17) ^ ROR(w[i - 2], 19) ^ (w[i - 2] >> 10));
+        memcpy(a, st, sizeof a);
+        for (int i = 0; i < 64; i++) {
+            uint32_t t1 = a[7] + (ROR(a[4], 6) ^ ROR(a[4], 11) ^ ROR(a[4], 25)) + ((a[4] & a[5]) ^ (~a[4] & a[6])) + K[i] + w[i];
+            uint32_t t2 = (ROR(a[0], 2) ^ ROR(a[0], 13) ^ ROR(a[0], 22)) + ((a[0] & a[1]) ^ (a[0] & a[2]) ^ (a[1] & a[2]));
+            a[7] = a[6], a[6] = a[5], a[5] = a[4], a[4] = a[3] + t1, a[3] = a[2], a[2] = a[1], a[1] = a[0], a[0] = t1 + t2;
+        }
+        for (int i = 0; i < 8; i++) st[i] += a[i];
+    }
+#undef ROR
+}
+static void memcmp_hook(HvCpu *c) {
+    if (c->x[2] != 32) return;
+    uint8_t x[32], y[32];
+    HvWalk w1, w2;
+    HvMachine *hm = hv_vm_machine();
+    hv_mmu_walk(c, c->x[0], HV_ACC_READ, 1, &w1);
+    hv_mmu_walk(c, c->x[1], HV_ACC_READ, 1, &w2);
+    if (w1.fsc || w2.fsc || hv_phys_read(hm, w1.pa, x, 32) || hv_phys_read(hm, w2.pa, y, 32)) return;
+    static const uint8_t want[8] = {0x52, 0x24, 0x67, 0x35, 0x8c, 0x28, 0x38, 0x7a};
+    if (memcmp(x, want, 8) && memcmp(y, want, 8)) return;
+    fprintf(stderr, "hengevm: at %ld s ", (long)time(NULL));
+    fprintf(stderr, "hengevm: memcmp 32 bytes, lr %llx:\n  a %llx:", (unsigned long long)c->x[30], (unsigned long long)c->x[0]);
+    for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", x[i]);
+    fprintf(stderr, "\n  b %llx:", (unsigned long long)c->x[1]);
+    for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", y[i]);
+    fprintf(stderr, "\n");
+}
+static __thread uint64_t watch_state;
+static __thread uint32_t watch_want[8];
 /* Debugging: "hooksha file": the guest kernel's SHA-256 routine, watched for hashing this 16 KB page. */
 static uint8_t hook_page[0x4000];
 static void sha_hook(HvCpu *c) {
-    static uint64_t calls, pages;
+    static uint64_t calls;
+    extern uint64_t hook_pages;
+    uint64_t pages = hook_pages;
     calls++;
+    if (watch_state) { /* the call after the page's: its state now is what the page's hash came to */
+        uint32_t st[8];
+        HvWalk wn;
+        hv_mmu_walk(c, watch_state, HV_ACC_READ, 1, &wn);
+        if (!wn.fsc && !hv_phys_read(hv_vm_machine(), wn.pa, st, 32)) {
+            int ok = !memcmp(st, watch_want, 32);
+            fprintf(stderr, "hengevm: sha hook: next call (x0 %s, %llu blocks): state after the page %s: %08x %08x %08x, should be %08x %08x %08x\n", c->x[0] == watch_state ? "same" : "other", (unsigned long long)c->x[1], ok ? "RIGHT" : "WRONG", st[0], st[1], st[2], watch_want[0], watch_want[1], watch_want[2]);
+        }
+        watch_state = 0;
+    }
     uint64_t blocks = c->x[1], va = c->x[2];
-    if (blocks >= 64) pages++;
+    if (blocks >= 64) pages = ++hook_pages;
     if (!blocks || blocks > 256) return;
     uint64_t bytes = blocks * 64, in = va & 0x3fff;
     if (in + bytes > 0x4000) return;
@@ -171,6 +221,24 @@ static void sha_hook(HvCpu *c) {
             int zeros[4] = {0};
             for (int k = 0; k < 0x4000; k++) zeros[k >> 12] += now[k] == 0;
             fprintf(stderr, "hengevm: sha hook: part of the page: %s, zero bytes per 4K %d %d %d %d, va %llx lr %llx\n", eq, zeros[0], zeros[1], zeros[2], zeros[3], (unsigned long long)va, (unsigned long long)c->x[30]);
+            {
+                uint32_t st0[8] = {0};
+                HvWalk ws0;
+                hv_mmu_walk(c, c->x[0], HV_ACC_READ, 1, &ws0);
+                if (!ws0.fsc && !hv_phys_read(hm, ws0.pa, st0, 32)) {
+                    fprintf(stderr, "  state before %08x %08x, cpu %d\n", st0[0], st0[1], c->index);
+                    memcpy(watch_want, st0, 32);
+                    sha_blocks(watch_want, now, 256);
+                    watch_state = c->x[0];
+                    static int switched;
+                    if (!switched++) { /* the page is about to be compared: from now on watch memcmp instead */
+                        HvMachine *mm = hv_vm_machine();
+                        mm->stop_hook = memcmp_hook;
+                        mm->stop_pc = c->pc - 0x2274914ull; /* bcmp */
+                        mm->flush_pending = 1;
+                    }
+                }
+            }
             for (int k = 0; k < 4; k++) if (eq[k] != 'S') {
                 fprintf(stderr, "  chunk %d there:", k);
                 for (int j = 0; j < 32; j++) fprintf(stderr, " %02x", now[k * 0x1000 + j]);
@@ -237,6 +305,7 @@ static void *input_thread(void *unused) {
         else if (sscanf(line, "wait %d", &x) == 1) sleep((unsigned)x);
         else if (!strncmp(line, "type ", 5)) type_text(line + 5);
         else if (!strncmp(line, "hooksha ", 8)) {
+            if (hv_vm_machine()->stop_hook) continue;
             FILE *pf = fopen(line + 8, "rb");
             size_t got = pf ? fread(hook_page, 1, sizeof hook_page, pf) : 0;
             if (pf) fclose(pf);
@@ -251,10 +320,10 @@ static void *input_thread(void *unused) {
             HvWalk wc;
             hv_mmu_walk(c0, va, HV_ACC_EXEC, 1, &wc);
             fprintf(stderr, "hengevm: sha at pa %llx, va %llx (walks to pa %llx, fsc %u); page file %zu bytes\n", (unsigned long long)pa, (unsigned long long)va, (unsigned long long)wc.pa, (unsigned)wc.fsc, got);
-            if (at && !wc.fsc && wc.pa == pa && got == sizeof hook_page) {
+            if (at && !wc.fsc && wc.pa == pa && got == sizeof hook_page && c0->vbar_el1 >> 40 == 0xfffffe) {
                 HvMachine *hm = hv_vm_machine();
-                hm->stop_hook = sha_hook;
-                hm->stop_pc = va;
+                hm->stop_hook = getenv("HV_HOOK_BCMP") ? memcmp_hook : sha_hook;
+                hm->stop_pc = getenv("HV_HOOK_BCMP") ? va - 0x2274914ull : va;
                 hm->flush_pending = 1;
             }
         }
@@ -360,6 +429,7 @@ static void *watch_thread(void *unused) {
           }
           for (int k = 0; k < 4; k++) fprintf(stderr, " %llx*%u(pc %llx)", (unsigned long long)(0x70000000ull + (best[k] << 14)), bestn[k], (unsigned long long)hv_smc_last[best[k]]);
           fprintf(stderr, " distinct %llu", (unsigned long long)distinct);
+          fprintf(stderr, " sha pages %llu", (unsigned long long)hook_pages);
         }
         fprintf(stderr, "\n");
     }
