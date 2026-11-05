@@ -10,6 +10,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <TargetConditionals.h>
+#import <IOSurface/IOSurfaceRef.h>
 
 #include <mach/mach.h>
 #include <mach/vm_map.h>
@@ -54,12 +55,16 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     HvObject *surface;
     uint64_t row;
     uint32_t first;
+    /* Multi-plane surfaces cannot sit on a buffer: a real IOSurface, kept up to date from the guest's pages. */
+    IOSurfaceRef iosurface;
+    uint64_t alloc, content_hash;
 }
 @end
 
 @implementation HvObject
 - (void)dealloc {
     if (mapped) vm_deallocate(mach_task_self(), (vm_address_t)mapped, length);
+    if (iosurface) CFRelease(iosurface);
     free(pages);
     free(tex_layout);
 }
@@ -334,6 +339,45 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     if (!o->object) [self complain:[NSString stringWithFormat:@"linear texture format %lu row %llu failed", (unsigned long)t.pixelFormat, h.row]];
 }
 
+/* A multi-plane surface as a real IOSurface, laid out as the guest laid it out.
+   Planes are in the descriptor from +0x80, 0x80 apart: offset +8, size +0x18,
+   width +0x20, height +0x28, row +0x30, bytes per element +0x38. */
+static IOSurfaceRef make_iosurface(const uint8_t *desc, uint64_t alloc) {
+    uint32_t fourcc, planes = desc[0x3e];
+    uint64_t width, height;
+    memcpy(&fourcc, desc + 4, 4), memcpy(&width, desc + 0x20, 8), memcpy(&height, desc + 0x28, 8);
+    NSMutableArray *info = [NSMutableArray new];
+    for (uint32_t i = 0; i < planes && i < 4; i++) {
+        const uint8_t *pl = desc + 0x80 + i * 0x80;
+        uint64_t off, size, w, h, row;
+        uint16_t bpe;
+        memcpy(&off, pl + 8, 8), memcpy(&size, pl + 0x18, 8), memcpy(&w, pl + 0x20, 8), memcpy(&h, pl + 0x28, 8), memcpy(&row, pl + 0x30, 8), memcpy(&bpe, pl + 0x38, 2);
+        [info addObject:@{(__bridge id)kIOSurfacePlaneWidth: @(w), (__bridge id)kIOSurfacePlaneHeight: @(h), (__bridge id)kIOSurfacePlaneBytesPerRow: @(row),
+                          (__bridge id)kIOSurfacePlaneOffset: @(off), (__bridge id)kIOSurfacePlaneSize: @(size), (__bridge id)kIOSurfacePlaneBytesPerElement: @(bpe),
+                          (__bridge id)kIOSurfacePlaneElementWidth: @1, (__bridge id)kIOSurfacePlaneElementHeight: @1}];
+    }
+    NSDictionary *props = @{(__bridge id)kIOSurfaceWidth: @(width), (__bridge id)kIOSurfaceHeight: @(height), (__bridge id)kIOSurfacePixelFormat: @(fourcc),
+                            (__bridge id)kIOSurfaceAllocSize: @(alloc), (__bridge id)kIOSurfacePlaneInfo: info};
+    return IOSurfaceCreate((__bridge CFDictionaryRef)props);
+}
+
+/* Guest pixels into its IOSurface, when they changed. A sample of every 64th byte says so cheaply. */
+static void sync_iosurface(HvObject *s) {
+    if (!s->iosurface) return;
+    const uint8_t *from = s->mapped + s->first;
+    uint64_t hash = 0xcbf29ce484222325ull;
+    for (uint64_t i = 0; i + 8 <= s->alloc; i += 64) {
+        uint64_t v;
+        memcpy(&v, from + i, 8);
+        hash = (hash ^ v) * 0x100000001b3ull;
+    }
+    if (hash == s->content_hash) return;
+    s->content_hash = hash;
+    IOSurfaceLock(s->iosurface, 0, NULL);
+    memcpy(IOSurfaceGetBaseAddress(s->iosurface), from, MIN(s->alloc, IOSurfaceGetAllocSize(s->iosurface)));
+    IOSurfaceUnlock(s->iosurface, 0, NULL);
+}
+
 /* A surface (IOSurface in the guest): a texture over its guest pages, so the
    guest's CPU and the GPU see the same pixels, as they do through a real one.
    {mapping id, tag, size, ref, description}. Its descriptor: page list at +0
@@ -373,12 +417,19 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         }
         surface->object = [device newBufferWithBytesNoCopy:surface->mapped length:surface->length options:MTLResourceStorageModeShared deallocator:nil];
         surfaces[key] = surface;
+        if (desc[0x3e] >= 2) {
+            surface->alloc = alloc;
+            surface->iosurface = make_iosurface(desc, alloc);
+            if (!surface->iosurface) [self complain:[NSString stringWithFormat:@"surface %llu: no IOSurface for its planes", h.mapping]];
+            sync_iosurface(surface);
+        }
         fprintf(stderr, "hengevm: pvg-metal: surface %llu: %lux%lu format %lu, row %llu, %llu KB, fourcc %c%c%c%c planes %u\n", h.mapping, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat, row, alloc >> 10, desc[7], desc[6], desc[5], desc[4], desc[0x3e]);
     }
     t.storageMode = MTLStorageModeShared;
     t.usage |= MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
     o->surface = surface;
-    o->object = [(id<MTLBuffer>)surface->object newTextureWithDescriptor:t offset:surface->first bytesPerRow:surface->row];
+    if (surface->iosurface) o->object = [device newTextureWithDescriptor:t iosurface:surface->iosurface plane:0];
+    else o->object = [(id<MTLBuffer>)surface->object newTextureWithDescriptor:t offset:surface->first bytesPerRow:surface->row];
     if (!o->object) {
         [self complain:[NSString stringWithFormat:@"surface %llu: format %lu row %llu not possible", h.mapping, (unsigned long)t.pixelFormat, surface->row]];
         t.storageMode = MTLStorageModePrivate;
@@ -668,6 +719,8 @@ typedef struct {
         else [e dispatchThreads:a threadsPerThreadgroup:b];
         break;
     }
+    case 219: /* not a command the framework knows either, though the guest sends it */
+        break;
     default:
         [self complain:[NSString stringWithFormat:@"compute command %u (%u bytes) skipped", tag, r.size]];
         break;
@@ -801,6 +854,7 @@ typedef struct {
         HvObject *o = [self object:res[i * 2] task:task];
         if (!o) continue;
         if (o->mapped) refresh_pages(self, task, o);
+        if (o->surface) sync_iosurface(o->surface);
         if (getenv("HV_PVG_TALLY") && (o->entry[0] & 0xff) == OBJ_MAPPED_TEXTURE) {
             static uint32_t seen[256];
             uint32_t f = res[i * 2 + 1] & 0xff, key = res[i * 2] & 0xff;
