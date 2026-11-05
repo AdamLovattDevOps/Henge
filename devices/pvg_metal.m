@@ -776,7 +776,7 @@ static BOOL has_guest_pages(HvObject *o) {
 }
 
 /* The guest asks to see what the GPU made: {task, count, refs}. */
-- (void)synchronize:(const uint32_t *)a length:(uint32_t)n discard:(BOOL)discard {
+- (void)synchronize:(const uint32_t *)a length:(uint32_t)n {
     if (n < 8) return;
     uint32_t task = a[0], count = a[1];
     if (n < 8 + count * 4ull) return;
@@ -789,7 +789,6 @@ static BOOL has_guest_pages(HvObject *o) {
         if (!cb) cb = [queue commandBuffer];
         [self page:o toGuest:YES task:task blit:&blit commandBuffer:cb];
         o->guest_stale = NO;
-        if (discard) o->host_valid = NO;
     }
     [blit endEncoding];
     if (cb) {
@@ -811,16 +810,6 @@ static BOOL has_guest_pages(HvObject *o) {
         if (e[7]) o->guest_stale = NO;
         if (e[4]) o->host_valid = NO;
         if (e[5]) o->host_valid = YES;
-    }
-}
-
-/* {task, count, refs}: the GPU's copy need not be kept. */
-- (void)discard:(const uint32_t *)a length:(uint32_t)n {
-    if (n < 8 || n < 8 + a[1] * 4ull) return;
-    NSMutableDictionary *objs = tasks[@(a[0])];
-    for (uint32_t i = 0; i < a[1]; i++) {
-        HvObject *o = objs[@(a[2 + i])];
-        if (o) o->host_valid = NO;
     }
 }
 
@@ -1446,7 +1435,7 @@ typedef struct {
                 fprintf(stderr, "pvgres task %u ref %u mapped flags %x\n", task, res[i * 2], res[i * 2 + 1]);
             }
         }
-        if (res[i * 2 + 1] & 1) o->guest_stale = NO, o->host_valid = NO;
+        if (res[i * 2 + 1] & 1) o->guest_stale = NO, o->host_valid = NO; /* the guest wrote it */
         if (o->guest_backed && !o->host_valid) {
             if (!o->guest_stale) [self page:o toGuest:NO task:task blit:&blit commandBuffer:cb];
             o->host_valid = YES;
@@ -1454,6 +1443,12 @@ typedef struct {
         if (res[i * 2 + 1] & 4) sync_after = YES;
     }
     [blit endEncoding];
+    /* Bit 1: this exec writes it, so the guest's copy is out of date from here on. Never
+       upload that over what the GPU drew: mostly zeros, which show as black boxes. */
+    for (uint32_t i = 0; i < nres; i++)
+        if (res[i * 2 + 1] & 2) { /* and what it is made from: a texture in a heap is the heap's bytes */
+            for (HvObject *o = [self object:res[i * 2] task:task]; o; o = o->parent) o->guest_stale = YES;
+        }
     id e = nil; /* the open encoder */
     uint32_t etype = 0;
     for (uint32_t b = 0; b < nbuf; b++) {
@@ -1918,11 +1913,12 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
                     uint32_t ref = op == 0x25 ? args[1] : (n >= 16 ? args[3] : 0);
                     [r->tasks[@(args[0])] removeObjectForKey:@(ref)];
                 } else if (op == 0x35 || op == 0x3e) {
-                    [r synchronize:args length:n discard:op == 0x3e];
+                    [r synchronize:args length:n];
                 } else if (op == 0x34) {
                     [r invalidate:args length:n];
                 } else if (op == 0x3f) {
-                    [r discard:args length:n];
+                    /* "May be thrown away": Apple's host only marks it purgeable, and the bytes stay
+                       until the system needs the memory. Here they just stay. */
                 } else if (op == 0x20 && n >= 4) {
                     [r->tasks removeObjectForKey:@(args[0] >> 1)];
                 } else {
