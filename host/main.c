@@ -1,3 +1,4 @@
+#include <time.h>
 /* hengevm: boots the virtual Mac on the macOS host.
    hengevm --rom AVPBooter.vmapple2.bin --disk disk.img --aux auxiliary.bin --ecid N [--seed N] [--ram MB] [--log N] */
 #include <CoreFoundation/CoreFoundation.h>
@@ -14,6 +15,7 @@
 #include "exception.h"
 #include "mmu.h"
 #include "pvg.h"
+#include "pvg_lite.h"
 #include "vm.h"
 #include "install.h"
 
@@ -59,6 +61,42 @@ static void *profile_thread(void *unused) {
     for (;;) {
         usleep(1000);
         if (cpu_port) sample_cpu();
+    }
+    return NULL;
+}
+
+/* Debugging: HV_CLICKS="seconds:x,y;seconds:x,y" walks the pointer to a spot on
+   the screen (watching where the display says it is) and clicks, to drive a
+   guest's UI without a window. */
+static void *click_thread(void *unused) {
+    (void)unused;
+    const char *p = getenv("HV_CLICKS");
+    time_t start = time(NULL);
+    while (p && *p) {
+        int when, x, y, n = 0;
+        if (sscanf(p, "%d:%d,%d%n", &when, &x, &y, &n) != 3) break;
+        p += n;
+        if (*p == ';') p++;
+        while (time(NULL) - start < when) sleep(1);
+        const uint8_t *page = hv_pvg_lite_display_page(board.pvg);
+        for (int i = 0; page && i < 1500; i++) {
+            uint32_t at = *(const volatile uint32_t *)(page + 0xe00);
+            int dx = x - (int)(at & 0xffff), dy = y - (int)(at >> 16);
+            if (abs(dx) < 3 && abs(dy) < 3) break;
+            /* Small steps, as a hand makes: macOS accelerates big ones past the target. */
+            int sx = dx > 16 ? 16 : dx < -16 ? -16 : dx, sy = dy > 16 ? 16 : dy < -16 ? -16 : dy;
+            hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_X, sx);
+            hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_Y, sy);
+            hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+            usleep(30000);
+        }
+        uint32_t at = page ? *(const volatile uint32_t *)(page + 0xe00) : 0;
+        fprintf(stderr, "hengevm: click at %u,%u (asked %d,%d) at %ld s\n", at & 0xffff, at >> 16, x, y, (long)(time(NULL) - start));
+        hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, 1);
+        hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+        usleep(120000);
+        hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, 0);
+        hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
     }
     return NULL;
 }
@@ -330,6 +368,10 @@ int main(int argc, char **argv) {
     pthread_attr_setstacksize(&attr, 8u << 20);
     pthread_create(&t, &attr, cpu_thread, NULL);
     if (profile) pthread_create(&t, NULL, profile_thread, NULL);
+    if (getenv("HV_CLICKS")) {
+        pthread_t cl;
+        pthread_create(&cl, NULL, click_thread, NULL);
+    }
     if (getenv("HV_TYPE_AT")) {
         pthread_t ty;
         pthread_create(&ty, NULL, type_thread, NULL);

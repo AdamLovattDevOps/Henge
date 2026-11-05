@@ -337,7 +337,14 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         if (!o->object) [self complain:[NSString stringWithFormat:@"texture format %lu %lux%lu samples %lu failed", (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.sampleCount]];
         return;
     }
-    if (h.tag != 9) { [self complain:[NSString stringWithFormat:@"linear texture tag %u", h.tag]]; return; }
+    if (h.tag != 9) {
+        uint32_t w[24] = {0};
+        hv_pvg_lite_task_read(lite, task, at, w, sizeof w);
+        NSMutableString *m = [NSMutableString stringWithFormat:@"serialized texture tag %u:", h.tag];
+        for (int i = 0; i < 24; i++) [m appendFormat:@" %08x", w[i]];
+        [self complain:m];
+        return;
+    }
     HvObject *b = [self object:h.buffer task:task];
     id<MTLBuffer> buffer = b ? b->object : nil;
     if (!buffer || ![buffer conformsToProtocol:@protocol(MTLBuffer)]) { [self complain:@"linear texture without a buffer"]; return; }
@@ -429,7 +436,11 @@ static void sync_iosurface(HvObject *s) {
         if (desc[0x3e] >= 2) {
             surface->alloc = alloc;
             surface->iosurface = make_iosurface(desc, alloc);
-            if (!surface->iosurface) [self complain:[NSString stringWithFormat:@"surface %llu: no IOSurface for its planes", h.mapping]];
+            if (!surface->iosurface) {
+                NSMutableString *m = [NSMutableString stringWithFormat:@"surface %llu: no IOSurface for its planes (alloc %llu):", h.mapping, alloc];
+                for (int i = 0; i < 96; i++) [m appendFormat:@" %08x", ((const uint32_t *)desc)[i]];
+                [self complain:m];
+            }
             sync_iosurface(surface);
         }
         fprintf(stderr, "hengevm: pvg-metal: surface %llu: %lux%lu format %lu, row %llu, %llu KB, fourcc %c%c%c%c planes %u\n", h.mapping, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat, row, alloc >> 10, desc[7], desc[6], desc[5], desc[4], desc[0x3e]);
@@ -468,7 +479,14 @@ static void sync_iosurface(HvObject *s) {
     case OBJ_SERIALIZED: o->object = [self makeSerialized:at length:size task:task]; break;
     case OBJ_LINEAR_TEXTURE: case 9: [self makeLinearTexture:o at:at task:task]; break;
     case OBJ_MAPPED_TEXTURE: [self makeMappedTexture:o at:at task:task]; break;
-    default: [self complain:[NSString stringWithFormat:@"object type %u", type]]; break;
+    default: {
+        uint32_t w[24] = {0};
+        hv_pvg_lite_task_read(lite, task, at, w, sizeof w);
+        NSMutableString *m = [NSMutableString stringWithFormat:@"object type %u size %u:", type, size];
+        for (int i = 0; i < 24; i++) [m appendFormat:@" %08x", w[i]];
+        [self complain:m];
+        break;
+    }
     }
     return o;
 }
@@ -812,6 +830,19 @@ typedef struct {
 - (void)info:(uint32_t)tag rec:(Rec)r task:(uint32_t)task {
     uint32_t ref = U32(0), bufref = U32(4);
     uint64_t off = U64(8);
+    if (tag == 451 || tag == 469) { /* how big a texture would be in a heap: {description, buffer ref, offset} */
+        uint32_t at = tag == 451 ? 0x20 : 0x28;
+        if (r.size < at + 12) return;
+        MTLTextureDescriptor *t = tag == 451 ? descriptor_v1(r.p) : descriptor_v2(r.p);
+        t.storageMode = MTLStorageModePrivate;
+        HvObject *to = [self object:U32(at) task:task];
+        uint64_t where = U64(at + 4);
+        if (!to || !to->mapped || where + 16 > to->length) { [self complain:@"heap size query: no buffer"]; return; }
+        MTLSizeAndAlign sa = [device heapTextureSizeAndAlignWithDescriptor:t];
+        uint64_t v[2] = {sa.size, sa.align};
+        memcpy(to->mapped + where, v, 16);
+        return;
+    }
     if (tag == 460) { /* an object's identifier: {ref, kind, buffer ref, offset} */
         bufref = U32(8);
         off = U64(12);
