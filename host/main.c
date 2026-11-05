@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
+#include <CommonCrypto/CommonDigest.h>
 
 #include "dispatch.h"
 #include "exception.h"
@@ -139,6 +140,78 @@ static void *click_thread(void *unused) {
     return NULL;
 }
 
+/* Debugging: "hooksha file": the guest kernel's SHA-256 routine, watched for hashing this 16 KB page. */
+static uint8_t hook_page[0x4000];
+static void sha_hook(HvCpu *c) {
+    static uint64_t calls, pages;
+    calls++;
+    uint64_t blocks = c->x[1], va = c->x[2];
+    if (blocks >= 64) pages++;
+    if (!blocks || blocks > 256) return;
+    uint64_t bytes = blocks * 64, in = va & 0x3fff;
+    if (in + bytes > 0x4000) return;
+    static __thread uint8_t now[0x4000];
+    HvMachine *hm = hv_vm_machine();
+    HvWalk w;
+    for (uint64_t k = 0; k < bytes;) {
+        uint64_t chunk = 0x1000 - ((va + k) & 0xfff);
+        if (chunk > bytes - k) chunk = bytes - k;
+        hv_mmu_walk(c, va + k, HV_ACC_READ, 1, &w);
+        if (w.fsc || hv_phys_read(hm, w.pa, now + k, (unsigned)chunk)) return;
+        k += chunk;
+    }
+    if (bytes == 0x4000) { /* any 4 KB of it the same as the file's? */
+        char eq[5] = "....";
+        int any = 0;
+        for (int k = 0; k < 4; k++) {
+            static const uint8_t zero4k[0x1000];
+            if (memcmp(hook_page + k * 0x1000, zero4k, 0x1000) && !memcmp(now + k * 0x1000, hook_page + k * 0x1000, 0x1000)) eq[k] = 'S', any = 1;
+        }
+        if (any) {
+            int zeros[4] = {0};
+            for (int k = 0; k < 0x4000; k++) zeros[k >> 12] += now[k] == 0;
+            fprintf(stderr, "hengevm: sha hook: part of the page: %s, zero bytes per 4K %d %d %d %d, va %llx lr %llx\n", eq, zeros[0], zeros[1], zeros[2], zeros[3], (unsigned long long)va, (unsigned long long)c->x[30]);
+            for (int k = 0; k < 4; k++) if (eq[k] != 'S') {
+                fprintf(stderr, "  chunk %d there:", k);
+                for (int j = 0; j < 32; j++) fprintf(stderr, " %02x", now[k * 0x1000 + j]);
+                fprintf(stderr, "\n  chunk %d want: ", k);
+                for (int j = 0; j < 32; j++) fprintf(stderr, " %02x", hook_page[k * 0x1000 + j]);
+                fprintf(stderr, "\n");
+            }
+            return;
+        }
+    }
+    /* Mostly the same as the file at that offset, on what is not zero in the file? */
+    int same = 0, nonzero = 0;
+    for (uint64_t k = 0; k + 16 <= bytes; k += 64) {
+        static const uint8_t zero[16];
+        if (!memcmp(hook_page + in + k, zero, 16)) continue;
+        nonzero++;
+        same += !memcmp(now + k, hook_page + in + k, 16);
+    }
+    if (nonzero < 1 || same * 2 < nonzero) return;
+    int diff = 0, first = -1, last = -1;
+    for (uint64_t k = 0; k < bytes; k++)
+        if (now[k] != hook_page[in + k]) {
+            diff++;
+            if (first < 0) first = (int)k;
+            last = (int)k;
+        }
+    uint8_t h[32];
+    CC_SHA256(now, (CC_LONG)bytes, h);
+    uint32_t st[8] = {0};
+    HvWalk ws;
+    hv_mmu_walk(c, c->x[0], HV_ACC_READ, 1, &ws);
+    if (!ws.fsc) hv_phys_read(hm, ws.pa, st, 32);
+    fprintf(stderr, "hengevm: sha hook: cpu %d, %llu blocks at %llx (pa %llx, in page +%llx), %llu pages so far: %d differ (+%x..+%x); sha256 %02x%02x%02x%02x%02x%02x%02x%02x; state %08x %08x; lr %llx\n",
+            c->index, (unsigned long long)blocks, (unsigned long long)va, (unsigned long long)w.pa, (unsigned long long)in, (unsigned long long)pages, diff, first, last, h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], st[0], st[1], (unsigned long long)c->x[30]);
+    if (diff) {
+        fprintf(stderr, "  there:");
+        for (int k = first & ~31; k < (first & ~31) + 64 && k < (int)bytes; k++) fprintf(stderr, " %02x", now[k]);
+        fprintf(stderr, "\n");
+    }
+}
+
 /* Debugging: HV_INPUT_FILE=path follows a file of lines, for driving a running guest:
    "click x y", "move x y", "key code" (Linux), "shiftkey code", "type words", "wait seconds". */
 static void *input_thread(void *unused) {
@@ -163,6 +236,47 @@ static void *input_thread(void *unused) {
         else if (sscanf(line, "shiftkey %d", &x) == 1) key_press(x, 1);
         else if (sscanf(line, "wait %d", &x) == 1) sleep((unsigned)x);
         else if (!strncmp(line, "type ", 5)) type_text(line + 5);
+        else if (!strncmp(line, "hooksha ", 8)) {
+            FILE *pf = fopen(line + 8, "rb");
+            size_t got = pf ? fread(hook_page, 1, sizeof hook_page, pf) : 0;
+            if (pf) fclose(pf);
+            static const uint8_t sig[] = {0x5f, 0x24, 0x03, 0xd5, 0x03, 0x00, 0x00, 0x90, 0x41, 0x00, 0x00, 0xb5, 0xc0, 0x03, 0x5f, 0xd6, 0x63, 0x00, 0x36, 0x91, 0xe4, 0x43, 0x04, 0xd1, 0xff, 0x43, 0x04, 0xd1, 0x80, 0x28, 0x9f, 0x4c};
+            HvVmapple *bd = hv_vm_board();
+            HvCpu *c0 = hv_vm_cpu(0);
+            HvWalk wv;
+            hv_mmu_walk(c0, c0->vbar_el1, HV_ACC_READ, 1, &wv);
+            uint8_t *at = memmem(bd->ram, bd->ram_size, sig, sizeof sig);
+            uint64_t pa = at ? 0x70000000ull + (uint64_t)(at - bd->ram) : 0;
+            uint64_t va = c0->vbar_el1 + (pa - wv.pa);
+            HvWalk wc;
+            hv_mmu_walk(c0, va, HV_ACC_EXEC, 1, &wc);
+            fprintf(stderr, "hengevm: sha at pa %llx, va %llx (walks to pa %llx, fsc %u); page file %zu bytes\n", (unsigned long long)pa, (unsigned long long)va, (unsigned long long)wc.pa, (unsigned)wc.fsc, got);
+            if (at && !wc.fsc && wc.pa == pa && got == sizeof hook_page) {
+                HvMachine *hm = hv_vm_machine();
+                hm->stop_hook = sha_hook;
+                hm->stop_pc = va;
+                hm->flush_pending = 1;
+            }
+        }
+        else if (!strncmp(line, "find ", 5)) { /* bytes in hex: where in guest RAM, and what is around them */
+            uint8_t want[32];
+            size_t wn = 0;
+            for (const char *h = line + 5; h[0] && h[1] && wn < sizeof want; h += 2) {
+                unsigned v;
+                if (sscanf(h, "%2x", &v) != 1) break;
+                want[wn++] = (uint8_t)v;
+            }
+            HvVmapple *bd = hv_vm_board();
+            int n = 0;
+            for (uint64_t i = 0; wn && i + wn + 64 < bd->ram_size && n < 8; i += 4) {
+                if (memcmp(bd->ram + i, want, wn)) continue;
+                n++;
+                fprintf(stderr, "ram %llx:", (unsigned long long)(0x70000000ull + i));
+                for (int k = 0; k < 96; k++) fprintf(stderr, "%s%02x", k % 32 == 0 ? " " : "", bd->ram[i + k]);
+                fprintf(stderr, "\n");
+            }
+            fprintf(stderr, "hengevm: find: %d places\n", n);
+        }
         else if (!strncmp(line, "grep ", 5)) { /* lines of text in guest RAM (the kernel's log) */
             HvVmapple *bd = hv_vm_board();
             const char *word = line + 5;
@@ -190,7 +304,7 @@ static void *input_thread(void *unused) {
             for (uint64_t at = 0; got == sizeof want && at + 0x4000 <= bd->ram_size; at += 0x4000) {
                 int same = 0;
                 for (int k = 0; k < 16; k++) same += !memcmp(bd->ram + at + k * 0x400, want + k * 0x400, 8);
-                if (same < 9) continue;
+                if (same < 2) continue;
                 int diff = 0, first = -1, last = -1;
                 for (int k = 0; k < 0x4000; k++)
                     if (bd->ram[at + k] != want[k]) {
@@ -198,7 +312,11 @@ static void *input_thread(void *unused) {
                         if (first < 0) first = k;
                         last = k;
                     }
+                if (diff > 9700) continue; /* a page of zeros differs by about this */
                 fprintf(stderr, "hengevm: page copy at pa %llx: %d bytes differ, from +%x to +%x\n", (unsigned long long)(0x70000000ull + at), diff, first, last);
+                { int part[4] = {0};
+                  for (int k = 0; k < 0x4000; k++) part[k >> 12] += bd->ram[at + k] != want[k];
+                  fprintf(stderr, "  differ per 4K: %d %d %d %d\n", part[0], part[1], part[2], part[3]); }
                 if (diff && first >= 0 && found < 3) {
                     fprintf(stderr, "  there:");
                     for (int k = first & ~31; k < (first & ~31) + 64 && k < 0x4000; k++) fprintf(stderr, " %02x", bd->ram[at + k]);
@@ -220,11 +338,29 @@ static void *watch_thread(void *unused) {
     (void)unused;
     int secs = atoi(getenv("HV_WATCH"));
     time_t start = time(NULL);
+    {
+        HvVmapple *bd = hv_vm_board();
+        hv_smc_pages = bd->ram_size >> 14;
+        hv_smc_last = calloc(hv_smc_pages, 8);
+        hv_smc_counts = calloc(hv_smc_pages, 4);
+    }
     for (;;) {
         sleep((unsigned)(secs > 0 ? secs : 5));
         const uint8_t *page = hv_pvg_lite_display_page(board.pvg);
         fprintf(stderr, "hengevm: watch %ld s: swaps %u on %u;", (long)(time(NULL) - start), page ? *(const volatile uint32_t *)(page + 0xf98) : 0, page ? *(const volatile uint32_t *)(page + 0xfb0) : 0);
         for (int i = 0; i < ncpus; i++) fprintf(stderr, " %llx@%u", (unsigned long long)hv_vm_cpu(i)->pc, hv_vm_cpu(i)->el);
+        { HvMachine *wm = hv_vm_machine(); fprintf(stderr, " | jit %llu MB, flushes %llu, ic %llu, code writes %llu", (unsigned long long)wm->jit.used * 4 >> 20, (unsigned long long)wm->stats.block_flushes, (unsigned long long)wm->stats.flush_ic, (unsigned long long)wm->stats.flush_smc);
+          fprintf(stderr, " (cpu %llu dma %llu), %llu translations, blocks now %u; top:", (unsigned long long)hv_smc_cpu, (unsigned long long)hv_smc_dma, (unsigned long long)wm->stats.translations, (unsigned)wm->nblocks);
+          uint32_t seen = 0; uint64_t distinct = 0; (void)seen;
+          uint64_t best[4] = {0}; uint32_t bestn[4] = {0};
+          for (uint64_t pg = 0; pg < hv_smc_pages; pg++) {
+              uint32_t n = hv_smc_counts[pg];
+              if (n) distinct++;
+              for (int k = 0; k < 4; k++) if (n > bestn[k]) { for (int j = 3; j > k; j--) bestn[j] = bestn[j - 1], best[j] = best[j - 1]; bestn[k] = n, best[k] = pg; break; }
+          }
+          for (int k = 0; k < 4; k++) fprintf(stderr, " %llx*%u(pc %llx)", (unsigned long long)(0x70000000ull + (best[k] << 14)), bestn[k], (unsigned long long)hv_smc_last[best[k]]);
+          fprintf(stderr, " distinct %llu", (unsigned long long)distinct);
+        }
         fprintf(stderr, "\n");
     }
     return NULL;

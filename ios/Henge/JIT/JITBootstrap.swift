@@ -58,8 +58,8 @@ enum JITBootstrap {
     // region, with the stubs the loader places beside it. A larger prewarm is safe for QEMU, which is handed the
     // prewarmed region whenever it is at least what tb-size asks for.
     /// The one region HengeVM's translator gets for the whole session (it flushes and starts over when full,
-    /// never asks for more). 512 MB is 32K debugger packets to prepare, and holds most of a boot's code.
-    static let jitBytes = 512 * 1024 * 1024
+    /// never asks for more). 1 GB takes about 1.5 s to prepare, and a first boot through Setup makes that much code; a full flush drops all of it.
+    static let jitBytes = 1024 * 1024 * 1024
 
     /// True once the region is held. The memory budget needs this: after a
     /// prewarm the JIT is already counted in the footprint, so subtracting it

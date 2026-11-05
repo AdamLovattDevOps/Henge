@@ -403,6 +403,11 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     d.storageMode = MTLStorageModePrivate;
     d.hazardTrackingMode = h.flags & 2 ? MTLHazardTrackingModeTracked : MTLHazardTrackingModeDefault;
     id<MTLHeap> heap = [device newHeapWithDescriptor:d];
+    if (!heap && d.hazardTrackingMode == MTLHazardTrackingModeTracked) { /* not every GPU tracks placement heaps */
+        d.hazardTrackingMode = MTLHazardTrackingModeDefault;
+        heap = [device newHeapWithDescriptor:d];
+        [self complain:@"placement heaps here cannot be tracked"];
+    }
     if (!heap) { [self complain:[NSString stringWithFormat:@"heap of %llu bytes failed", h.length]]; return; }
     o->object = heap;
     o->heap_whole = [heap newBufferWithLength:(NSUInteger)h.length options:MTLResourceStorageModePrivate offset:0];

@@ -272,6 +272,10 @@ HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa) {
     return NULL;
 }
 
+uint32_t *hv_smc_counts;
+uint64_t *hv_smc_last;
+uint64_t hv_smc_pages, hv_smc_cpu, hv_smc_dma;
+
 void hv_invalidate_code(HvMachine *m, uint64_t pa) {
     HvRam *r = hv_ram_lookup(m, pa);
     if (!r) return;
@@ -283,6 +287,13 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
     r->code_pages[pg] = 0;
     __atomic_add_fetch(&r->page_gen[pg], 1, __ATOMIC_SEQ_CST);
     m->stats.flush_smc++;
+    if (hv_smc_counts && pg < hv_smc_pages) {
+        hv_smc_counts[pg]++;
+        uint64_t caller = hv_self ? hv_self->pc : 0;
+        hv_smc_last[pg] = caller;
+        if (hv_self) hv_smc_cpu++;
+        else hv_smc_dma++;
+    }
     /* Exits from other pages chained into the stale blocks go back to their stub
        (whose next chain finds the new translation). Under the translation lock,
        as chaining them is: one that saw the old generation is done by now. */

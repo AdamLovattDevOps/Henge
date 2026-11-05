@@ -122,16 +122,46 @@ static void on_ill(int sig, siginfo_t *info, void *ctx) {
                 (unsigned long long)m.stats.block_flushes, (unsigned long long)uc->uc_mcontext->__ss.__lr, info->si_addr);
         for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%llx%c", i, (unsigned long long)uc->uc_mcontext->__ss.__x[i], i % 6 == 5 ? '\n' : ' ');
         fprintf(stderr, "\n");
+        fprintf(stderr, "sp=%llx ram %llx size %llx\n", (unsigned long long)uc->uc_mcontext->__ss.__sp, (unsigned long long)(uintptr_t)board.ram, (unsigned long long)board.ram_size);
+        {
+            uint64_t x7 = uc->uc_mcontext->__ss.__x[7], x28 = uc->uc_mcontext->__ss.__x[28];
+            if (x7 >= x28 && x7 < x28 + sizeof(HvCpu)) {
+                const uint64_t *ent = (const uint64_t *)(uintptr_t)(x7 + 0x500);
+                fprintf(stderr, "tlb entry at +%llx:", (unsigned long long)(x7 - x28));
+                for (int i = 0; i < 16; i++) fprintf(stderr, " %llx", (unsigned long long)ent[i]);
+                fprintf(stderr, "\n");
+            }
+        }
         for (int i = 0; i < ncpus; i++)
             fprintf(stderr, "  cpu %d: guest pc %llx el%u miss site %llx\n", i, (unsigned long long)cpus[i].pc, cpus[i].el, (unsigned long long)cpus[i].miss_site);
         if (in_rx) { /* the code it ran up to here, as it stands */
-            uint64_t from = pc - 0x180 < rx ? rx : pc - 0x180;
+            uint64_t from = pc - 0x300 < rx ? rx : pc - 0x300;
             fprintf(stderr, "  words from rx+%llx:", (unsigned long long)(from - rx));
-            for (uint64_t at = from; at < pc + 0x20 && at < rx + size; at += 4) {
+            for (uint64_t at = from; at < pc + 0x600 && at < rx + size; at += 4) {
                 if (((at - from) & 0x1f) == 0) fprintf(stderr, "\n   ");
                 fprintf(stderr, " %08x", *(const uint32_t *)(uintptr_t)at);
             }
             fprintf(stderr, "\n");
+        }
+        { /* x15 after a chained exit's check: the literal it loaded. Which exits, and where do they go now? */
+            uint64_t x15 = uc->uc_mcontext->__ss.__x[15];
+            const uint32_t *w15 = (const uint32_t *)(uintptr_t)rx;
+            uint64_t n15 = used / 4 < m.jit.capacity ? used / 4 : m.jit.capacity;
+            int shown = 0;
+            for (uint64_t k = 0; k + 8 < n15 && shown < 12; k++) {
+                if ((w15[k] & 0xff00001fu) != 0x5800000fu) continue; /* ldr x15, literal */
+                int64_t lo = (int64_t)(int32_t)(w15[k] << 8) >> 13;
+                uint64_t at = k + (uint64_t)lo;
+                if (at + 1 >= n15) continue;
+                uint64_t lit = w15[at] | (uint64_t)w15[at + 1] << 32;
+                if (lit != x15) continue;
+                /* eor x6; orr; cbnz; B */
+                uint32_t b = w15[k + 4];
+                if ((b & 0xfc000000u) != 0x14000000u) continue;
+                int64_t off = (int64_t)(b << 6) >> 6;
+                fprintf(stderr, "  exit at rx+%llx: B word %08x to rx+%llx\n", (unsigned long long)(k + 4) * 4, b, (unsigned long long)((int64_t)(k + 4) + off) * 4);
+                shown++;
+            }
         }
         if (!in_rx || pc >= rx + used) {
             /* Who branches there? */
@@ -145,7 +175,7 @@ static void on_ill(int sig, siginfo_t *info, void *ctx) {
                 else if ((i & 0xff000010u) == 0x54000000u || (i & 0x7e000000u) == 0x34000000u) off = (int64_t)(int32_t)(i << 8) >> 13;
                 else if ((i & 0x7e000000u) == 0x36000000u) off = (int64_t)(int32_t)(i << 13) >> 18;
                 else continue;
-                if (rx + k * 4 + (uint64_t)(off * 4) != pc) continue;
+                if (rx + k * 4 + (uint64_t)(off * 4) != pc && rx + k * 4 + (uint64_t)(off * 4) != pc - 4) continue;
                 found++;
                 fprintf(stderr, "  branch at rx+%llx (word %08x) leads there; around it:", (unsigned long long)k * 4, i);
                 for (int64_t d = -6; d <= 3; d++)
@@ -189,6 +219,8 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     int r = c->jit_rx ? hv_machine_init_jit(&m, c->jit_rx, c->jit_rw, jit) : hv_machine_init(&m, jit);
     if (r != 0) return fail(err, errlen, "Cannot set up the JIT region.");
     m.log = c->log;
+    m.gen_checks = getenv("HV_JIT_POISON") != NULL;
+    if (getenv("HV_SLOW_MEM")) m.slow_mem = 1; /* debugging: every load and store through the helper */
     ncpus = c->ncpus < 1 ? 1 : c->ncpus > HV_MAX_CPUS ? HV_MAX_CPUS : c->ncpus;
     m.big_lock_on = ncpus > 1 && getenv("HV_BIG_LOCK"); /* debugging: one CPU in guest code at a time */
     HvCfgParams cfg = {.nr_cpus = (uint32_t)ncpus, .ecid = c->ecid, .seed = c->seed, .mac_en0 = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01}};

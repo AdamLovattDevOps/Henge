@@ -33,6 +33,7 @@ typedef struct HvMmio {
 } HvMmio;
 
 typedef struct HvBlock {
+    uint32_t jit_gen; /* full flushes when it was made */
     uint64_t va, pa;
     uint32_t flags;      /* HV_BLOCK_* state the translation depends on */
     uint32_t ninsns;
@@ -206,6 +207,9 @@ typedef struct HvMachine {
     void (*icc_write)(struct HvMachine *m, HvCpu *cpu, uint32_t reg, uint64_t v);
 
     uint64_t stop_pc;    /* tests: leave the dispatcher when pc reaches this */
+    void (*stop_hook)(HvCpu *cpu); /* debugging: call this there instead of leaving */
+    uint32_t jit_gen;    /* full flushes so far, as blocks see them (HV_JIT_POISON checks) */
+    int gen_checks;
     int trace;           /* print every block entered */
     int log;             /* 1: unknown sysregs, undefined instructions, unmapped accesses; 2: also every exception */
     int slow_mem;        /* tests: send every load and store through hv_mem_emulate */
@@ -272,6 +276,10 @@ int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,
 HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa);
 /* Drop the translations made from the RAM page holding pa (it was written, or the guest invalidated it). */
 void hv_invalidate_code(HvMachine *m, uint64_t pa);
+/* Debugging (HV_WATCH): which pages keep losing their translations. */
+extern uint32_t *hv_smc_counts;
+extern uint64_t *hv_smc_last;
+extern uint64_t hv_smc_pages, hv_smc_cpu, hv_smc_dma;
 /* A device wrote guest memory directly: translations made from it are out of date. Any thread. */
 void hv_dma_written(HvMachine *m, uint64_t pa, uint64_t len);
 HvMmio *hv_mmio_lookup(HvMachine *m, uint64_t pa);

@@ -17,6 +17,7 @@
 
 void hv_flush_blocks(HvMachine *m) {
     m->stats.block_flushes++;
+    __atomic_add_fetch(&m->jit_gen, 1, __ATOMIC_SEQ_CST);
     for (int i = 0; i < m->ncpus; i++)
         if (m->cpus[i]) {
             hv_ijc_reset(m->cpus[i], 0);
@@ -28,6 +29,16 @@ void hv_flush_blocks(HvMachine *m) {
     m->nslots = 0;
     m->nxchained = 0;
     hv_jit_reset(&m->jit);
+    /* HV_JIT_POISON: nothing old is left to run, so a stale pointer faults where it is used. */
+    static int poison = -1;
+    if (poison < 0) poison = getenv("HV_JIT_POISON") != NULL;
+    m->gen_checks = poison;
+    if (poison) {
+        size_t bytes = (size_t)m->jit.capacity * 4;
+        uint32_t *rw = (uint32_t *)((uint8_t *)m->jit.base + m->jit.rw_diff);
+        for (size_t i = 0; i < bytes / 4; i++) rw[i] = 0;
+        hv_jit_finish(&m->jit, m->jit.base, m->jit.capacity);
+    }
 }
 
 /* Parked: not running guest code, nor using its TLB, so other CPUs need not
@@ -128,7 +139,7 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
         gen = __atomic_load_n(&ram->page_gen[pg], __ATOMIC_ACQUIRE);
     }
     /* Translate without the lock, into this thread's buffer... */
-    HvBlock nb = {.va = va, .pa = pa, .flags = flags, .gen = gen, .ram = ram, .pg = pg, .maker = cpu->index + 1};
+    HvBlock nb = {.va = va, .pa = pa, .flags = flags, .gen = gen, .ram = ram, .pg = pg, .maker = cpu->index + 1, .jit_gen = __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST)};
     uint64_t t0 = m->stats_interval ? mach_absolute_time() : 0;
     if (hv_translate_emit(m, &nb, code, avail) != 0) goto flush_unlocked;
     if (m->stats_interval) {
@@ -142,6 +153,8 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
         m->stats.flush_full++;
         goto flush;
     }
+    if (m->gen_checks && nb.jit_gen != __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST))
+        fprintf(stderr, "hengevm: cpu %u translated across a flush: gen %u to %u, placed at rx+%llx, used %llx, active %d\n", cpu->index, nb.jit_gen, m->jit_gen, (unsigned long long)(nb.code - m->jit.base) * 4, (unsigned long long)m->jit.used * 4, cpu->pc_state->active);
     block_dump(&nb, code);
     /* ...then take the lock only to publish it. */
     if (pthread_mutex_trylock(&m->tr_mu) != 0) {
@@ -685,6 +698,8 @@ static void print_stats(HvCpu *cpu, int force) {
    jump gets a block that just wrote its own page back to the dispatcher. */
 static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
     uint32_t idx = (uint32_t)(slot - m->slots);
+    if (m->gen_checks && (b->jit_gen != m->jit_gen || (m->slot_site[idx] && (uint64_t)(m->slot_site[idx] - m->jit.base) >= m->jit.used)))
+        fprintf(stderr, "hengevm: chain slot %u site %p to rx+%llx va %llx: block gen %u now %u\n", idx, (void *)m->slot_site[idx], (unsigned long long)(b->code - m->jit.base) * 4, (unsigned long long)b->va, b->jit_gen, m->jit_gen);
     uint64_t xa = m->slot_xa[idx];
     if (xa) {
         /* From another page: only to the block in the physical page the exit's
@@ -770,6 +785,7 @@ static void stop_the_world(HvCpu *cpu) {
             hv_cpu_process_requests(cpu); /* one of them may be waiting on a TLBI of ours */
             if (spins > 100) sched_yield();
         }
+        if (m->gen_checks) for (int i = 0; i < m->ncpus; i++) if (m->cpus[i] && m->cpus[i] != cpu && m->cpus[i]->pc_state->active) fprintf(stderr, "hengevm: flush while cpu %d is active\n", i);
         pthread_mutex_lock(&m->tr_mu);
         hv_flush_blocks(m);
         pthread_mutex_unlock(&m->tr_mu);
@@ -874,9 +890,13 @@ static int run_loop(HvCpu *cpu, int one) {
             pending_chain = NULL;
             why = 3;
         }
-        if (cpu->pc == m->stop_pc) return HV_EXIT_HALT;
+        if (cpu->pc == m->stop_pc) {
+            if (!m->stop_hook) return HV_EXIT_HALT;
+            m->stop_hook(cpu);
+            pending_chain = NULL; /* every call must come back through here */
+        }
 
-        if (m->log && cpu->el && (cpu->sctlr_el1 & 1) && !((cpu->pc >> 55) & 1) && cpu->pc >= 0x100000000ull) { /* EL1 at a user address: how did we get here? */
+        if ((m->log || m->gen_checks) && cpu->el && (cpu->sctlr_el1 & 1) && !((cpu->pc >> 55) & 1) && cpu->pc >= 0x100000000ull) { /* EL1 at a user address: how did we get here? */
             static int reported;
             if (reported++ < 4) {
                 fprintf(stderr, "hengevm: el1 at user pc %llx: previous block %llx flags %x (%u insns), exit reason %u, why %d, "
@@ -1012,6 +1032,8 @@ static int run_loop(HvCpu *cpu, int one) {
         cpu->icount++;
         m->stats.blocks++;
         if (m->stats_interval && cpu->index == 0 && (m->stats.blocks & 0xffff) == 0) print_stats(cpu, 0);
+        if (m->gen_checks && ((uint64_t)(b->code - m->jit.base) >= m->jit.used || b->jit_gen != __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST)))
+            fprintf(stderr, "hengevm: cpu %u entering %p (rx+%llx, used %llx) for va %llx: block gen %u, now %u, maker %u\n", cpu->index, (void *)b->code, (unsigned long long)(b->code - m->jit.base) * 4, (unsigned long long)m->jit.used * 4, (unsigned long long)b->va, b->jit_gen, m->jit_gen, b->maker);
         hv_enter(cpu, b->code);
 
         if (cpu->exit_reason == HV_EXIT_BRANCH && cpu->last_stub && m->chain) {

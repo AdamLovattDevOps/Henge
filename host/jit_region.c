@@ -61,6 +61,18 @@ void hv_jit_region_close(HvJitRegion *region) {
 }
 
 void hv_jit_write(HvJitRegion *region, uint32_t *start, const void *src, size_t bytes) {
+    /* One instruction may be rewritten while other CPUs run it (chaining a branch).
+       memcpy may copy a word in pieces, and a CPU fetching in between takes half of
+       the old branch and half of the new one: a jump to nowhere. */
+    if (bytes == 4) {
+        uint32_t word;
+        memcpy(&word, src, 4);
+#if TARGET_OS_OSX
+        if (!region->rw_diff) pthread_jit_write_protect_np(0);
+#endif
+        __atomic_store_n((uint32_t *)((uint8_t *)start + region->rw_diff), word, __ATOMIC_RELEASE);
+        return;
+    }
     if (region->rw_diff) {
         memcpy((uint8_t *)start + region->rw_diff, src, bytes);
         return;
