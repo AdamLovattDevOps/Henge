@@ -187,11 +187,8 @@ final class Installer: NSObject, ObservableObject {
 
     private func install(_ mac: VirtualMac, ipsw: URL, cpus: Int) async throws {
         guard JITBootstrap.ready else { throw message("Turn on JIT first: the installer runs the Mac's own restore system, which needs it.") }
-        let available = UInt64(henge_available_memory()) >> 20
-        let ram = min(UInt64(mac.ramMB), available > 2000 ? (available - 1500) / 512 * 512 : 0)
-        guard ram >= 2048 else {
-            throw message("Only \(available) MB is free for Henge; installing needs about 3 GB (the increased memory limit entitlement gives it).")
-        }
+        let ram = GuestMemory.prepare(mac)
+        guard ram >= 2048 else { throw message("Installing needs a few more GB of free storage for the Mac's memory.") }
         let work = mac.directory.appendingPathComponent("restore", isDirectory: true)
         try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
         var buffer = [CChar](repeating: 0, count: 256)

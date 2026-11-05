@@ -115,19 +115,11 @@ struct SessionView: View {
         }
     }
 
-    /// Guest RAM: what the machine was made with, or less if iOS will not give the app that much.
-    /// The translator's own tables (blocks, hash, slots) take about 400 MB more.
-    private func guestRAM() -> UInt64 {
-        let available = UInt64(henge_available_memory()) >> 20
-        let fits = available > 2000 ? (available - 1500) / 512 * 512 : 0 // the phone's log: 1.5 GB is not too much once the GPU is drawing
-        return min(UInt64(mac.ramMB), fits)
-    }
-
     private func run() async {
-        let ram = guestRAM()
-        HengeLog.log("session", "available memory \(henge_available_memory() >> 20) MB; guest gets \(ram) MB")
+        let ram = GuestMemory.prepare(mac)
+        HengeLog.log("session", "available memory \(henge_available_memory() >> 20) MB")
         guard ram >= 1024 else {
-            error = "Only \(henge_available_memory() >> 20) MB is free for Henge. A Mac needs at least 1 GB, more with the increased memory limit entitlement."
+            error = "There is not room for this Mac's memory: it needs a few GB of free storage."
             return
         }
         var buffer = [CChar](repeating: 0, count: 256)

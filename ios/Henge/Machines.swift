@@ -18,6 +18,23 @@ struct VirtualMac: Identifiable, Codable, Equatable {
     var aux: URL { directory.appendingPathComponent("auxiliary.bin") }
 }
 
+/// How much RAM a Mac gets. It lives in a file beside its disk: iOS's memory limit does not
+/// count a mapped file's pages, and iOS can write them out and drop them by itself, as swap.
+enum GuestMemory {
+    /// Points the engine at the file (it is unlinked as soon as it is open) and returns the size that fits.
+    static func prepare(_ mac: VirtualMac) -> UInt64 {
+        let file = mac.directory.appendingPathComponent("ram.tmp")
+        setenv("HV_RAM_FILE", file.path, 1)
+        let free = (try? mac.directory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
+            .volumeAvailableCapacityForImportantUsage ?? 0
+        let room = free > 0 ? UInt64(max(free - (2 << 30), 0)) >> 20 : UInt64.max
+        let reach = henge_largest_mapping_mb()
+        let ram = min(UInt64(mac.ramMB), room, reach > 512 ? reach - 512 : 0) / 512 * 512
+        HengeLog.log("session", "guest RAM \(ram) MB in a file (asked \(mac.ramMB), disk room \(room), largest mapping \(reach))")
+        return ram
+    }
+}
+
 /// machine.json in an exported folder (tools/export_ios.sh writes it).
 private struct MachineFile: Codable {
     var name: String?

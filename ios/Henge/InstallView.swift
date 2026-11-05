@@ -6,7 +6,7 @@ struct InstallView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var release = MacOSRelease.all.first(where: Installer.haveImage) ?? MacOSRelease.all[0]
     @State private var name = "Mac"
-    @State private var ramGB = 4
+    @State private var ramGB = 8
     @State private var deleteAfter = false
     @State private var refresh = 0 // redraws the list when a download is deleted
     @AppStorage("henge.cpus") private var cpus = 3

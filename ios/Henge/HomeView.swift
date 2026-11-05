@@ -26,6 +26,8 @@ struct HomeView: View {
                 Section("Memory") {
                     LabeledContent("Extra memory", value: Entitlements.increasedMemory ? "On" : "Off")
                     LabeledContent("Henge's limit", value: ByteText.string(UInt64(Entitlements.memoryLimitAtLaunch)))
+                    Text("A Mac's memory lives in a file, so it can go past this limit. It uses that much free storage while the Mac runs.")
+                        .font(.footnote).foregroundStyle(.secondary)
                     if !Entitlements.increasedMemory {
                         Text("This install isn't signed with the increased memory limit entitlement. Reinstall Henge with a certificate that has it. Export your Mac first if the reinstall replaces the app's data.")
                             .font(.footnote).foregroundStyle(.secondary)
@@ -76,6 +78,15 @@ struct HomeView: View {
                                 .buttonStyle(.bordered)
                                 .disabled(!jitReady)
                             Menu {
+                                Menu("Memory: \(mac.ramMB / 1024) GB") {
+                                    ForEach([4, 6, 8], id: \.self) { gb in
+                                        Button("\(gb) GB") {
+                                            var changed = mac
+                                            changed.ramMB = gb * 1024
+                                            machines.update(changed)
+                                        }
+                                    }
+                                }
                                 Button("Export") { machines.export(mac) }
                                     .disabled(machines.exporting != nil)
                                 Button("Delete", role: .destructive) { toDelete = mac }
