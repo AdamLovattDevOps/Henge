@@ -16,25 +16,80 @@ struct SessionView: View {
     @State private var started = Date()
     @AppStorage("henge.cpus") private var cpus = 3
 
+    @State private var typing = false
+    @State private var rightClick = false
+    @State private var lastDrag: CGPoint?
+    @State private var dragDistance: CGFloat = 0
+    @State private var dragStart = Date()
+    @State private var showDetails = false
+    @Environment(\.verticalSizeClass) private var verticalSize
+
     var body: some View {
         NavigationStack {
-            List {
-                Section(phase) {
-                    BootDisplay().aspectRatio(16.0 / 10.0, contentMode: .fit)
-                    if let error { Text(error).foregroundStyle(.red) }
+            VStack(spacing: 0) {
+                screen
+                if verticalSize != .compact {
+                    Text(phase).font(.footnote).foregroundStyle(.secondary).padding(.top, 6)
+                    if let error { Text(error).foregroundStyle(.red).padding(.horizontal) }
+                    Text("Drag to move the pointer, tap to click.").font(.footnote).foregroundStyle(.secondary).padding(.top, 2)
+                    Spacer()
                 }
-                Section("Status") { status }
-                Section("Log") { logView }
+                KeyboardCatcher(active: $typing).frame(width: 0, height: 0)
             }
             .navigationTitle(mac.name)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .primaryAction) {
+                ToolbarItemGroup(placement: .primaryAction) {
+                    Button { typing.toggle() } label: { Image(systemName: typing ? "keyboard.chevron.compact.down" : "keyboard") }
+                        .accessibilityLabel("Keyboard")
+                    Button { rightClick.toggle() } label: { Image(systemName: rightClick ? "cursorarrow.click.2" : "cursorarrow.click") }
+                        .accessibilityLabel(rightClick ? "Next tap is a right click" : "Next tap is a click")
+                    Button { showDetails = true } label: { Image(systemName: "info.circle") }
+                        .accessibilityLabel("Details")
                     Button(state == 1 ? "Shut Down" : "Close") { finish() }
+                }
+            }
+            .sheet(isPresented: $showDetails) {
+                NavigationStack {
+                    List {
+                        Section(phase) { status }
+                        Section("Log") { logView }
+                    }
+                    .navigationTitle("Details")
+                    .navigationBarTitleDisplayMode(.inline)
                 }
             }
         }
         .task { await run() }
+    }
+
+    /// The Mac's screen, used like a trackpad: pointer speed suits a 1920-wide screen on a small one.
+    private var screen: some View {
+        BootDisplay()
+            .aspectRatio(16.0 / 9.0, contentMode: .fit)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        if let last = lastDrag {
+                            let dx = value.location.x - last.x, dy = value.location.y - last.y
+                            dragDistance += abs(dx) + abs(dy)
+                            henge_vm_mouse_move(Int32((dx * 3).rounded()), Int32((dy * 3).rounded()))
+                        } else {
+                            dragDistance = 0
+                            dragStart = Date()
+                        }
+                        lastDrag = value.location
+                    }
+                    .onEnded { _ in
+                        lastDrag = nil
+                        guard dragDistance < 8, Date().timeIntervalSince(dragStart) < 0.4 else { return }
+                        let button: Int32 = rightClick ? 1 : 0
+                        henge_vm_mouse_button(button, 1)
+                        henge_vm_mouse_button(button, 0)
+                        rightClick = false
+                    }
+            )
     }
 
     private var phase: String {

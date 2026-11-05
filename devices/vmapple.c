@@ -1,10 +1,15 @@
 #include "vmapple.h"
 #include "pvg_lite.h"
 
+#include <errno.h>
+#include <pthread.h>
+#include <pthread/qos.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 #include <time.h>
 
 #include "timer.h"
@@ -108,6 +113,26 @@ static void gic_msi_write(void *opaque, uint64_t off, uint64_t v, unsigned size)
                            (unsigned long long)v, size);
 }
 
+/* A mapped file's page is slow to touch the first time and as fast as any other
+   afterwards, so a background thread gets there before the guest does. Adding
+   zero dirties the page without changing it, whatever the guest has written. */
+struct PrefaultArgs {
+    uint8_t *ram;
+    uint64_t size;
+};
+
+static void *prefault_thread(void *arg) {
+    struct PrefaultArgs a = *(struct PrefaultArgs *)arg;
+    free(arg);
+    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (uint64_t off = 0; off < a.size; off += 0x4000) __atomic_fetch_add((volatile uint64_t *)(a.ram + off), 0, __ATOMIC_RELAXED);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    fprintf(stderr, "hengevm: guest RAM file ready in %.1f s\n", (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) * 1e-9);
+    return NULL;
+}
+
 static uint64_t tick_locked(HvMachine *m, HvCpu *cpu) {
     HvVmapple *b = m->tick_opaque;
     uint64_t deadline = hv_timer_update(b->gic, cpu);
@@ -143,7 +168,33 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
     b->ncpus = cfg->nr_cpus ? (int)cfg->nr_cpus : 1;
     if (b->ncpus > HV_MAX_CPUS) b->ncpus = HV_MAX_CPUS;
     b->ram_size = ram_size;
-    b->ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    /* HV_RAM_FILE: guest RAM in a file. iOS's memory limit counts anonymous
+       pages and not pages of a mapped file, which it can also write out and
+       drop by itself, so the guest can have more RAM than the app may hold.
+       The file is unlinked at once and goes away with the process. */
+    const char *ram_file = getenv("HV_RAM_FILE");
+    b->ram = MAP_FAILED;
+    if (ram_file && *ram_file) {
+        int fd = open(ram_file, O_RDWR | O_CREAT | O_TRUNC, 0600);
+        if (fd >= 0) {
+            unlink(ram_file);
+            if (ftruncate(fd, (off_t)ram_size) == 0)
+                b->ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            close(fd);
+        }
+        if (b->ram == MAP_FAILED) fprintf(stderr, "hengevm: guest RAM file %s failed: %s; using anonymous memory\n", ram_file, strerror(errno));
+        else {
+            fprintf(stderr, "hengevm: guest RAM (%llu MB) is backed by a file\n", (unsigned long long)(ram_size >> 20));
+            if (!getenv("HV_RAM_NO_PREFAULT")) {
+                struct PrefaultArgs *a = malloc(sizeof *a);
+                a->ram = b->ram, a->size = ram_size;
+                pthread_t t;
+                if (pthread_create(&t, NULL, prefault_thread, a) == 0) pthread_detach(t);
+                else free(a);
+            }
+        }
+    }
+    if (b->ram == MAP_FAILED) b->ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (b->ram == MAP_FAILED) return -1;
     b->rom = mmap(NULL, ROM_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (b->rom == MAP_FAILED) return -1;

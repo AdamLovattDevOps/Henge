@@ -26,7 +26,7 @@ struct BootDisplay: View {
         .task {
             while !Task.isCancelled {
                 image = Self.snapshot() ?? image
-                try? await Task.sleep(nanoseconds: 400_000_000)
+                try? await Task.sleep(nanoseconds: 66_000_000)
             }
         }
     }

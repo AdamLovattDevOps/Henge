@@ -932,16 +932,29 @@ typedef struct {
         failed++;
         [self complain:[NSString stringWithFormat:@"command buffer: %@", cb.error.localizedDescription]];
     }
-    if (++execs % 2000 == 0)
-        fprintf(stderr, "hengevm: pvg-metal: %llu execs, %llu draws, %llu failed\n", (unsigned long long)execs, (unsigned long long)draws, (unsigned long long)failed);
+    if (++execs % 2000 == 0) {
+        static double t0;
+        if (!t0) t0 = now_seconds();
+        fprintf(stderr, "hengevm: pvg-metal: %llu execs, %llu draws, %llu failed, %.0f s\n", (unsigned long long)execs, (unsigned long long)draws, (unsigned long long)failed, now_seconds() - t0);
+    }
 }
 
-static inline uint8_t to_byte(float v) {
-    if (!(v > 0)) return 0;
-    if (v >= 1) return 255;
-    /* The surface is linear light. */
-    float s = v <= 0.0031308f ? v * 12.92f : 1.055f * powf(v, 1.0f / 2.4f) - 0.055f;
-    return (uint8_t)(s * 255.0f + 0.5f);
+/* The surface is linear light in half floats: every possible value, to a display byte. */
+static const uint8_t *half_to_byte(void) {
+    static uint8_t *table;
+    if (table) return table;
+    uint8_t *t = malloc(65536);
+    for (uint32_t i = 0; i < 65536; i++) {
+        uint16_t bits = (uint16_t)i;
+        __fp16 h;
+        memcpy(&h, &bits, 2);
+        float v = h;
+        if (!(v > 0)) t[i] = 0;
+        else if (v >= 1) t[i] = 255;
+        else t[i] = (uint8_t)((v <= 0.0031308f ? v * 12.92f : 1.055f * powf(v, 1.0f / 2.4f) - 0.055f) * 255.0f + 0.5f);
+    }
+    table = t;
+    return t;
 }
 
 /* What the display should show: copied to memory the host can read, at most a few times a second. */
@@ -949,7 +962,7 @@ static inline uint8_t to_byte(float v) {
     id<MTLTexture> t = mapped_textures[@(mapping)];
     if (!t) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
     double now = now_seconds();
-    if (now - last_capture < 0.2) return;
+    if (now - last_capture < 0.066) return; /* 15 a second is plenty until this is GPU work */
     last_capture = now;
     HvObject *surface = surfaces[@(mapping)];
     if (!surface) return;
@@ -957,12 +970,13 @@ static inline uint8_t to_byte(float v) {
     uint32_t w = (uint32_t)t.width, h = (uint32_t)t.height;
     uint8_t *out = frame && frame_w == w && frame_h == h ? frame : malloc((size_t)w * h * 4);
     const uint8_t *src = surface->mapped + surface->first;
+    const uint8_t *lut = half_to_byte();
     if (bpp == 8) {
         for (uint32_t y = 0; y < h; y++) {
-            const __fp16 *in = (const __fp16 *)(src + y * row);
+            const uint16_t *in = (const uint16_t *)(src + y * row);
             uint8_t *o = out + (size_t)y * w * 4;
             for (uint32_t x = 0; x < w; x++, in += 4, o += 4) {
-                o[0] = to_byte(in[2]), o[1] = to_byte(in[1]), o[2] = to_byte(in[0]), o[3] = 255;
+                o[0] = lut[in[2]], o[1] = lut[in[1]], o[2] = lut[in[0]], o[3] = 255;
             }
         }
     } else {
