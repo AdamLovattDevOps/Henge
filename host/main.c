@@ -106,18 +106,23 @@ static void key_press(int code, int shift) {
 }
 
 static void type_text(const char *t) {
-    static const char row1[] = "qwertyuiop", row2[] = "asdfghjkl", row3[] = "zxcvbnm", nums[] = "1234567890";
+    static const char row1[] = "qwertyuiop", row2[] = "asdfghjkl", row3[] = "zxcvbnm", nums[] = "1234567890", shifted[] = "!@#$%^&*()";
+    static const struct { char c; uint8_t code, shift; } extra[] = {
+        {' ', 57, 0}, {'.', 52, 0}, {'-', 12, 0}, {'/', 53, 0}, {',', 51, 0}, {';', 39, 0}, {'\'', 40, 0}, {'=', 13, 0}, {'[', 26, 0},
+        {']', 27, 0}, {'\\', 43, 0}, {'`', 41, 0}, {'_', 12, 1}, {'+', 13, 1}, {':', 39, 1}, {'"', 40, 1}, {'|', 43, 1}, {'<', 51, 1},
+        {'>', 52, 1}, {'?', 53, 1}, {'~', 41, 1}, {'{', 26, 1}, {'}', 27, 1}};
     for (; *t; t++) {
         int c = *t, up = c >= 'A' && c <= 'Z', code = 0;
         if (up) c += 32;
         const char *f;
-        if ((f = strchr(row1, c)) && c) code = 16 + (int)(f - row1);
-        else if ((f = strchr(row2, c)) && c) code = 30 + (int)(f - row2);
-        else if ((f = strchr(row3, c)) && c) code = 44 + (int)(f - row3);
-        else if ((f = strchr(nums, c)) && c) code = 2 + (int)(f - nums);
-        else if (c == ' ') code = 57;
-        else if (c == '.') code = 52;
-        else if (c == '-') code = 12;
+        if ((f = strchr(row1, c))) code = 16 + (int)(f - row1);
+        else if ((f = strchr(row2, c))) code = 30 + (int)(f - row2);
+        else if ((f = strchr(row3, c))) code = 44 + (int)(f - row3);
+        else if ((f = strchr(nums, c))) code = 2 + (int)(f - nums);
+        else if ((f = strchr(shifted, c))) code = 2 + (int)(f - shifted), up = 1;
+        else
+            for (size_t k = 0; k < sizeof extra / sizeof extra[0]; k++)
+                if (extra[k].c == c) code = extra[k].code, up = extra[k].shift;
         if (code) key_press(code, up);
     }
 }
@@ -366,6 +371,13 @@ static void *input_thread(void *unused) {
         else if (sscanf(line, "move %d %d", &x, &y) == 2) pointer_to(x, y);
         else if (sscanf(line, "key %d", &x) == 1) key_press(x, 0);
         else if (sscanf(line, "shiftkey %d", &x) == 1) key_press(x, 1);
+        else if (sscanf(line, "cmdkey %d", &x) == 1) { /* with Command held: 125 is the left one */
+            key_event(125, 1);
+            usleep(60000);
+            key_press(x, 0);
+            usleep(60000);
+            key_event(125, 0);
+        }
         else if (sscanf(line, "wait %d", &x) == 1) sleep((unsigned)x);
         else if (!strncmp(line, "type ", 5)) type_text(line + 5);
         else if (!strncmp(line, "hooksha ", 8)) {

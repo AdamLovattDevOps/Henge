@@ -275,6 +275,15 @@ int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
     cfg.if_mru = 1500;
     slirp = slirp_new(&cfg, &callbacks, NULL);
     if (!slirp) return -1;
+    if (getenv("HV_NET_FWD")) { /* debugging: "hostport:guestport", from this Mac's loopback into the guest */
+        int hp, gp;
+        struct in_addr h, g;
+        if (sscanf(getenv("HV_NET_FWD"), "%d:%d", &hp, &gp) == 2) {
+            inet_pton(AF_INET, "127.0.0.1", &h);
+            inet_pton(AF_INET, "10.0.2.15", &g);
+            if (slirp_add_hostfwd(slirp, 0, h, hp, g, gp) != 0) fprintf(stderr, "hengevm: no forward for port %d\n", hp);
+        }
+    }
     net = n;
     n->transmit = transmit;
     pthread_t t;
