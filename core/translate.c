@@ -270,17 +270,18 @@ static void put_ijc_jump(Emit *e, int check) {
 }
 
 /* A direct branch to another page through hv_xjump_thunk (the cache lookup in
-   one shared copy): seven or eight words. check: test exit_req first. */
+   one shared copy): a BR, so the CPU's own stack of return addresses gets nothing it
+   would use on the guest's next return. check: test exit_req first. */
 static void put_xjump(Emit *e, uint64_t target, int check) {
     if (e->no_ijc) {
         put_lit(e, 15, target);
         put_ijc_jump(e, 1);
         return;
     }
-    put(e, STR_X(30, 28, HV_CPU_X(30)));
+    if (!(e->n & 1)) put(e, 0xd503201f); /* nop: the data after the br starts 8-byte aligned */
+    put(e, 0x10000007u | 3u << 5);       /* adr x7, data */
     put(e, LDR_X(15, 28, HV_CPU_XJUMP_THUNK));
-    if ((e->n & 1) == 0) put(e, 0xd503201f); /* nop: the data after the blr starts 8-byte aligned */
-    put(e, BLR_X(15));
+    put(e, BR_X(15));
     put(e, (e->flags & 0x7fffffffu) | (check ? 1u << 31 : 0));
     put(e, 0);
     put(e, (uint32_t)target);
@@ -430,32 +431,32 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
 }
 
 /* Call hv_helper(cpu, info) and continue unless it leaves. */
-/* Call hv_helper: guest x30 saved, a blr to hv_helper_thunk with the
-   HvHelperInfo right after it (8-byte aligned), and x0 reloaded when it comes
-   back. Seven or eight words; host x15 is clobbered. */
+/* Call hv_helper: guest x30 saved, a blr to hv_helper_thunk with x6 = its HvHelperInfo,
+   and x0 reloaded when it comes back. Host x6 and x15 are clobbered. */
 static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op);
 
 /* A memory slow path whose thunk may refill the TLB and resume at `retry`:
    the op word carries the refill flags (bits 18..8) and how far back retry is
    from where the helper would resume (bits 31..19, in words). */
 static void put_helper_refill(Emit *e, uint64_t pc, uint32_t insn, uint32_t rflags, uint32_t retry) {
-    uint32_t start = e->n;
     put_helper(e, pc, insn, HV_OP_MEM);
     uint32_t resume = e->n - 1; /* the ldr x0, [x28] the helper comes back to */
     uint32_t back = resume - retry;
-    if (back < (1u << 13) && rflags < (1u << 11)) e->w[resume - 1] = HV_OP_MEM | rflags << 8 | back << 19;
-    (void)start;
+    if (back < (1u << 13) && rflags < (1u << 11)) e->pool[e->npool - 1] = (uint64_t)insn | (uint64_t)(HV_OP_MEM | rflags << 8 | back << 19) << 32;
 }
 
+/* The return address is where it goes back to, so the thunk's RET goes where the CPU expects
+   and leaves its stack of return addresses as it was. The HvHelperInfo is in the pool. */
 static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op) {
+    uint32_t info = e->npool;
+    e->pool[info] = pc;
+    e->pool[info + 1] = (uint64_t)insn | (uint64_t)op << 32;
+    e->npool += 2;
     put(e, STR_X(30, 28, HV_CPU_X(30)));
     put(e, LDR_X(15, 28, HV_CPU_HELPER_THUNK));
-    if ((e->n & 1) == 0) put(e, 0xd503201f); /* nop: the info after the blr starts 8-byte aligned */
+    e->fix[e->nfix++] = (LitFix){e->n, FIX_ADR, info, (uint8_t)(e->in_cold && !e->flat)};
+    put(e, 0x10000006u); /* adr x6, info */
     put(e, BLR_X(15));
-    put(e, (uint32_t)pc);
-    put(e, (uint32_t)(pc >> 32));
-    put(e, insn);
-    put(e, op);
     put(e, LDR_X(0, 28, 0));
 }
 

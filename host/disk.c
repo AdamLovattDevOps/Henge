@@ -1,3 +1,5 @@
+#include <fcntl.h>
+#include "../core/machine.h"
 #include "disk.h"
 
 #include <fcntl.h>
@@ -49,6 +51,13 @@ int hv_disk_write(HvDisk *d, uint64_t off, const void *buf, uint64_t len) {
     return 0;
 }
 
+/* HV_FLUSH: 0 fsync; 1 nothing here, what was written is safe in the host's cache as long as the
+   host runs; 2 fcntl(F_BARRIERFSYNC). */
 int hv_disk_flush(HvDisk *d) {
-    return d->readonly ? 0 : fsync(d->fd);
+    if (d->readonly) return 0;
+    switch (hv_knob[HV_K_FLUSH]) {
+    case 1: return 0;
+    case 2: return fcntl(d->fd, F_BARRIERFSYNC) == -1 ? -1 : 0;
+    default: return fsync(d->fd);
+    }
 }

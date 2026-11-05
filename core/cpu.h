@@ -89,6 +89,7 @@ typedef struct HvCpu {
     /* 0x500: what tags in the return tables (ret_tab) are xored with, [0] user, [1] kernel.
        Bits 63..48, as ijc_salt; a new value empties that half of the tables. */
     uint64_t ret_salt[2] __attribute__((aligned(128)));
+    uint64_t helper_came_from; /* 0x510: where hv_helper_entry was called from, to tell if it goes back there */
     /* 0x580: [0] EL0 and unprivileged accesses, [1] EL1, [2] EL1 with PSTATE.PAN set,
        so toggling PAN (the kernel does it around every user copy) flushes nothing.
        [slot][EL0, EL1, EL1 with PAN, unused]: a slot's three in one 128-byte cache line. */
