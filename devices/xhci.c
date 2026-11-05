@@ -56,7 +56,7 @@ static const uint8_t report_desc[] = {
 
 static const uint8_t device_desc[18] = {
     18, 1, 0x00, 0x02, 0, 0, 0, 64, /* USB 2.0, class per interface, EP0 64 bytes */
-    0x27, 0x06, 0x01, 0x00,         /* vendor 0x0627, product 0x0001 */
+    0xac, 0x05, 0x20, 0x02,         /* vendor Apple, product 0x0220 (an ANSI keyboard): macOS knows its layout, no Keyboard Setup Assistant */
     0x00, 0x01, 1, 2, 3, 1,         /* bcdDevice 1.00, strings 1-3, one configuration */
 };
 

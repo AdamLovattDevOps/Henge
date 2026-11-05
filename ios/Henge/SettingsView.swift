@@ -2,7 +2,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @ObservedObject private var jit = JITCoordinator.shared
-    @AppStorage("henge.cpus") private var cpus = 3
+    @AppStorage("henge.cpus") private var cpus = 4
     @AppStorage(JITCoordinator.autoEnableKey) private var jitAtLaunch = false
 
     var body: some View {

@@ -163,6 +163,53 @@ static void *input_thread(void *unused) {
         else if (sscanf(line, "shiftkey %d", &x) == 1) key_press(x, 1);
         else if (sscanf(line, "wait %d", &x) == 1) sleep((unsigned)x);
         else if (!strncmp(line, "type ", 5)) type_text(line + 5);
+        else if (!strncmp(line, "grep ", 5)) { /* lines of text in guest RAM (the kernel's log) */
+            HvVmapple *bd = hv_vm_board();
+            const char *word = line + 5;
+            size_t wn = strlen(word);
+            uint64_t hits = 0;
+            for (uint64_t i = 0; i + wn < bd->ram_size && hits < 40; i++) {
+                if (bd->ram[i] != (uint8_t)word[0] || memcmp(bd->ram + i, word, wn)) continue;
+                uint64_t from = i;
+                while (from > 0 && i - from < 200 && bd->ram[from - 1] >= 32 && bd->ram[from - 1] < 127) from--;
+                uint64_t to = i;
+                while (to < bd->ram_size && to - i < 400 && bd->ram[to] >= 32 && bd->ram[to] < 127) to++;
+                fprintf(stderr, "ram %llx: %.*s\n", (unsigned long long)(0x70000000ull + from), (int)(to - from), bd->ram + from);
+                hits++;
+                i = to;
+            }
+            fprintf(stderr, "hengevm: grep: %llu lines\n", (unsigned long long)hits);
+        }
+        else if (!strncmp(line, "page ", 5)) { /* a 16 KB file: is it in guest RAM, and how does the copy there differ? */
+            static uint8_t want[0x4000];
+            FILE *pf = fopen(line + 5, "rb");
+            size_t got = pf ? fread(want, 1, sizeof want, pf) : 0;
+            if (pf) fclose(pf);
+            HvVmapple *bd = hv_vm_board();
+            int found = 0;
+            for (uint64_t at = 0; got == sizeof want && at + 0x4000 <= bd->ram_size; at += 0x4000) {
+                int same = 0;
+                for (int k = 0; k < 16; k++) same += !memcmp(bd->ram + at + k * 0x400, want + k * 0x400, 8);
+                if (same < 9) continue;
+                int diff = 0, first = -1, last = -1;
+                for (int k = 0; k < 0x4000; k++)
+                    if (bd->ram[at + k] != want[k]) {
+                        diff++;
+                        if (first < 0) first = k;
+                        last = k;
+                    }
+                fprintf(stderr, "hengevm: page copy at pa %llx: %d bytes differ, from +%x to +%x\n", (unsigned long long)(0x70000000ull + at), diff, first, last);
+                if (diff && first >= 0 && found < 3) {
+                    fprintf(stderr, "  there:");
+                    for (int k = first & ~31; k < (first & ~31) + 64 && k < 0x4000; k++) fprintf(stderr, " %02x", bd->ram[at + k]);
+                    fprintf(stderr, "\n  want: ");
+                    for (int k = first & ~31; k < (first & ~31) + 64 && k < 0x4000; k++) fprintf(stderr, " %02x", want[k]);
+                    fprintf(stderr, "\n");
+                }
+                found++;
+            }
+            fprintf(stderr, "hengevm: %d copies of that page in RAM\n", found);
+        }
         fprintf(stderr, "hengevm: input: %s\n", line);
     }
     return NULL;

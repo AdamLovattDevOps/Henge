@@ -14,7 +14,7 @@ struct SessionView: View {
     @State private var framesIn: UInt64 = 0
     @State private var log: [String] = []
     @State private var started = Date()
-    @AppStorage("henge.cpus") private var cpus = 3
+    @AppStorage("henge.cpus") private var cpus = 4
 
     @State private var typing = false
     @State private var rightClick = false

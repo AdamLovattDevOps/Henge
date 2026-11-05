@@ -9,7 +9,7 @@ struct InstallView: View {
     @State private var ramGB = 8
     @State private var deleteAfter = false
     @State private var refresh = 0 // redraws the list when a download is deleted
-    @AppStorage("henge.cpus") private var cpus = 3
+    @AppStorage("henge.cpus") private var cpus = 4
 
     var body: some View {
         NavigationStack {

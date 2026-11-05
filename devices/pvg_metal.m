@@ -105,6 +105,7 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     uint64_t execs, draws, failed, heap_bytes, synced, remaps;
     double encode_time, gpu_wait_time;
     BOOL pipeline_set; /* in the open encoder */
+    BOOL tess_factors; /* so is a tessellation factor buffer */
     BOOL tracing; /* HV_PVG_TRACE_FILE exists: say what each exec draws */
     /* The newest frame, BGRA, for hv_pvg_metal_frame, and the same without the pointer on it. */
     uint8_t *frame, *base;
@@ -368,6 +369,25 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         return s;
     }
     if (tag == 0xd) return [device newFence];
+    if (tag == 4) { /* depth and stencil: {tag, size, ref, flags, front {ops, read, write}, back {...}} */
+        MTLDepthStencilDescriptor *d = [MTLDepthStencilDescriptor new];
+        uint32_t f = w[3];
+        d.depthCompareFunction = (MTLCompareFunction)(f & 7);
+        d.depthWriteEnabled = (f >> 3) & 1;
+        for (int side = 0; side < 2; side++) {
+            if (!((f >> (4 + side)) & 1)) continue;
+            const uint32_t *t = w + 4 + side * 3;
+            MTLStencilDescriptor *sd = [MTLStencilDescriptor new];
+            sd.stencilCompareFunction = (MTLCompareFunction)(t[0] & 7);
+            sd.stencilFailureOperation = (MTLStencilOperation)((t[0] >> 3) & 7);
+            sd.depthFailureOperation = (MTLStencilOperation)((t[0] >> 6) & 7);
+            sd.depthStencilPassOperation = (MTLStencilOperation)((t[0] >> 9) & 7);
+            sd.readMask = t[1], sd.writeMask = t[2];
+            if (side == 0) d.frontFaceStencil = sd;
+            else d.backFaceStencil = sd;
+        }
+        return [device newDepthStencilStateWithDescriptor:d];
+    }
     [self complain:[NSString stringWithFormat:@"serialized object tag %u", tag]];
     return nil;
 }
@@ -883,7 +903,7 @@ typedef struct {
 }
 
 - (void)render:(id<MTLRenderCommandEncoder>)e tag:(uint32_t)tag rec:(Rec)r task:(uint32_t)task {
-    if (!pipeline_set && (tag == 1 || tag == 3 || tag == 6 || tag == 7 || tag == 155 || tag == 162)) return;
+    if (!pipeline_set && (tag == 1 || tag == 3 || tag == 6 || tag == 7 || tag == 13 || tag == 155 || tag == 162)) return;
     if (tracing && (tag == 1 || tag == 3 || tag == 6 || tag == 7 || tag == 155 || tag == 162)) fprintf(stderr, "trace:  draw tag %u\n", tag);
     switch (tag) {
     case 24: { /* {fence, stages} */
@@ -970,6 +990,129 @@ typedef struct {
         [e setViewport:v];
         break;
     }
+    case 122: { /* {ref, offset, stride} */
+        id<MTLBuffer> b = [self get:U32(0) task:task];
+        [e setTessellationFactorBuffer:b offset:(NSUInteger)U64(4) instanceStride:(NSUInteger)U64(12)];
+        tess_factors = b != nil;
+        break;
+    }
+    case 123: {
+        float f;
+        memcpy(&f, r.p, 4);
+        [e setTessellationFactorScale:f];
+        break;
+    }
+    case 104: {
+        id state = [self get:U32(0) task:task];
+        [e setDepthStencilState:state];
+        break;
+    }
+    case 107: [e setCullMode:(MTLCullMode)U32(0)]; break;
+    case 108: {
+        float f[3];
+        memcpy(f, r.p, sizeof f);
+        [e setDepthBias:f[0] slopeScale:f[1] clamp:f[2]];
+        break;
+    }
+    case 109: [e setDepthClipMode:(MTLDepthClipMode)U32(0)]; break;
+    case 115: [e setFrontFacingWinding:(MTLWinding)U32(0)]; break;
+    case 124: [e setTriangleFillMode:(MTLTriangleFillMode)U32(0)]; break;
+    case 119: [e setStencilFrontReferenceValue:U32(0) backReferenceValue:U32(4)]; break;
+    case 118: { /* a header, then the rectangles */
+        uint32_t head = r.size % sizeof(MTLScissorRect), n = (r.size - head) / sizeof(MTLScissorRect);
+        if (n) [e setScissorRects:(const MTLScissorRect *)(r.p + head) count:n];
+        break;
+    }
+    case 131: {
+        uint32_t head = r.size % sizeof(MTLViewport), n = (r.size - head) / sizeof(MTLViewport);
+        if (n) [e setViewports:(const MTLViewport *)(r.p + head) count:n];
+        break;
+    }
+    case 129: { /* vertex textures: {index, count}, refs */
+        uint32_t index = U32(0), count = U32(4);
+        if (count > 128) break;
+        __unsafe_unretained id<MTLTexture> items[128];
+        id strong[128];
+        for (uint32_t i = 0; i < count; i++) {
+            strong[i] = [self get:U32(8 + i * 4) task:task];
+            items[i] = strong[i];
+        }
+        [e setVertexTextures:items withRange:NSMakeRange(index, count)];
+        break;
+    }
+    case 127: { /* vertex samplers */
+        uint32_t index = U32(0), count = U32(4);
+        if (count > 16) break;
+        __unsafe_unretained id<MTLSamplerState> items[16];
+        id strong[16];
+        for (uint32_t i = 0; i < count; i++) {
+            strong[i] = [self get:U32(8 + i * 4) task:task];
+            items[i] = strong[i];
+        }
+        [e setVertexSamplerStates:items withRange:NSMakeRange(index, count)];
+        break;
+    }
+    case 113: case 128: { /* samplers with LOD clamps: {index, count}, refs, minimums, maximums */
+        uint32_t index = U32(0), count = U32(4);
+        if (count > 16 || r.size < 8 + count * 12ull) break;
+        __unsafe_unretained id<MTLSamplerState> items[16];
+        id strong[16];
+        float lo[16], hi[16];
+        for (uint32_t i = 0; i < count; i++) {
+            strong[i] = [self get:U32(8 + i * 4) task:task];
+            items[i] = strong[i];
+            memcpy(&lo[i], r.p + 8 + count * 4 + i * 4, 4);
+            memcpy(&hi[i], r.p + 8 + count * 8 + i * 4, 4);
+        }
+        if (tag == 113) [e setFragmentSamplerStates:items lodMinClamps:lo lodMaxClamps:hi withRange:NSMakeRange(index, count)];
+        else [e setVertexSamplerStates:items lodMinClamps:lo lodMaxClamps:hi withRange:NSMakeRange(index, count)];
+        break;
+    }
+    case 135: case 137: { /* {count, usage}, or {count, usage 16, stages 16}, then the resources */
+        uint32_t count = U32(0);
+        if (count > 256 || r.size < 8 + count * 4ull) break;
+        __unsafe_unretained id<MTLResource> items[256];
+        NSMutableArray *keep = [NSMutableArray new];
+        uint32_t have = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            id x = [self get:U32(8 + i * 4) task:task];
+            if (!x || [x conformsToProtocol:@protocol(MTLHeap)]) continue;
+            [keep addObject:x];
+            items[have++] = x;
+        }
+        if (!have) break;
+        if (tag == 135) [e useResources:items count:have usage:(MTLResourceUsage)U32(4)];
+        else [e useResources:items count:have usage:(MTLResourceUsage)U16(4) stages:(MTLRenderStages)U16(6)];
+        break;
+    }
+    case 165: { /* vertex buffers with stride: {index, count}, {ref, offset, stride}... */
+        uint32_t index = U32(0), count = U32(4);
+        if (count > 31 || r.size < 8 + count * 20ull) break;
+        __unsafe_unretained id<MTLBuffer> buffers[31];
+        id strong[31];
+        NSUInteger offsets[31], strides[31];
+        for (uint32_t i = 0; i < count; i++) {
+            strong[i] = [self get:U32(8 + i * 20) task:task];
+            buffers[i] = strong[i];
+            offsets[i] = (NSUInteger)U64(12 + i * 20);
+            strides[i] = (NSUInteger)U64(20 + i * 20);
+        }
+        [e setVertexBuffers:buffers offsets:offsets attributeStrides:strides withRange:NSMakeRange(index, count)];
+        break;
+    }
+    case 166: [e setVertexBufferOffset:(NSUInteger)U64(4) attributeStride:(NSUInteger)U64(12) atIndex:U32(0)]; break;
+    case 101: {
+        float c[4];
+        memcpy(c, r.p, sizeof c);
+        [e setBlendColorRed:c[0] green:c[1] blue:c[2] alpha:c[3]];
+        break;
+    }
+    case 13: { /* {start 16, count 16, index ref, offset 16, instances 16, base instance 16, control points 16} */
+        if (!tess_factors) break; /* Metal crashes without a factor buffer */
+        id<MTLBuffer> b = [self get:U32(4) task:task];
+        [e drawPatches:U16(14) patchStart:U16(0) patchCount:U16(2) patchIndexBuffer:b patchIndexBufferOffset:U16(8) instanceCount:U16(10) baseInstance:U16(12)];
+        break;
+    }
     case 1: /* {primitive, start 16, count 16} */
         [e drawPrimitives:(MTLPrimitiveType)U32(0) vertexStart:U16(4) vertexCount:U16(6)];
         draws++;
@@ -1025,6 +1168,18 @@ typedef struct {
 - (void)compute:(id<MTLComputeCommandEncoder>)e tag:(uint32_t)tag rec:(Rec)r task:(uint32_t)task {
     if (!pipeline_set && (tag == 200 || tag == 202)) return;
     switch (tag) {
+    case 209: {
+        MTLRegion region;
+        if (r.size >= sizeof region) {
+            memcpy(&region, r.p, sizeof region);
+            [e setStageInRegion:region];
+        }
+        break;
+    }
+    case 214: /* barriers: encoders here are in order, and each exec is waited for */
+    case 215:
+        [e memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures];
+        break;
     case 212: {
         id f = [self get:U32(0) task:task];
         if (f) [e updateFence:f];
@@ -1325,7 +1480,7 @@ typedef struct {
                 if (etype == 0 && tag == 26) {
                     if (e) [e endEncoding];
                     e = [self beginPass:r task:task commandBuffer:cb];
-                    pipeline_set = NO;
+                    pipeline_set = NO, tess_factors = NO;
                 } else if (e) {
                     if (etype == 0) [self render:e tag:tag rec:r task:task];
                     else if (etype == 1) [self compute:e tag:tag rec:r task:task];
