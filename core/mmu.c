@@ -727,7 +727,7 @@ static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
     HvPerCpu *pcs = cpu->pc_state;
     int kernel = flags & HV_BLOCK_EL1;
 #define FAIL(k) do { if (m->stats_interval) m->stats.light_fail[k]++; return 0; } while (0)
-    if (!m->chain || va == m->stop_pc || (int)((va >> 55) & 1) != kernel || (va & 3)) FAIL(0);
+    if (!m->chain || va == m->stop_pc || va == m->stop_pc2 || (int)((va >> 55) & 1) != kernel || (va & 3)) FAIL(0);
     if (pcs->ijc_keyed_count >= (1u << 17) || pcs->ucode_count + 1 >= (1u << HV_UCODE_BITS) / 2) FAIL(1);
     int table = !kernel ? 0 : (flags & HV_BLOCK_PAN) ? 2 : 1;
     HvTlbEntry *e = &cpu->tlb[(va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1)][table];

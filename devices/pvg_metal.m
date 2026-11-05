@@ -106,6 +106,7 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     double encode_time, gpu_wait_time;
     BOOL pipeline_set; /* in the open encoder */
     BOOL tess_factors; /* so is a tessellation factor buffer */
+    uint32_t pre_raster_samples, pre_imageblock, pre_threadgroup, pre_tile_w, pre_tile_h; /* for the next pass */
     BOOL tracing; /* HV_PVG_TRACE_FILE exists: say what each exec draws */
     /* The newest frame, BGRA, for hv_pvg_metal_frame, and the same without the pointer on it. */
     uint8_t *frame, *base;
@@ -870,6 +871,20 @@ typedef struct {
     }
     if (!d.depthAttachment.texture) d.depthAttachment.loadAction = MTLLoadActionDontCare, d.depthAttachment.storeAction = MTLStoreActionDontCare;
     if (!d.stencilAttachment.texture) d.stencilAttachment.loadAction = MTLLoadActionDontCare, d.stencilAttachment.storeAction = MTLStoreActionDontCare;
+    /* After the attachments: the visibility buffer and the render target's size. */
+    if (r.size >= 0x248) {
+        if (U32(0x22c)) d.visibilityResultBuffer = [self get:U32(0x22c) task:task];
+        uint64_t layers = U64(0x230), rw = U64(0x238), rh = U64(0x240);
+        if (layers) d.renderTargetArrayLength = (NSUInteger)layers;
+        if (rw) d.renderTargetWidth = (NSUInteger)rw;
+        if (rh) d.renderTargetHeight = (NSUInteger)rh;
+    }
+    /* What came before the pass itself. */
+    if (pre_raster_samples) d.defaultRasterSampleCount = pre_raster_samples;
+    if (pre_imageblock) d.imageblockSampleLength = pre_imageblock;
+    if (pre_threadgroup) d.threadgroupMemoryLength = pre_threadgroup;
+    if (pre_tile_w) d.tileWidth = pre_tile_w, d.tileHeight = pre_tile_h;
+    pre_raster_samples = pre_imageblock = pre_threadgroup = pre_tile_w = pre_tile_h = 0;
     if (tracing) {
         id<MTLTexture> c0 = d.colorAttachments[0].texture;
         MTLClearColor cc = d.colorAttachments[0].clearColor;
@@ -1482,7 +1497,13 @@ typedef struct {
                 memcpy(&tag, p, 4), memcpy(&size, p + 4, 4);
                 if (size < 8 || p + size > end) break;
                 Rec r = {p + 8, size - 8};
-                if (etype == 0 && tag == 26) {
+                if (etype == 0 && tag >= 30 && tag <= 36) { /* these describe the pass that follows */
+                    if (tag == 30 && size >= 12) pre_raster_samples = U32(0);
+                    else if (tag == 34 && size >= 12) pre_imageblock = U32(0);
+                    else if (tag == 35 && size >= 12) pre_threadgroup = U32(0);
+                    else if (tag == 36 && size >= 12) pre_tile_w = U32(0) & 0xffff, pre_tile_h = U32(0) >> 16;
+                    else if (tag == 33 || tag == 32) [self complain:[NSString stringWithFormat:@"pass description %u (%u bytes) not done", tag, size]];
+                } else if (etype == 0 && tag == 26) {
                     if (e) [e endEncoding];
                     e = [self beginPass:r task:task commandBuffer:cb];
                     pipeline_set = NO, tess_factors = NO;

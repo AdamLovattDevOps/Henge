@@ -208,6 +208,7 @@ typedef struct HvMachine {
 
     uint64_t stop_pc;    /* tests: leave the dispatcher when pc reaches this */
     void (*stop_hook)(HvCpu *cpu); /* debugging: call this there instead of leaving */
+    uint64_t stop_pc2;   /* debugging: a second such place */
     uint32_t jit_gen;    /* full flushes so far, as blocks see them (HV_JIT_POISON checks) */
     int gen_checks;
     int trace;           /* print every block entered */

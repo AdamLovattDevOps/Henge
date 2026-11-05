@@ -40,6 +40,7 @@ static int init_rest(HvMachine *m) {
     m->blocks = calloc(m->max_blocks, sizeof(HvBlock));
     if (!m->blocks) return -1;
     m->stop_pc = ~0ull;
+    m->stop_pc2 = ~0ull;
     m->chain = 1;
     m->slots = calloc(m->max_slots, sizeof *m->slots);
     m->slot_site = calloc(m->max_slots, sizeof *m->slot_site);

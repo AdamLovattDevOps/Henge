@@ -141,6 +141,21 @@ static void *click_thread(void *unused) {
 }
 
 uint64_t hook_pages;
+/* The guest kernel's call chain, by frame pointers. */
+static void guest_frames(HvCpu *c) {
+    HvMachine *hm = hv_vm_machine();
+    uint64_t fp = c->x[29];
+    fprintf(stderr, "  frames: lr %llx", (unsigned long long)c->x[30]);
+    for (int i = 0; i < 12 && fp >> 40 == 0xfffffe; i++) {
+        uint64_t rec[2];
+        HvWalk w;
+        hv_mmu_walk(c, fp, HV_ACC_READ, 1, &w);
+        if (w.fsc || hv_phys_read(hm, w.pa, rec, 16)) break;
+        fprintf(stderr, " %llx", (unsigned long long)(rec[1] & 0xfffffffffffffull) | 0xfff0000000000000ull);
+        fp = rec[0];
+    }
+    fprintf(stderr, "; sha at %llx; process table n/a\n", (unsigned long long)c->pc);
+}
 /* SHA-256 compression, to know what the guest's should come to. */
 static void sha_blocks(uint32_t st[8], const uint8_t *d, size_t n) {
     static const uint32_t K[64] = {0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
@@ -175,6 +190,7 @@ static void memcmp_hook(HvCpu *c) {
     fprintf(stderr, "\n  b %llx:", (unsigned long long)c->x[1]);
     for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", y[i]);
     fprintf(stderr, "\n");
+    guest_frames(c);
 }
 static __thread uint64_t watch_state;
 static __thread uint32_t watch_want[8];
@@ -227,11 +243,12 @@ static void sha_hook(HvCpu *c) {
                 hv_mmu_walk(c, c->x[0], HV_ACC_READ, 1, &ws0);
                 if (!ws0.fsc && !hv_phys_read(hm, ws0.pa, st0, 32)) {
                     fprintf(stderr, "  state before %08x %08x, cpu %d\n", st0[0], st0[1], c->index);
+                    guest_frames(c);
                     memcpy(watch_want, st0, 32);
                     sha_blocks(watch_want, now, 256);
                     watch_state = c->x[0];
                     static int switched;
-                    if (!switched++) { /* the page is about to be compared: from now on watch memcmp instead */
+                    if (getenv("HV_HOOK_SWITCH") && !switched++) { /* the page is about to be compared: from now on watch memcmp instead */
                         HvMachine *mm = hv_vm_machine();
                         mm->stop_hook = memcmp_hook;
                         mm->stop_pc = c->pc - 0x2274914ull; /* bcmp */
@@ -280,6 +297,53 @@ static void sha_hook(HvCpu *c) {
     }
 }
 
+/* Both at once: remember what each 16 KB hash read; when the compare for the page fails, keep it. */
+static uint64_t both_sha_pc;
+static __thread uint8_t both_data[0x4000];
+static __thread uint64_t both_va, both_pa;
+static __thread int both_have;
+static void both_hook(HvCpu *c) {
+    HvMachine *hm = hv_vm_machine();
+    if (c->pc == both_sha_pc) {
+        if (c->x[1] != 256) return;
+        HvWalk w;
+        both_have = 0;
+        for (int k = 0; k < 4; k++) {
+            hv_mmu_walk(c, c->x[2] + (uint64_t)k * 0x1000, HV_ACC_READ, 1, &w);
+            if (w.fsc || hv_phys_read(hm, w.pa, both_data + k * 0x1000, 0x1000)) return;
+            if (!k) both_pa = w.pa;
+        }
+        both_va = c->x[2];
+        both_have = 1;
+        return;
+    }
+    if (c->x[2] != 32) return;
+    uint8_t x[32], y[32];
+    HvWalk w1, w2;
+    hv_mmu_walk(c, c->x[0], HV_ACC_READ, 1, &w1);
+    hv_mmu_walk(c, c->x[1], HV_ACC_READ, 1, &w2);
+    if (w1.fsc || w2.fsc || hv_phys_read(hm, w1.pa, x, 32) || hv_phys_read(hm, w2.pa, y, 32)) return;
+    static const uint8_t want[8] = {0x52, 0x24, 0x67, 0x35, 0x8c, 0x28, 0x38, 0x7a};
+    if (memcmp(x, want, 8)) return;
+    int same = !memcmp(x, y, 32);
+    fprintf(stderr, "hengevm: compare %s; hash read pa %llx va %llx (have %d); now it holds:\n", same ? "equal" : "DIFFERENT", (unsigned long long)both_pa, (unsigned long long)both_va, both_have);
+    if (!same && both_have) {
+        static uint8_t now[0x4000];
+        int same_now = hv_phys_read(hm, both_pa, now, 0x4000) == 0 && !memcmp(now, both_data, 0x4000);
+        int diff_good = 0, part[4] = {0};
+        for (int k = 0; k < 0x4000; k++) if (both_data[k] != hook_page[k]) diff_good++, part[k >> 12]++;
+        uint8_t h[32];
+        CC_SHA256(both_data, 0x4000, h);
+        fprintf(stderr, "  bytes hashed: %d differ from the file's page (per 4K %d %d %d %d); same as RAM now: %d; sha256 %02x%02x%02x%02x; compare b %02x%02x%02x%02x\n", diff_good, part[0], part[1], part[2], part[3], same_now, h[0], h[1], h[2], h[3], y[0], y[1], y[2], y[3]);
+        const char *out = getenv("HV_HOOK_OUT");
+        if (out) {
+            FILE *f = fopen(out, "wb");
+            if (f) fwrite(both_data, 1, 0x4000, f), fclose(f);
+        }
+    }
+    guest_frames(c);
+}
+
 /* Debugging: HV_INPUT_FILE=path follows a file of lines, for driving a running guest:
    "click x y", "move x y", "key code" (Linux), "shiftkey code", "type words", "wait seconds". */
 static void *input_thread(void *unused) {
@@ -322,8 +386,15 @@ static void *input_thread(void *unused) {
             fprintf(stderr, "hengevm: sha at pa %llx, va %llx (walks to pa %llx, fsc %u); page file %zu bytes\n", (unsigned long long)pa, (unsigned long long)va, (unsigned long long)wc.pa, (unsigned)wc.fsc, got);
             if (at && !wc.fsc && wc.pa == pa && got == sizeof hook_page && c0->vbar_el1 >> 40 == 0xfffffe) {
                 HvMachine *hm = hv_vm_machine();
+                if (getenv("HV_HOOK_BOTH")) {
+                    both_sha_pc = va;
+                    hm->stop_hook = both_hook;
+                    hm->stop_pc = va;
+                    hm->stop_pc2 = va - 0x2274914ull;
+                } else {
                 hm->stop_hook = getenv("HV_HOOK_BCMP") ? memcmp_hook : sha_hook;
                 hm->stop_pc = getenv("HV_HOOK_BCMP") ? va - 0x2274914ull : va;
+                }
                 hm->flush_pending = 1;
             }
         }

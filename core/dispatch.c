@@ -264,7 +264,7 @@ static void *fast_resume(HvCpu *cpu) {
     if (off < 0) off = getenv("HV_NO_FAST_RESUME") != NULL;
     HvMachine *m = cpu->m;
     HvPerCpu *p = cpu->pc_state;
-    if (off || !m->chain || m->trace || m->log >= 2 || !p || cpu->pc == m->stop_pc || cpu->halted || cpu->off) { if (m->stats_interval) m->stats.fr_fail[0]++; return NULL; }
+    if (off || !m->chain || m->trace || m->log >= 2 || !p || cpu->pc == m->stop_pc || cpu->pc == m->stop_pc2 || cpu->halted || cpu->off) { if (m->stats_interval) m->stats.fr_fail[0]++; return NULL; }
     if (__atomic_load_n(&cpu->exit_req, __ATOMIC_RELAXED) || __atomic_load_n(&m->flush_pending, __ATOMIC_RELAXED) ||
         __atomic_load_n(&m->stw_active, __ATOMIC_RELAXED)) {
         if (m->stats_interval) m->stats.fr_fail[1]++;
@@ -890,7 +890,7 @@ static int run_loop(HvCpu *cpu, int one) {
             pending_chain = NULL;
             why = 3;
         }
-        if (cpu->pc == m->stop_pc) {
+        if (cpu->pc == m->stop_pc || cpu->pc == m->stop_pc2) {
             if (!m->stop_hook) return HV_EXIT_HALT;
             m->stop_hook(cpu);
             pending_chain = NULL; /* every call must come back through here */
@@ -947,7 +947,7 @@ static int run_loop(HvCpu *cpu, int one) {
         /* Remember it for indirect branches (not the tests' stop PC: that must reach us). */
         /* EL0 tables only hold user VAs and EL1 tables kernel VAs, so each half has its own salt. */
         int kernel = b->flags & HV_BLOCK_EL1;
-        if (m->chain && b->va != m->stop_pc && (int)((b->va >> 55) & 1) == kernel) {
+        if (m->chain && b->va != m->stop_pc && b->va != m->stop_pc2 && (int)((b->va >> 55) & 1) == kernel) {
             HvPerCpu *pcs = cpu->pc_state;
             uint64_t *t = pcs->ijc + (size_t)(b->flags & (HV_IJC_TABLES - 1)) * (HV_IJC_TABLE_BYTES / 8);
             uint64_t tag = b->va ^ cpu->ijc_salt[kernel];

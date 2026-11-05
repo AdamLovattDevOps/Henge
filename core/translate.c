@@ -1568,7 +1568,7 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
 #define KILL(r) (cur[(r) & 31] = -1)
     for (uint32_t i = 0; i < max && i < HV_MAX_BLOCK_INSNS; i++) {
         uint32_t insn = code[i];
-        if (i > 0 && va + 4ull * i == e->m->stop_pc) break;
+        if (i > 0 && (va + 4ull * i == e->m->stop_pc || va + 4ull * i == e->m->stop_pc2)) break;
         HvInsnKind kind = hv_classify(insn);
         if ((e->flags & HV_BLOCK_FPOFF) && kind != HV_INSN_UNDEFINED && is_fp_insn(insn)) break;
         if (kind == HV_INSN_COPY && (insn & 0xfffff01fu) == 0xd503201fu) continue; /* hints (NOP, BTI): no register */
@@ -1702,7 +1702,7 @@ static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32
     int ended = 0;
     while (i < max && !ended) {
         uint64_t pc = b->va + 4ull * i;
-        if (i > 0 && pc == m->stop_pc) break; /* so the dispatcher sees stop_pc at a block start */
+        if (i > 0 && (pc == m->stop_pc || pc == m->stop_pc2)) break; /* so the dispatcher sees stop_pc at a block start */
         e->cur_pc = pc;
         e->cur_i = i;
         e->u_prev = e->u_live, e->u_live = 0;
@@ -1762,7 +1762,7 @@ int hv_translate_place(HvMachine *m, HvBlock *b) {
     for (uint32_t k = 0; k < e->nsite && !m->trace; k++) { /* tracing logs every block entry */
         uint32_t slot = e->site[k].slot;
         uint64_t t = e->site[k].target;
-        if (m->slot_xa[slot] || e->site[k].flags != b->flags || t == m->stop_pc) continue; /* the dispatcher stops there */
+        if (m->slot_xa[slot] || e->site[k].flags != b->flags || t == m->stop_pc || t == m->stop_pc2) continue; /* the dispatcher stops there */
         const uint32_t *code = NULL;
         if (t == b->va) code = dst;
         else {
