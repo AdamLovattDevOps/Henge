@@ -51,6 +51,11 @@ struct HvPvgLite {
     int root_pending, iosfc_pending;
     uint64_t display_pa;
     uint64_t swaps;
+    /* The last stamp handed to the worker per channel, and who is being drained. */
+    uint32_t submitted[MAX_CHANNELS];
+    uint32_t draining;
+    uint32_t barrier_waits[MAX_CHANNELS];
+    uint64_t barriers, barrier_drains, barrier_retries, barrier_timeouts;
     void *layer; /* where frames go, once there is a replay */
     uint32_t task_root[512]; /* page of each task's root, by the id in commands */
     uint64_t task_objects[512], task_placement[512]; /* task offsets of its object lists */
@@ -280,6 +285,10 @@ void hv_pvg_lite_set_layer(HvPvgLite *p, void *layer) {
     if (p->metal) hv_pvg_metal_set_layer(p->metal, layer);
 }
 
+void hv_pvg_lite_barrier_stats(HvPvgLite *p, uint64_t out[4]) {
+    out[0] = p->barriers, out[1] = p->barrier_drains, out[2] = p->barrier_retries, out[3] = p->barrier_timeouts;
+}
+
 uint64_t hv_pvg_lite_gpu_frames(HvPvgLite *p) {
     return p && p->metal ? hv_pvg_metal_gpu_frames(p->metal) : 0;
 }
@@ -449,6 +458,8 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
     uint32_t pages = 0;
     while (pages < 0x1000 && table[pages]) pages++;
     if (!pages) return;
+    if (ch >= MAX_CHANNELS || (p->draining & (1u << ch))) return; /* already being drained, further up */
+    p->draining |= 1u << ch;
     uint32_t size = pages << 14, wr = __atomic_load_n(&rec[0], __ATOMIC_ACQUIRE), rd = rec[1], last = 0;
     int any = 0;
     while (rd != wr) {
@@ -469,7 +480,33 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
             if (!getenv("HV_PVG_NO_METAL")) p->metal = hv_pvg_metal_create(p);
             if (p->metal && p->layer) hv_pvg_metal_set_layer(p->metal, p->layer);
         }
+        if (p->metal && (hdr[0] >> 16)) {
+            /* {channel, stamp}: this waits for that channel's work, such as a swap for
+               the drawing of the frame it shows. All of it goes through one worker in
+               order, so everything up to the stamp has to be handed over first, or the
+               screen shows a frame half drawn. */
+            uint32_t b[2] = {0, 0};
+            ring_read(p, table, size, rd + 12, b, 8);
+            if (b[0] && b[0] < MAX_CHANNELS && b[0] != ch) {
+                p->barriers++;
+                if ((int32_t)(p->submitted[b[0]] - b[1]) < 0) {
+                    p->barrier_drains++;
+                    do_channel(p, b[0]);
+                }
+                if ((int32_t)(p->submitted[b[0]] - b[1]) < 0) {
+                    if (++p->barrier_waits[ch] < 20000) { /* not written yet: this channel waits for a later poll */
+                        p->barrier_retries++;
+                        p->chan_pending |= 1u << ch;
+                        break;
+                    }
+                    p->barrier_timeouts++;
+                    fprintf(stderr, "hengevm: pvg-lite: channel %u gave up waiting for channel %u stamp %x (at %x)\n", ch, b[0], b[1], p->submitted[b[0]]);
+                }
+                p->barrier_waits[ch] = 0;
+            }
+        }
         channel_command(p, table, size, rd, hdr);
+        p->submitted[ch] = hdr[2];
         if (p->metal) {
             uint32_t *copy = malloc(hdr[1]);
             ring_read(p, table, size, rd, copy, hdr[1]);
@@ -480,6 +517,7 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
         rd += hdr[1];
     }
     __atomic_store_n(&rec[1], rd, __ATOMIC_RELEASE);
+    p->draining &= ~(1u << ch);
     if (any) {
         uint32_t *stamp = guest32(p, buf + 4 * ch);
         if (stamp) __atomic_store_n(stamp, last, __ATOMIC_RELEASE);

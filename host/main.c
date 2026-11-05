@@ -501,6 +501,7 @@ static void *watch_thread(void *unused) {
           for (int k = 0; k < 4; k++) fprintf(stderr, " %llx*%u(pc %llx)", (unsigned long long)(0x70000000ull + (best[k] << 14)), bestn[k], (unsigned long long)hv_smc_last[best[k]]);
           fprintf(stderr, " distinct %llu", (unsigned long long)distinct);
           fprintf(stderr, " sha pages %llu", (unsigned long long)hook_pages);
+          { uint64_t bs[4]; hv_pvg_lite_barrier_stats(board.pvg, bs); fprintf(stderr, " barriers %llu drains %llu retries %llu gaveup %llu", (unsigned long long)bs[0], (unsigned long long)bs[1], (unsigned long long)bs[2], (unsigned long long)bs[3]); }
         }
         fprintf(stderr, "\n");
     }

@@ -37,6 +37,7 @@ uint64_t hv_pvg_metal_gpu_frames(HvPvgMetal *m);
 void hv_pvg_lite_task_pages(HvPvgLite *p, uint32_t task, uint64_t first, uint64_t n, uint32_t *out);
 void hv_pvg_lite_set_layer(HvPvgLite *p, void *layer);
 uint64_t hv_pvg_lite_gpu_frames(HvPvgLite *p);
+void hv_pvg_lite_barrier_stats(HvPvgLite *p, uint64_t out[4]);
 /* The display's shared state page, or NULL before the guest named it. */
 uint8_t *hv_pvg_lite_display_page(HvPvgLite *p);
 void hv_pvg_lite_command(HvPvgLite *p, const uint32_t *command, uint32_t length);
