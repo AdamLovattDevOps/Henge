@@ -2,6 +2,9 @@
 #include "pvg_lite.h"
 
 #include <errno.h>
+#include <mach/mach.h>
+#include <mach/mach_error.h>
+#include <mach/vm_map.h>
 #include <pthread.h>
 #include <pthread/qos.h>
 #include <fcntl.h>
@@ -113,6 +116,37 @@ static void gic_msi_write(void *opaque, uint64_t off, uint64_t v, unsigned size)
                            (unsigned long long)v, size);
 }
 
+/* Guest RAM the memory limit does not count: asking the kernel to leave these
+   pages out of this process's footprint. It allows that once a debugger has
+   been attached, which is how an iOS app gets to use JIT at all. Returns NULL
+   if it is refused. In pieces, as one memory entry has a size limit. */
+extern kern_return_t mach_memory_entry_ownership(mach_port_t entry, task_t owner, int ledger_tag, int ledger_flags);
+
+static uint8_t *alloc_no_footprint(uint64_t size) {
+    enum { CHUNK = 128u << 20, MAP_MEM_LEDGER_TAGGED_ = 0x002000, MAP_MEM_NAMED_CREATE_ = 0x020000, LEDGER_TAG_DEFAULT = 1, LEDGER_NO_FOOTPRINT = 1 };
+    vm_address_t base = 0;
+    if (vm_allocate(mach_task_self(), &base, size, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) return NULL;
+    for (uint64_t off = 0; off < size; off += CHUNK) {
+        uint64_t len = size - off < CHUNK ? size - off : CHUNK;
+        memory_object_size_t got = len;
+        mach_port_t entry = MACH_PORT_NULL;
+        kern_return_t kr = mach_make_memory_entry_64(mach_task_self(), &got, 0, MAP_MEM_NAMED_CREATE_ | MAP_MEM_LEDGER_TAGGED_ | VM_PROT_READ | VM_PROT_WRITE, &entry, MACH_PORT_NULL);
+        if (kr == KERN_SUCCESS) kr = mach_memory_entry_ownership(entry, TASK_NULL, LEDGER_TAG_DEFAULT, LEDGER_NO_FOOTPRINT);
+        if (kr == KERN_SUCCESS) {
+            vm_address_t to = base + off;
+            kr = vm_map(mach_task_self(), &to, len, 0, VM_FLAGS_OVERWRITE, entry, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
+        }
+        if (entry != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), entry);
+        if (kr != KERN_SUCCESS) {
+            fprintf(stderr, "hengevm: guest RAM outside the footprint refused: %s\n", mach_error_string(kr));
+            vm_deallocate(mach_task_self(), base, size);
+            return NULL;
+        }
+    }
+    fprintf(stderr, "hengevm: guest RAM (%llu MB) is outside the footprint\n", (unsigned long long)(size >> 20));
+    return (uint8_t *)base;
+}
+
 /* A mapped file's page is slow to touch the first time and as fast as any other
    afterwards, so a background thread gets there before the guest does. Adding
    zero dirties the page without changing it, whatever the guest has written. */
@@ -174,7 +208,11 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
        The file is unlinked at once and goes away with the process. */
     const char *ram_file = getenv("HV_RAM_FILE");
     b->ram = MAP_FAILED;
-    if (ram_file && *ram_file) {
+    if (!getenv("HV_RAM_NO_LEDGER")) {
+        uint8_t *free_of_footprint = alloc_no_footprint(ram_size);
+        if (free_of_footprint) b->ram = free_of_footprint;
+    }
+    if (b->ram == MAP_FAILED && ram_file && *ram_file) {
         int fd = open(ram_file, O_RDWR | O_CREAT | O_TRUNC, 0600);
         if (fd >= 0) {
             unlink(ram_file);

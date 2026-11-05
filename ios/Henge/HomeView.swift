@@ -26,7 +26,7 @@ struct HomeView: View {
                 Section("Memory") {
                     LabeledContent("Extra memory", value: Entitlements.increasedMemory ? "On" : "Off")
                     LabeledContent("Henge's limit", value: ByteText.string(UInt64(Entitlements.memoryLimitAtLaunch)))
-                    Text("A Mac's memory lives in a file, so it can go past this limit. It uses that much free storage while the Mac runs.")
+                    Text("A Mac's memory is kept out of this limit once JIT is on. If iOS refuses that, it uses free storage instead.")
                         .font(.footnote).foregroundStyle(.secondary)
                     if !Entitlements.increasedMemory {
                         Text("This install isn't signed with the increased memory limit entitlement. Reinstall Henge with a certificate that has it. Export your Mac first if the reinstall replaces the app's data.")
