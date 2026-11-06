@@ -29,6 +29,13 @@ enum Device {
 /// which is what the Mac's USB keyboard sends, so every key and modifier goes straight across.
 enum HardwareKeys {
     private static var held: Set<UInt8> = []
+    private static var lastKey: CFTimeInterval = 0
+
+    /// With the on-screen keyboard's view holding the keyboard, iOS may also offer a hardware key as
+    /// text, and again as it repeats. The Mac has the key already, and repeats it itself.
+    static var keyJustPressed: Bool {
+        held.contains { $0 < 0xe0 } || CACurrentMediaTime() - lastKey < 0.1
+    }
 
     /// Sends the presses that are keys, and returns the rest.
     static func send(_ presses: Set<UIPress>, down: Bool) -> Set<UIPress> {
@@ -40,6 +47,7 @@ enum HardwareKeys {
             }
             let usage = UInt8(raw)
             henge_vm_key_hid(usage, down ? 1 : 0)
+            if usage < 0xe0 { lastKey = CACurrentMediaTime() }
             if down {
                 held.insert(usage)
             } else {

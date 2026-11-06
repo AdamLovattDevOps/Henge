@@ -81,11 +81,13 @@ struct KeyboardCatcher: UIViewRepresentable {
         var smartDashesType: UITextSmartDashesType = .no
 
         func insertText(_ text: String) {
+            guard !HardwareKeys.keyJustPressed else { return }
             for c in text { Keys.type(c) }
             StickyKeys.shared.releaseAll()
         }
 
         func deleteBackward() {
+            guard !HardwareKeys.keyJustPressed else { return }
             Keys.press(Keys.backspace)
             StickyKeys.shared.releaseAll()
         }
