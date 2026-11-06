@@ -88,9 +88,11 @@ final class Installer: NSObject, ObservableObject {
             var made: VirtualMac?
             do {
                 try checkSpace(release)
+                let rom = try await BootROM.file() // before the long download, so a problem shows up at once
+                HengeLog.log("install", "boot ROM ready")
                 let ipsw = try await download(release)
                 phase = .preparing
-                var mac = try prepare(name: name, ramMB: ramMB)
+                var mac = try prepare(name: name, ramMB: ramMB, rom: rom)
                 mac.osName = release.name
                 made = mac
                 phase = .installing
@@ -160,13 +162,11 @@ final class Installer: NSObject, ObservableObject {
 
     // MARK: The new machine
 
-    private func prepare(name: String, ramMB: Int) throws -> VirtualMac {
-        guard let rom = Bundle.main.url(forResource: "AVPBooter.vmapple2", withExtension: "bin") else {
-            throw message("This build of Henge has no boot ROM in it.")
-        }
+    private func prepare(name: String, ramMB: Int, rom: URL) throws -> VirtualMac {
         // A new machine identity, as VZMacMachineIdentifier makes one: a random ECID.
         let ecid = UInt64.random(in: 1 << 40 ..< 1 << 62)
         var mac = VirtualMac(name: name, ecid: ecid, seed: 0, ramMB: ramMB, diskBytes: 64 << 30)
+        (mac.screenWidth, mac.screenHeight) = Device.fittingScreen
         let fm = FileManager.default
         try fm.createDirectory(at: mac.directory, withIntermediateDirectories: true)
         Machines.excludeFromBackup(Machines.root)

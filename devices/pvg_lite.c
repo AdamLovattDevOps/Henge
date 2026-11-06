@@ -134,6 +134,14 @@ static void ring_read(HvPvgLite *p, const uint32_t *table, uint32_t size, uint32
     }
 }
 
+/* The one mode the display offers. macOS takes the size it is given at boot. */
+static uint32_t display_w = 1920, display_h = 1080;
+
+void hv_pvg_lite_set_mode(uint32_t width, uint32_t height) {
+    display_w = width;
+    display_h = height;
+}
+
 static void display_set_page(HvPvgLite *p, uint64_t pa) {
     uint8_t *d = hv_phys_ptr(p->m, pa, 0x4000);
     if (!d) return;
@@ -141,14 +149,15 @@ static void display_set_page(HvPvgLite *p, uint64_t pa) {
 #define PUT32(off, v) (*(uint32_t *)(d + (off)) = (uint32_t)(v))
 #define PUTF(off, v) (*(float *)(d + (off)) = (v))
     PUT32(0x00, 1);
-    PUT32(0x14, 300u << 16 | 400); /* physical size in mm */
+    uint32_t width_mm = 400, height_mm = 400 * display_h / display_w; /* the same pixel density at any shape */
+    PUT32(0x14, height_mm << 16 | width_mm);
     PUT32(0x18, 0x01000100);
     PUT32(0x1c, 0x400);
     PUT32(0x20, 3);
-    PUTF(0x24, 400.0f);
-    PUTF(0x28, 300.0f);
+    PUTF(0x24, (float)width_mm);
+    PUTF(0x28, (float)height_mm);
     PUT32(0x208, 1); /* one mode: */
-    PUT32(0x210, 1080u << 16 | 1920);
+    PUT32(0x210, display_h << 16 | display_w);
     PUT32(0x214, 60u << 16);
     PUTF(0xa10, 1.0f); /* identity colour matrix */
     PUTF(0xa24, 1.0f);

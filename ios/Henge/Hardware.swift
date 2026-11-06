@@ -7,6 +7,15 @@ enum Device {
     static let isPad = UIDevice.current.userInterfaceIdiom == .pad
     static let name = isPad ? "iPad" : "iPhone"
 
+    /// A Mac's screen that fills this device on its side: 1920 wide, as tall as the shape asks. iPads are
+    /// squarer than 16:9, which would leave bars above and below. Phones are wider, so they stay at 16:9.
+    static var fittingScreen: (width: Int, height: Int) {
+        guard isPad else { return (1920, 1080) }
+        let size = UIScreen.main.bounds.size
+        let shape = max(size.width, size.height) / max(min(size.width, size.height), 1)
+        return (1920, min(max(Int((1920 / shape / 8).rounded()) * 8, 1080), 1440))
+    }
+
     /// How much memory to suggest for a new Mac: what leaves this device room for iOS.
     static var suggestedRAMGB: Int {
         let mb = ProcessInfo.processInfo.physicalMemory >> 20

@@ -28,6 +28,8 @@ Download macOS, install it on the device, and use it.
 - **Graphics** — macOS draws through a virtual GPU, and Henge replays its commands with Metal. Safari and Electron apps like Discord draw on it.
 - **Touch** — The screen is a trackpad: hold to drag, two fingers to scroll. Esc, Tab, Control, Option and Command sit above the keyboard.
 - **Keyboard and mouse** — On iPad, a Magic Keyboard or a Bluetooth keyboard and mouse drive the Mac directly.
+- **Sharing** — Copy and paste between macOS and the device, and a shared folder that shows up in Files and on the Mac.
+- **Fits the screen** — On iPad, a new Mac gets a screen the shape of the iPad's, so there are no black bars.
 
 On an iPhone 17 Pro, macOS reaches the lock screen in about 15 seconds. Discord installs, opens in about 15 seconds, logs in and sends messages.
 
@@ -40,6 +42,12 @@ Sideload `Henge.ipa` from [Releases](https://github.com/Leviidev/Henge/releases)
 - **Memory:** a Mac gets 4, 6 or 8 GB. Sign Henge with the increased memory limit entitlement if your certificate has it.
 
 Then open the Install tab, pick macOS Sequoia 15.6.1, and keep Henge open with the device plugged in. Tahoe 26.6.2 and macOS 27.2 are offered too, but they aren't tested yet.
+
+## Sharing with the Mac
+
+Do this once for each Mac: open Terminal on the Mac, then in Henge open Details and tap **Type the Set Up Command**. Press Return on the Mac, and choose Allow when macOS asks about `henge-agent` and local networks. It needs the Mac's keyboard layout to be U.S.
+
+Then a Henge folder in the Mac's home folder is the same folder as Files › Henge › Shared. What you copy on the Mac is copied on the device too, and the paste button pastes from the device into the Mac.
 
 ## Known limits
 
@@ -75,7 +83,7 @@ make ios-lib
 ios/scripts/package_ipa.sh
 ```
 
-That produces `~/Desktop/Henge.ipa`, and `package_ipa.sh --trollstore` writes `Henge.tipa`. The build copies Apple's boot ROM (`AVPBooter.vmapple2.bin`) from the Mac's Virtualization framework into the app.
+That produces `~/Desktop/Henge.ipa`, and `package_ipa.sh --trollstore` writes `Henge.tipa`.
 
 `make` builds the engine for the Mac, `build/hengevm`, and `make test` runs its tests.
 
@@ -83,4 +91,4 @@ That produces `~/Desktop/Henge.ipa`, and `package_ipa.sh --trollstore` writes `H
 
 GPL-2.0-or-later. Henge compiles in usbmuxd (GPLv2 or GPLv3) and code from Husk (GPL-2.0-or-later), so the shipped binary is a combined GPL work. It cannot go on the App Store. See [docs/licensing.md](docs/licensing.md).
 
-macOS and the boot ROM are Apple's and aren't covered by this licence.
+macOS and the Mac's boot ROM are Apple's and aren't part of Henge. Henge downloads both from Apple when you install.

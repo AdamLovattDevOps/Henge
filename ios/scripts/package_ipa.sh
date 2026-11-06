@@ -39,6 +39,13 @@ cp "$IOS/Henge/Henge.entitlements" "$ENT"
 BANNED_KEYS=("com.apple.private.cs.debugger" "dynamic-codesigning" "com.apple.private.skip-library-validation")
 if [ "$TROLLSTORE" = true ]; then for k in "${BANNED_KEYS[@]}"; do plutil -remove "$k" "$ENT" 2>/dev/null || true; done; fi
 SAPP="$STAGE/Payload/Henge.app"
+# Apple's boot ROM is fetched on the device (BootROM.swift) and must never ship. An older build folder can still
+# hold a copy from when the app bundled it, so it goes, and nothing is packaged if any is left.
+rm -f "$SAPP/AVPBooter.vmapple2.bin"
+if [ -n "$(find "$STAGE" -iname 'AVPBooter*' -o -iname 'AVPSEPBooter*')" ]; then
+  echo "Apple's boot ROM is in the app: not packaging." >&2
+  exit 1
+fi
 sign() { codesign --force --sign - --timestamp=none "$@"; }
 for fw in "$SAPP"/Frameworks/*.framework; do [ -d "$fw" ] && sign "$fw"; done
 for ex in "$SAPP"/PlugIns/*.appex; do [ -d "$ex" ] && sign "$ex"; done

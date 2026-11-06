@@ -8,6 +8,7 @@
    virtio-net device on the CPU thread (hv_net_poll), which may only take them
    when the guest has posted receive buffers. */
 #include "net_slirp.h"
+#include "share.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -52,6 +53,12 @@ static Timer timers[MAX_TIMERS];
 static struct pollfd pfds[MAX_POLL];
 static int npfd;
 uint64_t hv_net_tx_frames, hv_net_rx_frames;
+
+static char share_socket[256];
+
+void hv_net_set_share_socket(const char *path) {
+    snprintf(share_socket, sizeof share_socket, "%s", path ? path : "");
+}
 
 static int push(Queue *q, const uint8_t *data, uint32_t len) {
     pthread_mutex_lock(&q->mu);
@@ -283,6 +290,11 @@ int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
             inet_pton(AF_INET, "10.0.2.15", &g);
             if (slirp_add_hostfwd(slirp, 0, h, hp, g, gp) != 0) fprintf(stderr, "hengevm: no forward for port %d\n", hp);
         }
+    }
+    if (share_socket[0]) { /* 10.0.2.4:80 is the shared folder and clipboard: see share.c */
+        struct in_addr addr;
+        inet_pton(AF_INET, HV_SHARE_ADDR, &addr);
+        if (slirp_add_unix(slirp, share_socket, &addr, 80) != 0) fprintf(stderr, "hengevm: net: no route to the shared folder\n");
     }
     net = n;
     n->transmit = transmit;

@@ -25,10 +25,10 @@ struct SessionView: View {
     @State private var zoomCentre = CGPoint(x: 0.5, y: 0.5) // where the zoomed view is, 0...1 of the Mac's screen
     @State private var map: UIImage?
     @State private var zoomFollowing: Task<Void, Never>?
+    @State private var helperRunning = false
     @State private var shown = CGSize(width: 0.5, height: 0.5) // how much of the Mac's screen the zoomed view shows
     @Environment(\.scenePhase) private var scenePhase
 
-    private static let aspect: CGFloat = 16.0 / 9.0
 
     var body: some View {
         GeometryReader { geo in
@@ -36,7 +36,7 @@ struct SessionView: View {
             let full = CGSize(width: geo.size.width + insets.leading + insets.trailing,
                               height: geo.size.height + insets.top + insets.bottom)
             let landscape = full.width > full.height
-            let layout = Layout(full: full, insets: insets, landscape: landscape, zoomed: zoomed, typing: typing, centre: zoomCentre)
+            let layout = Layout(full: full, insets: insets, landscape: landscape, zoomed: zoomed, typing: typing, centre: zoomCentre, aspect: mac.aspect)
             ZStack(alignment: .topLeading) {
                 (landscape || zoomed ? Color.black : Desk.page)
                 // One view in every layout: it holds the layer the engine draws into.
@@ -98,6 +98,7 @@ struct SessionView: View {
             HardwareMouse.shared.stop()
         }
         .task { await run() }
+        .task { await Sharing.followMacClipboard() }
     }
 
     /// When there is something of the app's to point at, iPadOS gets its own pointer back.
@@ -119,9 +120,8 @@ struct SessionView: View {
             CGSize(width: min(touch.width / max(screen.width, 1), 1), height: min(touch.height / max(screen.height, 1), 1))
         }
 
-        init(full: CGSize, insets: EdgeInsets, landscape: Bool, zoomed: Bool, typing: Bool, centre: CGPoint) {
+        init(full: CGSize, insets: EdgeInsets, landscape: Bool, zoomed: Bool, typing: Bool, centre: CGPoint, aspect: CGFloat) {
             self.insets = insets
-            let aspect = SessionView.aspect
             let big = full.height >= 600 // an iPad on its side, or a window on one
             if zoomed {
                 // Upright, as tall as the device. On its side, bigger than it fits: a big screen needs less.
@@ -176,6 +176,8 @@ struct SessionView: View {
             HStack {
                 tool("keyboard", "Keyboard") { typing = true }
                 Spacer()
+                pasteTool
+                Spacer()
                 tool("plus.magnifyingglass", "Zoom in") { zoomed = true }
                 Spacer()
                 tool("info.circle", "Details") { showDetails = true }
@@ -229,6 +231,16 @@ struct SessionView: View {
             .font(.system(size: 15))
     }
 
+    /// The system's paste button: iOS asks no permission for it, as it would if the app read the clipboard itself.
+    private var pasteTool: some View {
+        PasteButton(payloadType: String.self) { texts in
+            if let text = texts.first { Sharing.paste(text) }
+        }
+        .labelStyle(.iconOnly)
+        .buttonBorderShape(.circle)
+        .tint(Desk.raised)
+    }
+
     private func tool(_ symbol: String, _ label: String, tint: Color = Desk.text, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: symbol)
@@ -247,6 +259,7 @@ struct SessionView: View {
         let top = layout.insets.top + (landscape ? 8 : 6)
         let pill = HStack(spacing: 4) {
             tool("keyboard", "Keyboard", tint: .white) { typing.toggle() }
+            pasteTool
             tool(zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass", zoomed ? "Zoom out" : "Zoom in", tint: zoomed ? Desk.accentLight : .white) { zoomed.toggle() }
             tool("info.circle", "Details", tint: .white) { showDetails = true }
             Rectangle().fill(Color.white.opacity(0.3)).frame(width: 1, height: 22).padding(.horizontal, 4)
@@ -267,7 +280,7 @@ struct SessionView: View {
 
     /// The whole screen, small, with where the zoomed view is on it.
     private func zoomMap(_ layout: Layout) -> some View {
-        let width: CGFloat = 112, height = width / Self.aspect
+        let width: CGFloat = 112, height = width / mac.aspect
         let viewW = min(layout.touch.width / layout.screen.width, 1) * width
         let viewH = min(layout.touch.height / layout.screen.height, 1) * height
         let left = (-layout.screen.minX / layout.screen.width) * width
@@ -293,9 +306,9 @@ struct SessionView: View {
         while !Task.isCancelled {
             var x: Int32 = 0, y: Int32 = 0
             if henge_vm_pointer(&x, &y) == 0 {
-                moveZoom(toward: CGPoint(x: CGFloat(x) / 1920, y: CGFloat(y) / 1080))
+                moveZoom(toward: CGPoint(x: CGFloat(x) / CGFloat(mac.screen.width), y: CGFloat(y) / CGFloat(mac.screen.height)))
             }
-            if tick % 60 == 0, let image = MacPreview.capture(width: 224, height: 126) { map = UIImage(cgImage: image) }
+            if tick % 60 == 0, let image = MacPreview.capture(width: 224, height: Int(224 / mac.aspect)) { map = UIImage(cgImage: image) }
             tick += 1
             try? await Task.sleep(nanoseconds: 33_000_000)
         }
@@ -345,6 +358,22 @@ struct SessionView: View {
                     LabeledContent("Network frames", value: "\(framesOut) out, \(framesIn) in")
                     LabeledContent("Up", value: "\(Int(Date().timeIntervalSince(started))) s")
                 }
+                Section("Sharing") {
+                    LabeledContent("Clipboard and folder", value: helperRunning ? "On" : "Not set up")
+                    if !helperRunning {
+                        Button("Type the Set Up Command") {
+                            showDetails = false
+                            Task {
+                                try? await Task.sleep(nanoseconds: 600_000_000)
+                                await Sharing.typeSetUpCommand()
+                            }
+                        }
+                    }
+                    Text(helperRunning
+                         ? "Put files in Files, Henge, Shared to see them in the Henge folder in this Mac's home folder. What you copy on the Mac is copied here too, and the paste button pastes from here into the Mac."
+                         : "Once for each Mac: open Terminal on the Mac, tap this, then press Return. When macOS asks about henge-agent and local networks, choose Allow. It types \(Sharing.setUpCommand) and needs the Mac's keyboard layout to be U.S.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
                 Section("Log") {
                     VStack(alignment: .leading, spacing: 1) {
                         ForEach(Array(log.suffix(30).enumerated()), id: \.offset) { _, line in
@@ -369,6 +398,8 @@ struct SessionView: View {
             return
         }
         var buffer = [CChar](repeating: 0, count: 256)
+        Sharing.prepare()
+        henge_vm_set_display(UInt32(mac.screen.width), UInt32(mac.screen.height))
         let rc = henge_vm_boot(mac.rom.path, mac.disk.path, mac.aux.path, mac.ecid, mac.seed, ram, Int32(cpus), &buffer, buffer.count)
         if rc != 0 {
             error = String(cString: buffer)
@@ -391,6 +422,7 @@ struct SessionView: View {
             lastTime = now
             framesOut = henge_vm_net_frames(1)
             framesIn = henge_vm_net_frames(0)
+            helperRunning = Sharing.helperRunning
             log = Array(HengeLog.recentLines(200))
             if state == 2 { break }
             tick += 1

@@ -1,3 +1,5 @@
+#include "share.h"
+#include "net_slirp.h"
 #include <time.h>
 /* hengevm: boots the virtual Mac on the macOS host.
    hengevm --rom AVPBooter.vmapple2.bin --disk disk.img --aux auxiliary.bin --ecid N [--seed N] [--ram MB] [--log N] */
@@ -550,6 +552,12 @@ static void *input_thread(void *unused) {
             hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, line[0] == 'p');
             hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
         }
+        else if (!strncmp(line, "clip ", 5)) hv_share_set_clipboard(line + 5);
+        else if (!strncmp(line, "getclip", 7)) {
+            char *text = hv_share_take_clipboard();
+            fprintf(stderr, "hengevm: guest clipboard: %s (agent seen %ld s ago)\n", text ? text : "(nothing new)", hv_share_agent_seen());
+            free(text);
+        }
         else if (sscanf(line, "hiddown %i", &x) == 1) hv_vm_key_hid((uint8_t)x, 1);
         else if (sscanf(line, "hidup %i", &x) == 1) hv_vm_key_hid((uint8_t)x, 0);
         else if (sscanf(line, "hidkey %i", &x) == 1) {
@@ -886,6 +894,7 @@ int main(int argc, char **argv) {
     const char *rom = NULL, *disk_path = NULL, *aux_path = NULL;
     uint64_t seed = 0, ecid = 0, ram_mb = 4096, aux_offset = 16384;
     const char *install_ipsw = NULL;
+    const char *share_folder = NULL;
     int log = 1, trace = 0, use_pvg = 1, no_chain = 0;
     const char *screenshot = NULL;
     uint64_t watch = 0, watch_pa = 0;
@@ -915,6 +924,13 @@ int main(int argc, char **argv) {
         }
         if (i + 1 >= argc) usage();
         if (!strcmp(argv[i], "--rom")) rom = argv[++i];
+        else if (!strcmp(argv[i], "--share")) { /* FOLDER: the guest reaches it at http://10.0.2.4/ */
+            share_folder = argv[++i];
+        }
+        else if (!strcmp(argv[i], "--display")) { /* WxH, in --phone mode */
+            unsigned w = 0, h = 0;
+            if (sscanf(argv[++i], "%ux%u", &w, &h) == 2 && w && h) hv_pvg_lite_set_mode(w, h);
+        }
         else if (!strcmp(argv[i], "--disk")) disk_path = argv[++i];
         else if (!strcmp(argv[i], "--aux")) aux_path = argv[++i];
         else if (!strcmp(argv[i], "--ecid")) ecid = strtoull(argv[++i], NULL, 0);
@@ -950,6 +966,11 @@ int main(int argc, char **argv) {
     if (getenv("HV_JIT_MB")) vc.jit_bytes = (size_t)atoi(getenv("HV_JIT_MB")) << 20; /* debugging: a small region flushes often */
     hv_prof_register = hv_prof_register_thread;
     char err[256];
+    if (share_folder) {
+        char sock[256];
+        snprintf(sock, sizeof sock, "%s.sock", share_folder);
+        if (hv_share_start(share_folder, sock, getenv("HV_AGENT")) == 0) hv_net_set_share_socket(sock);
+    }
     if (hv_vm_create(&vc, err, sizeof err) != 0) {
         fprintf(stderr, "hengevm: %s\n", err);
         return 1;

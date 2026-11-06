@@ -31,5 +31,8 @@ GPL-2.0-or-later allows.
 These are Apple's, and none of the licences above apply to them:
 
 - **macOS**, which Henge downloads from Apple when you install it.
-- **The boot ROM**, `AVPBooter.vmapple2.bin`. The build copies it into the app from
-  the Virtualization framework on the Mac doing the build, so every IPA contains it.
+- **The boot ROM**, `AVPBooter.vmapple2.bin`. Henge fetches it on the device, from Apple's
+  macOS 14.6.1 restore image, when you install. It isn't in this repository or in the app.
+
+An exported Mac is a copy of that Mac, so its folder contains macOS and the ROM, as does
+one made by `tools/export_ios.sh`. Those folders are for your own devices, not for sharing.

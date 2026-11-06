@@ -102,15 +102,15 @@ enum MacPreview {
 
     /// Off the main thread.
     static func save(for mac: VirtualMac) {
-        let url = file(for: mac)
-        Task.detached(priority: .utility) { write(to: url) }
+        let url = file(for: mac), height = Int(640 / mac.aspect)
+        Task.detached(priority: .utility) { write(to: url, height: height) }
     }
 
     /// Before the machine stops, while there is still a screen to read.
-    static func saveNow(for mac: VirtualMac) { write(to: file(for: mac)) }
+    static func saveNow(for mac: VirtualMac) { write(to: file(for: mac), height: Int(640 / mac.aspect)) }
 
-    private static func write(to url: URL) {
-        guard let image = capture(width: 640, height: 360), let data = UIImage(cgImage: image).jpegData(compressionQuality: 0.8) else { return }
+    private static func write(to url: URL, height: Int) {
+        guard let image = capture(width: 640, height: height), let data = UIImage(cgImage: image).jpegData(compressionQuality: 0.8) else { return }
         try? data.write(to: url, options: .atomic)
     }
 }

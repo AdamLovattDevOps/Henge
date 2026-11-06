@@ -21,8 +21,14 @@ libslirp and glib for iOS).
   can also be exported from the app, or made on a Mac with
   `tools/export_ios.sh DISK AUX ECID [NAME]` (disk packed with its holes left out,
   see `host/hvsparse.h`), and dropped on Henge in Finder or picked in Files.
+- **Boot ROM**: fetched from Apple at install, not shipped (`Henge/BootROM.swift`,
+  [docs/architecture.md](../docs/architecture.md)).
 - **Display**: iOS has no ParavirtualizedGraphics framework, so Henge replays the
   guest's GPU commands with Metal (`devices/pvg_lite.c`, `devices/pvg_metal.m`).
+- **Sharing** (`Henge/Sharing.swift`, `host/share.c`,
+  [docs/architecture.md](../docs/architecture.md)): the Shared folder in Files and
+  the clipboard. The Mac's clipboard follows along; going the other way uses the
+  system paste button, since iOS asks permission when an app reads it on its own.
 - **Hardware input** (`Henge/Hardware.swift`): a keyboard's keys go to the Mac's
   USB keyboard by HID usage, which is how iOS reports them. A trackpad or mouse
   goes through GameController with the pointer locked, which iPadOS allows only

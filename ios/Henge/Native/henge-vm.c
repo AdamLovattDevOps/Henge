@@ -1,3 +1,6 @@
+#include "pvg_lite.h"
+#include "share.h"
+#include "net_slirp.h"
 #include <sys/mman.h>
 #include "henge-vm.h"
 
@@ -120,6 +123,15 @@ int henge_vm_guest_el0(void) {
         if (!hv_vm_cpu(i)->off && hv_vm_cpu(i)->el == 0) return 1;
     return 0;
 }
+
+void henge_vm_share(const char *folder, const char *socket_path, const char *agent) {
+    if (hv_share_start(folder, socket_path, agent) == 0) hv_net_set_share_socket(socket_path);
+}
+void henge_share_set_clipboard(const char *text) { hv_share_set_clipboard(text); }
+char *henge_share_take_clipboard(void) { return hv_share_take_clipboard(); }
+long henge_share_agent_seen(void) { return hv_share_agent_seen(); }
+
+void henge_vm_set_display(uint32_t width, uint32_t height) { hv_pvg_lite_set_mode(width, height); }
 
 void henge_vm_key(uint16_t code, int down) { if (state == 1) hv_vm_key(code, down); }
 void henge_vm_key_hid(uint8_t usage, int down) { if (state == 1) hv_vm_key_hid(usage, down); }

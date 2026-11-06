@@ -56,6 +56,25 @@ macOS draws through Apple's paravirtual GPU. iOS has no ParavirtualizedGraphics
 framework, so `devices/pvg_lite.c` takes the guest's command streams and
 `devices/pvg_metal.m` replays them with Metal.
 
+## The boot ROM
+
+The first code a virtual Mac runs is Apple's AVPBooter, which starts macOS or, for an
+install, waits in DFU mode. It lives in macOS's system image, and since macOS 15 those are
+encrypted, but the one in Apple's macOS 14.6.1 restore image is not, and its ROM runs later
+versions. `ios/Henge/BootROM.swift` fetches it from Apple: the file is part of one
+compressed block of that image, so one request of under a megabyte gets all of it. It then
+checks the result against a SHA-256 hash. Nothing is decrypted.
+
+## Sharing
+
+`host/share.c` is a small WebDAV server, because macOS has a WebDAV client built in. The
+guest reaches it at 10.0.2.4, which the user-mode network hands to a Unix socket in the
+app's storage: no TCP port is open, so other apps on the device can't reach it. Under
+`/.henge/` it also has the clipboard and what it takes to install `tools/henge-agent.m`, a
+small helper that runs inside macOS as a LaunchAgent, mounts the folder at `~/Henge` and
+follows the clipboard. The app types the set up command but never presses Return: it can't
+see what has the keyboard on the Mac.
+
 ## Installing macOS (no Mac needed)
 
 `hengevm --install IPSW` (and the iOS app's Install macOS) install macOS on a

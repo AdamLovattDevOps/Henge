@@ -937,7 +937,7 @@ typedef struct {
 }
 
 - (void)render:(id<MTLRenderCommandEncoder>)e tag:(uint32_t)tag rec:(Rec)r task:(uint32_t)task {
-    BOOL draw = tag <= 13 || tag == 16 || tag == 17 || tag == 28 || tag == 29 || tag == 155 || tag == 162;
+    BOOL draw = tag <= 19 || tag == 28 || tag == 29 || tag == 155 || tag == 162;
     if (!pipeline_set && draw) return;
     if (tracing && draw) fprintf(stderr, "trace:  draw tag %u\n", tag);
     switch (tag) {
@@ -1147,6 +1147,46 @@ typedef struct {
         if (!tess_factors) break; /* Metal crashes without a factor buffer */
         id<MTLBuffer> b = [self get:U32(4) task:task];
         [e drawPatches:U16(14) patchStart:U16(0) patchCount:U16(2) patchIndexBuffer:b patchIndexBufferOffset:U16(8) instanceCount:U16(10) baseInstance:U16(12)];
+        draws++;
+        break;
+    }
+    case 12: { /* {start 64, count 64, index ref, offset 64, instances 64, base instance 64, control points 16} */
+        if (!tess_factors) break;
+        id<MTLBuffer> b = [self get:U32(16) task:task];
+        [e drawPatches:U16(44) patchStart:(NSUInteger)U64(0) patchCount:(NSUInteger)U64(8) patchIndexBuffer:b patchIndexBufferOffset:(NSUInteger)U64(20)
+         instanceCount:(NSUInteger)U64(28) baseInstance:(NSUInteger)U64(36)];
+        draws++;
+        break;
+    }
+    case 14: { /* {start 64, count 64, patch index ref, offset 64, control point index ref, offset 64, instances 64, base instance 64, control points 16} */
+        if (!tess_factors) break;
+        id<MTLBuffer> patches = [self get:U32(16) task:task], points = [self get:U32(28) task:task];
+        if (points) [e drawIndexedPatches:U16(56) patchStart:(NSUInteger)U64(0) patchCount:(NSUInteger)U64(8) patchIndexBuffer:patches patchIndexBufferOffset:(NSUInteger)U64(20)
+                  controlPointIndexBuffer:points controlPointIndexBufferOffset:(NSUInteger)U64(32) instanceCount:(NSUInteger)U64(40) baseInstance:(NSUInteger)U64(48)];
+        draws++;
+        break;
+    }
+    case 15: { /* {start 16, count 16, patch index ref, offset 16, control point index ref, offset 16, instances 16, base instance 16, control points 16} */
+        if (!tess_factors) break;
+        id<MTLBuffer> patches = [self get:U32(4) task:task], points = [self get:U32(10) task:task];
+        if (points) [e drawIndexedPatches:U16(20) patchStart:U16(0) patchCount:U16(2) patchIndexBuffer:patches patchIndexBufferOffset:U16(8)
+                  controlPointIndexBuffer:points controlPointIndexBufferOffset:U16(14) instanceCount:U16(16) baseInstance:U16(18)];
+        draws++;
+        break;
+    }
+    case 18: { /* {patch index ref, indirect ref, patch index offset 64, indirect offset 64, control points 16} */
+        if (!tess_factors) break;
+        id<MTLBuffer> patches = [self get:U32(0) task:task], indirect = [self get:U32(4) task:task];
+        if (indirect) [e drawPatches:U16(24) patchIndexBuffer:patches patchIndexBufferOffset:(NSUInteger)U64(8) indirectBuffer:indirect indirectBufferOffset:(NSUInteger)U64(16)];
+        draws++;
+        break;
+    }
+    case 19: { /* {patch index ref, control point index ref, indirect ref, then their three offsets, 64, and control points 16} */
+        if (!tess_factors) break;
+        id<MTLBuffer> patches = [self get:U32(0) task:task], points = [self get:U32(4) task:task], indirect = [self get:U32(8) task:task];
+        if (points && indirect) [e drawIndexedPatches:U16(36) patchIndexBuffer:patches patchIndexBufferOffset:(NSUInteger)U64(12) controlPointIndexBuffer:points
+                                controlPointIndexBufferOffset:(NSUInteger)U64(20) indirectBuffer:indirect indirectBufferOffset:(NSUInteger)U64(28)];
+        draws++;
         break;
     }
     case 1: /* {primitive, start 16, count 16} */

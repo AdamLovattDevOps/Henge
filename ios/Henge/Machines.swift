@@ -13,6 +13,11 @@ struct VirtualMac: Identifiable, Codable, Hashable {
     var added = Date()
     var osName: String?
     var lastUsed: Date?
+    /// The size macOS is told its screen is. Macs made before this was a choice have none: 16:9.
+    var screenWidth: Int?
+    var screenHeight: Int?
+    var screen: (width: Int, height: Int) { (screenWidth ?? 1920, screenHeight ?? 1080) }
+    var aspect: CGFloat { CGFloat(screen.width) / CGFloat(screen.height) }
 
     var directory: URL { Machines.directory(for: id) }
     var rom: URL { directory.appendingPathComponent("AVPBooter.vmapple2.bin") }
