@@ -1,8 +1,9 @@
 # Henge for iOS
 
 The Henge app on HengeVM's engine. Build: `ios/scripts/package_ipa.sh` (writes
-`~/Desktop/Henge.ipa`; `--trollstore` writes `Henge.tipa` without the entitlements
-TrollStore bans). Needs Xcode, xcodegen, and the prebuilt pieces
+`~/Desktop/Henge.ipa`; `--trollstore` writes `Henge.tipa`, for TrollStore and
+TrollStore Lite, without the entitlements TrollStore bans). Needs Xcode, xcodegen,
+and the prebuilt pieces
 `ios/scripts/fetch_deps.sh` copies from Husk (StikJIT, the pairing library,
 libslirp and glib for iOS).
 
