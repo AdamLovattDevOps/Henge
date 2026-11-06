@@ -13,10 +13,6 @@ struct Trackpad: UIViewRepresentable {
         private static let holdTime: TimeInterval = 0.4
         private static let tapTime: TimeInterval = 0.3
         private static let tapDistance: CGFloat = 8
-        /// Points of two-finger travel to one unit of the wheel. macOS moves a page about half a pixel
-        /// per unit (measured), so this scrolls about as far as the pointer would move.
-        private static let scrollStep: CGFloat = 1.0 / 6
-
         private var fingers: [UITouch] = []
         private var started = Date()
         private var travelled: CGFloat = 0
@@ -101,16 +97,26 @@ struct Trackpad: UIViewRepresentable {
             holdTimer = nil
         }
 
-        /// As on a Mac's trackpad, the page follows the fingers. The wheel only takes whole units.
+        /// As on a Mac's trackpad, the page follows the fingers. macOS accelerates the wheel hard: a page
+        /// moves about 0.08 d² pixels for an event of d units (measured: 8 units 4 px, 100 units 970 px).
+        /// So d comes from the square root of how far the fingers went, to move the page about three
+        /// pixels for each point, the same as the pointer.
         private func scroll(_ dx: CGFloat, _ dy: CGFloat) {
             scrollX += dx
             scrollY += dy
-            let notchesX = Int32((scrollX / Self.scrollStep).rounded(.towardZero))
-            let notchesY = Int32((scrollY / Self.scrollStep).rounded(.towardZero))
-            guard notchesX != 0 || notchesY != 0 else { return }
-            scrollX -= CGFloat(notchesX) * Self.scrollStep
-            scrollY -= CGFloat(notchesY) * Self.scrollStep
-            henge_vm_mouse_scroll(-notchesX, notchesY)
+            // Mostly one way is that way only: a page shouldn't drift sideways, or a browser go back.
+            if abs(scrollY) > 2 * abs(scrollX) { scrollX = 0 } else if abs(scrollX) > 2 * abs(scrollY) { scrollY = 0 }
+            let unitsX = wheelUnits(scrollX), unitsY = wheelUnits(scrollY)
+            guard unitsX != 0 || unitsY != 0 else { return }
+            if unitsX != 0 { scrollX = 0 }
+            if unitsY != 0 { scrollY = 0 }
+            henge_vm_mouse_scroll(-unitsX, unitsY)
+        }
+
+        private func wheelUnits(_ points: CGFloat) -> Int32 {
+            guard abs(points) >= 0.25 else { return 0 } // less than this is a finger resting
+            let units = (6 * abs(points).squareRoot()).rounded()
+            return Int32(points < 0 ? -units : units)
         }
     }
 }

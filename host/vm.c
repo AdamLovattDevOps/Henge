@@ -352,15 +352,18 @@ void hv_vm_mouse_button(int button, int down) {
     hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
 }
 
-void hv_vm_mouse_wheel(int dy) {
-    hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_WHEEL, dy);
-    hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+/* The guest takes a wheel event as 8 bits: -200 arrives as +56, the wrong way. So big moves go in pieces. */
+static void wheel(uint16_t axis, int amount) {
+    while (amount) {
+        int piece = amount > 100 ? 100 : amount < -100 ? -100 : amount;
+        hv_virtio_input_send(board.mouse, HV_EV_REL, axis, piece);
+        hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+        amount -= piece;
+    }
 }
 
-void hv_vm_mouse_hwheel(int dx) {
-    hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_HWHEEL, dx);
-    hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
-}
+void hv_vm_mouse_wheel(int dy) { wheel(HV_REL_WHEEL, dy); }
+void hv_vm_mouse_hwheel(int dx) { wheel(HV_REL_HWHEEL, dx); }
 
 int hv_vm_pointer(int *x, int *y) {
     const uint8_t *page = board.pvg ? hv_pvg_lite_display_page(board.pvg) : NULL;
