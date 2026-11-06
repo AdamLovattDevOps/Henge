@@ -6,6 +6,9 @@ import QuartzCore
 /// progress bar (a virtual Mac's firmware draws no logo into it), so the logo
 /// over it is the app's own.
 struct BootDisplay: View {
+    let display: DisplayRouter
+    let role: DisplayTargetSelection.Role
+
     @State private var image: CGImage?
     @State private var gpuLive = false
 
@@ -26,7 +29,7 @@ struct BootDisplay: View {
                         .foregroundStyle(.white)
                 }
             }
-            GPUScreen().allowsHitTesting(false)
+            GPUScreen(display: display, role: role).allowsHitTesting(false)
         }
         .task {
             // Once macOS draws with the GPU the frames go straight to GPUScreen:
@@ -59,19 +62,61 @@ struct BootDisplay: View {
 
 /// A layer the engine draws the Mac's frames into, with the GPU, without the main thread.
 private struct GPUScreen: UIViewRepresentable {
+    let display: DisplayRouter
+    let role: DisplayTargetSelection.Role
+
     final class Screen: UIView {
         override class var layerClass: AnyClass { CAMetalLayer.self }
+
+        private let id = UUID()
+        private let display: DisplayRouter
+        private let role: DisplayTargetSelection.Role
+        private var attached = false
+        private var lastSize: CGSize = .zero
+
+        init(display: DisplayRouter, role: DisplayTargetSelection.Role) {
+            self.display = display
+            self.role = role
+            super.init(frame: .zero)
+            backgroundColor = .clear
+            isOpaque = false
+            layer.contentsGravity = .resizeAspect
+            layer.isOpaque = false
+        }
+
+        required init?(coder: NSCoder) { fatalError("made in code") }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            if window == nil { detach() } else { attachIfReady() }
+        }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            attachIfReady()
+        }
+
+        private func attachIfReady() {
+            guard window != nil, bounds.width > 0, bounds.height > 0,
+                  let metal = layer as? CAMetalLayer else { return }
+            if !attached {
+                attached = true
+                lastSize = bounds.size
+                display.connect(id, layer: metal, role: role)
+            } else if lastSize != bounds.size {
+                lastSize = bounds.size
+                display.refresh(id)
+            }
+        }
+
+        func detach() {
+            guard attached else { return }
+            attached = false
+            display.disconnect(id)
+        }
     }
 
-    func makeUIView(context: Context) -> Screen {
-        let view = Screen()
-        view.backgroundColor = .clear
-        view.isOpaque = false
-        view.layer.contentsGravity = .resizeAspect
-        view.layer.isOpaque = false
-        henge_vm_set_display_layer(Unmanaged.passUnretained(view.layer).toOpaque())
-        return view
-    }
-
+    func makeUIView(context: Context) -> Screen { Screen(display: display, role: role) }
     func updateUIView(_ view: Screen, context: Context) {}
+    static func dismantleUIView(_ view: Screen, coordinator: ()) { view.detach() }
 }

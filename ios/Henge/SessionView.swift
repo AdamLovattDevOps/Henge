@@ -7,6 +7,7 @@ struct SessionView: View {
     let mac: VirtualMac
     let close: () -> Void
 
+    @StateObject private var display = DisplayRouter()
     @State private var error: String?
     @State private var state: Int32 = 0
     @State private var cpusOn: Int32 = 0
@@ -40,7 +41,22 @@ struct SessionView: View {
             ZStack(alignment: .topLeading) {
                 (landscape || zoomed ? Color.black : Desk.page)
                 // One view in every layout: it holds the layer the engine draws into.
-                BootDisplay()
+                BootDisplay(display: display, role: .device)
+                    .opacity(display.isExternal ? 0 : 1)
+                    .overlay {
+                        if display.isExternal {
+                            VStack(spacing: 8) {
+                                Image(systemName: "display").font(.largeTitle)
+                                Text("Mac on external display").font(.headline)
+                                Text("Use the trackpad, keyboard or a connected mouse.")
+                                    .font(.subheadline)
+                            }
+                            .foregroundStyle(.white)
+                            .multilineTextAlignment(.center)
+                            .padding()
+                            .accessibilityElement(children: .combine)
+                        }
+                    }
                     .frame(width: layout.screen.width, height: layout.screen.height)
                     .clipShape(RoundedRectangle(cornerRadius: layout.fillsPhone ? 0 : 15, style: .continuous))
                     .overlay {
@@ -82,7 +98,10 @@ struct SessionView: View {
         }
         .onChange(of: pointerNeeded) { PointerLock.set(!$0) }
         .onChange(of: scenePhase) { phase in
-            guard phase != .active else { return }
+            guard phase != .active else {
+                display.refresh()
+                return
+            }
             HardwareKeys.releaseAll()
             HardwareMouse.shared.releaseButtons()
         }
@@ -97,6 +116,7 @@ struct SessionView: View {
             HardwareKeys.releaseAll()
             HardwareMouse.shared.stop()
         }
+        .modifier(ExternalMacDisplayModifier(display: display, aspect: mac.aspect))
         .task { await run() }
         .task { await Sharing.followMacClipboard() }
     }

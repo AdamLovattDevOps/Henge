@@ -3,6 +3,7 @@ import SwiftUI
 /// Download macOS (or use a copy already on this device) and install it on a new Mac.
 struct InstallView: View {
     @ObservedObject private var installer = Installer.shared
+    @StateObject private var display = DisplayRouter()
     @State private var release = MacOSRelease.all.first(where: Installer.haveImage) ?? MacOSRelease.all[0]
     @State private var name = "Mac"
     @State private var ramGB = Device.suggestedRAMGB
@@ -214,7 +215,7 @@ struct InstallView: View {
         if details {
             VStack(spacing: 12) {
                 if case .installing = installer.phase {
-                    BootDisplay()
+                    BootDisplay(display: display, role: .device)
                         .aspectRatio(16.0 / 10.0, contentMode: .fit)
                         .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
                 }

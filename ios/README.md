@@ -2,7 +2,7 @@
 
 The Henge app on HengeVM's engine. Build: `ios/scripts/package_ipa.sh` (writes
 `~/Desktop/Henge.ipa`; `--trollstore` writes `Henge.tipa`, for TrollStore and
-TrollStore Lite, without the entitlements TrollStore bans). Needs Xcode, xcodegen,
+TrollStore Lite, without the entitlements TrollStore bans). Needs Xcode 27 or later, xcodegen,
 and the prebuilt pieces
 `ios/scripts/fetch_deps.sh` copies from Husk (StikJIT, the pairing library,
 libslirp and glib for iOS).
@@ -25,6 +25,23 @@ libslirp and glib for iOS).
   [docs/architecture.md](../docs/architecture.md)).
 - **Display**: iOS has no ParavirtualizedGraphics framework, so Henge replays the
   guest's GPU commands with Metal (`devices/pvg_lite.c`, `devices/pvg_metal.m`).
+- **External display (iOS 27+)**: `SessionView` registers a SwiftUI
+  `ExternalNonInteractiveAccessory` during a Mac session. `DisplayRouter` selects
+  one live `CAMetalLayer`, preferring the external surface and returning to the
+  device on disconnect. The phone's session owns the VM and all input; the
+  accessory only presents pixels. The existing guest resolution is unchanged
+  (1920×1080 by default on iPhone), fitted to the monitor without stretching.
+  USB-C video and a hub's keyboard/mouse can be used together when iOS recognizes
+  the peripherals. iOS 17–26 keep system mirroring; AirPlay may also provide an
+  external scene, with transport-dependent latency. Run `make test-display-routing`
+  for routing lifecycle checks; `ios/scripts/check_display.sh` also compiles all
+  app Swift sources and the iOS/macOS renderer without linking external libraries.
+  USB-C video is user-confirmed on an iPhone 17 Pro running iOS 27 with
+  development build 0.1/2; activation is automatic during a Mac session.
+  Remaining acceptance checks: connect before/during boot, unplug/replug with an
+  idle desktop, rotate the phone, use keyboard/mouse through the dock, and end
+  the session while connected. These individual lifecycle cases, other devices
+  and AirPlay have not been separately verified.
 - **Sharing** (`Henge/Sharing.swift`, `host/share.c`,
   [docs/architecture.md](../docs/architecture.md)): the Shared folder in Files and
   the clipboard. The Mac's clipboard follows along; going the other way uses the

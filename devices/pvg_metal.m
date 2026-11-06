@@ -145,16 +145,22 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     BOOL late, late_queued;
     uint64_t frames, frames_shot;
     /* Showing frames with the GPU: a layer the app gave us. No copies, no conversion on a CPU. */
-    CAMetalLayer *layer;
+    CAMetalLayer *layer; /* screen_lock protects the target and its generation */
+    uint64_t layer_generation;
+    __weak CAMetalLayer *prepared_layer; /* presenter only: each target needs its own setup */
     id<MTLRenderPipelineState> screen_pipe, linear_pipe, cursor_pipe;
     id<MTLTexture> cursor_tex;
     id<MTLSamplerState> screen_sampler;
     uint64_t on_screen; /* the mapping showing */
-    uint64_t gpu_frames;
+    _Atomic uint64_t gpu_frames;
     dispatch_queue_t presenter;
     os_unfair_lock screen_lock; /* what to show, and the pointer as the presenter reads it */
     id<MTLTexture> screen_tex;
     BOOL screen_half, screen_dirty, presenter_running;
+    BOOL drawable_retry_pending;
+    double drawable_retry_cooldown; /* fresh work coalesces one wake at its expiry */
+    uint64_t screen_requests; /* fresh frames/cursor changes, not automatic retries */
+    double drawable_retry_deadline; /* at most two seconds of retrying an unavailable target */
     uint32_t screen_w, screen_h;
     id<MTLBuffer> test_readback; /* HV_PVG_GPU_TEST: the drawable's pixels for screenshots */
     id<MTLBuffer> readback;
@@ -165,6 +171,9 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
 - (void)complain:(NSString *)what;
 - (HvObject *)object:(uint32_t)ref task:(uint32_t)task;
 - (void)drawCursor;
+- (BOOL)hasDisplayLayer;
+- (void)kickPresenter:(BOOL)fresh;
+- (void)present:(uint64_t)mapping;
 @end
 
 /* What Metal asks while it reads a serialized pipeline. */
@@ -1753,9 +1762,16 @@ static const uint8_t *half_to_byte(void) {
     [self drawCursor];
 }
 
+- (BOOL)hasDisplayLayer {
+    os_unfair_lock_lock(&screen_lock);
+    BOOL attached = layer != nil;
+    os_unfair_lock_unlock(&screen_lock);
+    return attached;
+}
+
 /* Puts back what the pointer covered, and draws it where the shared page says it is now. */
 - (void)drawCursor {
-    if (layer) {
+    if ([self hasDisplayLayer]) {
         [self screenChanged];
         return;
     }
@@ -1808,46 +1824,73 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
     "fragment float4 screen_cursor(V v [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) {\n"
     "  return t.sample(s, v.uv); }\n";
 
-- (BOOL)prepareScreen {
-    if (screen_pipe) return YES;
-    NSError *err = nil;
-    id<MTLLibrary> lib = [device newLibraryWithSource:screen_shaders options:nil error:&err];
-    if (!lib) { [self complain:[NSString stringWithFormat:@"screen shaders: %@", err.localizedDescription]]; return NO; }
-    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
-    d.vertexFunction = [lib newFunctionWithName:@"screen_v"];
-    d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    d.fragmentFunction = [lib newFunctionWithName:@"screen_plain"];
-    screen_pipe = [device newRenderPipelineStateWithDescriptor:d error:&err];
-    d.fragmentFunction = [lib newFunctionWithName:@"screen_linear"];
-    linear_pipe = [device newRenderPipelineStateWithDescriptor:d error:&err];
-    d.fragmentFunction = [lib newFunctionWithName:@"screen_cursor"];
-    d.colorAttachments[0].blendingEnabled = YES;
-    d.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
-    d.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    d.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-    d.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    cursor_pipe = [device newRenderPipelineStateWithDescriptor:d error:&err];
-    MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
-    sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
-    screen_sampler = [device newSamplerStateWithDescriptor:sd];
-    if (!screen_pipe || !linear_pipe || !cursor_pipe) { [self complain:[NSString stringWithFormat:@"screen pipelines: %@", err.localizedDescription]]; return NO; }
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    layer.device = device;
-    layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-    layer.framebufferOnly = !getenv("HV_PVG_GPU_TEST");
-    layer.allowsNextDrawableTimeout = YES;
-    layer.maximumDrawableCount = 3;
-    [CATransaction commit];
+- (BOOL)prepareScreenForLayer:(CAMetalLayer *)target {
+    if (!screen_pipe || !linear_pipe || !cursor_pipe) {
+        NSError *err = nil;
+        id<MTLLibrary> lib = [device newLibraryWithSource:screen_shaders options:nil error:&err];
+        if (!lib) { [self complain:[NSString stringWithFormat:@"screen shaders: %@", err.localizedDescription]]; return NO; }
+        MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = [lib newFunctionWithName:@"screen_v"];
+        d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        d.fragmentFunction = [lib newFunctionWithName:@"screen_plain"];
+        screen_pipe = [device newRenderPipelineStateWithDescriptor:d error:&err];
+        d.fragmentFunction = [lib newFunctionWithName:@"screen_linear"];
+        linear_pipe = [device newRenderPipelineStateWithDescriptor:d error:&err];
+        d.fragmentFunction = [lib newFunctionWithName:@"screen_cursor"];
+        d.colorAttachments[0].blendingEnabled = YES;
+        d.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+        d.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        d.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        d.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        cursor_pipe = [device newRenderPipelineStateWithDescriptor:d error:&err];
+        MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+        sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
+        screen_sampler = [device newSamplerStateWithDescriptor:sd];
+        if (!screen_pipe || !linear_pipe || !cursor_pipe) { [self complain:[NSString stringWithFormat:@"screen pipelines: %@", err.localizedDescription]]; return NO; }
+    }
+    // Pipelines are shared, but a newly connected monitor has a fresh layer.
+    if (prepared_layer != target) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        target.device = device;
+        target.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        target.framebufferOnly = !getenv("HV_PVG_GPU_TEST");
+        target.allowsNextDrawableTimeout = YES;
+        target.maximumDrawableCount = 3;
+        [CATransaction commit];
+        prepared_layer = target;
+    }
     return YES;
 }
 
 /* The display, drawn by the GPU. Waiting for a drawable can take until the screen's next
    refresh, so that happens on a thread of its own and never holds up the guest's GPU work:
    this only says what to show next. Whatever is newest when a drawable comes is what is shown. */
-- (void)kickPresenter {
+- (void)kickPresenter:(BOOL)fresh {
     /* screen_lock held */
-    if (presenter_running) return;
+    if (fresh) screen_requests++;
+    if (presenter_running || !layer || !screen_tex || drawable_retry_pending) return;
+    if (drawable_retry_cooldown) {
+        double delay = drawable_retry_cooldown - now_seconds();
+        if (delay > 0) {
+            if (!fresh) return;
+            // Coalesce fresh work arriving during cooldown; it may be the guest's
+            // last update. Automatic retries alone never reopen an exhausted budget.
+            drawable_retry_pending = YES;
+            uint64_t generation = layer_generation;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), presenter, ^{
+                os_unfair_lock_lock(&self->screen_lock);
+                if (self->layer_generation == generation) {
+                    self->drawable_retry_pending = NO;
+                    self->drawable_retry_cooldown = self->drawable_retry_deadline = 0;
+                    [self kickPresenter:NO];
+                }
+                os_unfair_lock_unlock(&self->screen_lock);
+            });
+            return;
+        }
+        drawable_retry_cooldown = drawable_retry_deadline = 0;
+    }
     presenter_running = YES;
     dispatch_async(presenter, ^{ [self presentLoop]; });
 }
@@ -1868,7 +1911,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
     os_unfair_lock_lock(&screen_lock);
     screen_tex = surface->scanout, screen_half = half, screen_w = surface->surface_w, screen_h = surface->surface_h;
     screen_dirty = YES;
-    [self kickPresenter];
+    [self kickPresenter:YES];
     os_unfair_lock_unlock(&screen_lock);
 }
 
@@ -1877,7 +1920,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
     os_unfair_lock_lock(&screen_lock);
     if (screen_tex) {
         screen_dirty = YES;
-        [self kickPresenter];
+        [self kickPresenter:YES];
     }
     os_unfair_lock_unlock(&screen_lock);
 }
@@ -1885,41 +1928,79 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
 - (void)presentLoop {
     for (;;) @autoreleasepool {
         os_unfair_lock_lock(&screen_lock);
-        if (!screen_dirty) {
+        if (!screen_dirty || !layer) {
             presenter_running = NO;
             os_unfair_lock_unlock(&screen_lock);
             return;
         }
         screen_dirty = NO;
+        CAMetalLayer *target = layer; // retained across nextDrawable and a concurrent disconnect
+        uint64_t generation = layer_generation, requests = screen_requests;
         id<MTLTexture> tex = screen_tex, ctex = cursor_tex;
         BOOL half = screen_half, shown = cursor_shown;
         uint32_t W = screen_w, H = screen_h, cw0 = cursor_w, ch0 = cursor_h;
         int hx = cursor_hot_x, hy = cursor_hot_y;
         os_unfair_lock_unlock(&screen_lock);
-        if (![self prepareScreen]) continue;
+        if (![self prepareScreenForLayer:target]) {
+            os_unfair_lock_lock(&screen_lock);
+            BOOL changed = layer_generation != generation;
+            if (!changed) presenter_running = NO;
+            os_unfair_lock_unlock(&screen_lock);
+            if (changed) continue;
+            return;
+        }
         CGSize want = CGSizeMake(W, H);
-        if (!CGSizeEqualToSize(layer.drawableSize, want)) {
+        if (!CGSizeEqualToSize(target.drawableSize, want)) {
             [CATransaction begin];
             [CATransaction setDisableActions:YES];
-            layer.drawableSize = want;
+            target.drawableSize = want;
             [CATransaction commit];
         }
-        id<CAMetalDrawable> drawable = [layer nextDrawable]; /* the wait is here */
+        id<CAMetalDrawable> drawable = [target nextDrawable]; /* the wait is here */
         if (!drawable) {
             os_unfair_lock_lock(&screen_lock);
             screen_dirty = YES;
+            BOOL changed = layer_generation != generation;
+            if (!changed) {
+                presenter_running = NO;
+                double now = now_seconds();
+                if (!drawable_retry_deadline) drawable_retry_deadline = now + 2;
+                BOOL exhausted = now >= drawable_retry_deadline;
+                if (exhausted) {
+                    drawable_retry_cooldown = now + 1;
+                    // A fresh frame/cursor event received while nextDrawable waited
+                    // must not lose its wakeup at the transition into cooldown.
+                    if (screen_requests != requests) [self kickPresenter:YES];
+                } else {
+                    // A monitor can connect before its first drawable is available.
+                    // Retry even if the guest is idle, but never poll a hidden target forever.
+                    drawable_retry_pending = YES;
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), presenter, ^{
+                        os_unfair_lock_lock(&self->screen_lock);
+                        if (self->layer_generation == generation) {
+                            self->drawable_retry_pending = NO;
+                            [self kickPresenter:NO];
+                        }
+                        os_unfair_lock_unlock(&self->screen_lock);
+                    });
+                }
+            }
             os_unfair_lock_unlock(&screen_lock);
-            usleep(4000);
-            continue;
+            if (changed) continue;
+            return;
         }
         /* Something newer came during the wait? Then that is the frame to show. */
         os_unfair_lock_lock(&screen_lock);
         tex = screen_tex, half = screen_half, ctex = cursor_tex, shown = cursor_shown;
         cw0 = cursor_w, ch0 = cursor_h, hx = cursor_hot_x, hy = cursor_hot_y;
+        BOOL same_target = layer_generation == generation && layer == target;
         BOOL same_size = screen_w == W && screen_h == H;
-        screen_dirty = NO;
+        if (same_target && same_size) {
+            screen_dirty = NO;
+            drawable_retry_deadline = 0;
+        }
         os_unfair_lock_unlock(&screen_lock);
-        if (!same_size) { /* a mode change: start over with the right size */
+        if (!same_target || !same_size) { /* a target or mode change during nextDrawable */
             os_unfair_lock_lock(&screen_lock);
             screen_dirty = YES;
             os_unfair_lock_unlock(&screen_lock);
@@ -1971,16 +2052,26 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
             }];
         }
 #endif
-        [cb presentDrawable:drawable];
-        [cb commit];
-        gpu_frames++;
+        // Serialize the final check and commit with set_layer: a switch that has
+        // returned must not be followed by a commit to its old target.
+        os_unfair_lock_lock(&screen_lock);
+        if (layer_generation == generation && layer == target) {
+            [cb presentDrawable:drawable];
+            [cb commit];
+            gpu_frames++;
+        } else {
+            screen_dirty = YES;
+        }
+        os_unfair_lock_unlock(&screen_lock);
     }
 }
 
 /* What the display should show: at most a few times a second by CPU, for tests and the boot's first frames. */
 - (void)present:(uint64_t)mapping {
     double now = now_seconds();
-    if (layer) {
+    on_screen = mapping;
+    if ([self hasDisplayLayer]) {
+        late = NO;
         [self showOnLayer:mapping];
         return;
     }
@@ -2126,7 +2217,9 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
                     }
                     if (op == 4) [r cursorGlyph:args length:n];
                     if (op == 5 && n >= 8) {
+                        os_unfair_lock_lock(&r->screen_lock);
                         r->cursor_shown = args[1] & 1;
+                        os_unfair_lock_unlock(&r->screen_lock);
                         if (getenv("HV_PVG_CURSOR_LOG")) fprintf(stderr, "pvgcursor show %u\n", args[1]);
                         [r drawCursor];
                     }
@@ -2141,10 +2234,19 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
 }
 
 void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
+    if (!m) return;
     HvReplay *r = (__bridge HvReplay *)m;
     CAMetalLayer *l = (__bridge CAMetalLayer *)layer;
+    // Invalidate immediately, even when the guest GPU worker has a backlog.
+    os_unfair_lock_lock(&r->screen_lock);
+    r->layer_generation++; /* reattaching the same layer also wakes a stopped presenter */
+    r->layer = l;
+    r->drawable_retry_pending = NO;
+    r->drawable_retry_deadline = r->drawable_retry_cooldown = 0;
+    r->screen_dirty = YES;
+    [r kickPresenter:YES];
+    os_unfair_lock_unlock(&r->screen_lock);
     dispatch_async(r->worker, ^{
-        r->layer = l;
         if (r->on_screen) [r present:r->on_screen];
     });
 }
@@ -2154,8 +2256,9 @@ uint64_t hv_pvg_metal_gpu_frames(HvPvgMetal *m) {
 }
 
 void hv_pvg_metal_cursor_moved(HvPvgMetal *m) {
+    if (!m) return;
     HvReplay *r = (__bridge HvReplay *)m;
-    if (r->layer) { /* no need to queue behind the guest's GPU work */
+    if ([r hasDisplayLayer]) { /* no need to queue behind the guest's GPU work */
         [r screenChanged];
         return;
     }
