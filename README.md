@@ -1,74 +1,84 @@
-# HengeVM
+<p align="center">
+  <img src="docs/icon.png" width="120" height="120" alt="Henge">
+</p>
 
-A virtual Mac without a hypervisor: arm64 guest code runs through an arm64-to-arm64
-JIT instead of hardware virtualization, so the same engine can run on iOS, where
-apps have no hypervisor access. Built and tested on the Mac first, then ported to
-iOS. This is separate from Henge, whose Mac app uses Virtualization.framework.
+<h1 align="center">Henge</h1>
 
-## Layout
+<p align="center">macOS on your iPhone.</p>
 
-- `core/`: guest CPU state, the block translator, the software MMU, and exceptions.
-- `devices/`: the virtual Mac's devices (interrupt controller, timers, UART, RTC,
-  config region, PCIe with virtio block and network).
-- `host/`: the macOS host harness (memory, JIT region, disk files, logging). The
-  iOS host comes later.
-- `tests/`: instruction-level and block-level tests that run on the Mac.
+<p align="center">
+  <a href="#install">Install</a>
+  ·
+  <a href="docs/architecture.md">How it works</a>
+  ·
+  <a href="https://itslevii.dev">Website</a>
+  ·
+  <a href="https://github.com/Leviidev/Henge/releases">Releases</a>
+</p>
 
-## How the translator works
+<p align="center">
+  <a href="https://github.com/Leviidev/Henge/releases"><img src="https://img.shields.io/github/downloads/Leviidev/Henge/total?style=flat-square&color=2E6BFF&labelColor=111111" alt="Downloads"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Leviidev/Henge?style=flat-square&color=2E6BFF&labelColor=111111" alt="GPL-2.0-or-later"></a>
+</p>
 
-The guest and host are both arm64, so most guest instructions are copied into a
-translated block unchanged. Only these are rewritten:
+Download macOS, install it on the iPhone, and use it.
 
-- loads and stores, which go through the guest MMU (an inline TLB, with a slow
-  path for misses and device accesses);
-- PC-relative instructions and branches, which get the guest PC filled in;
-  same-page branches chain directly to the target block, and indirect branches
-  go through a small cache and fall back to the dispatcher;
-- system register access, exceptions, and barriers that touch guest state, which
-  call helpers;
-- pointer-authentication instructions, which become a strip or a no-op, since the
-  host's keys cannot be the guest's;
-- any instruction that uses a register the translator reserves for itself; those
-  registers are kept in the guest context instead. Guest x6, x7, x15, x18 and
-  x28 are kept in the CPU context, so the host's x6, x7 and x15 are free scratch.
+- **Own emulator** — iOS gives apps no hypervisor, so Henge runs the Mac's arm64 code through its own JIT, with its own MMU and devices. It doesn't use QEMU or Virtualization.framework.
+- **Installs on the iPhone** — Henge downloads Apple's restore image and restores it the way a Mac does. No Mac needed, and nothing is decrypted or patched.
+- **Graphics** — macOS draws through a virtual GPU, and Henge replays its commands with Metal. Safari and Electron apps like Discord draw on it.
+- **Touch** — The screen is a trackpad: hold to drag, two fingers to scroll. Esc, Tab, Control, Option and Command sit above the keyboard.
 
-Guest and host both use 16 KB pages, so guest RAM maps onto host pages directly.
+On an iPhone 17 Pro, macOS reaches the lock screen in about 15 seconds. Discord installs, opens in about 15 seconds, logs in and sends messages.
 
-## Device model
+## Install
 
-The machine follows the memory map and devices of QEMU's open-source `vmapple`
-machine (hw/vmapple in QEMU, GPL-2.0-or-later). That code is the reference for
-device behaviour; nothing here comes from Virtualization.framework.
+Sideload `Henge.ipa` from [Releases](https://github.com/Leviidev/Henge/releases) with SideStore or AltStore, or install `Henge.tipa` with TrollStore. iOS 17 or later, and so far tested only on an iPhone 17 Pro.
 
-## Installing macOS (no Mac needed)
+- **JIT** is required: StikDebug, TrollStore, a jailbreak, or the StikJIT helper built into Henge (iOS 26 or later).
+- **Storage:** about 43 GB free for macOS Sequoia. That's 17 GB for the download, which you can delete afterwards, and 26 GB for the Mac.
+- **Memory:** a Mac gets 4, 6 or 8 GB. Sign Henge with the increased memory limit entitlement if your certificate has it.
 
-`hengevm --install IPSW` (and the iOS app's Install macOS) install macOS on a
-blank machine the way Virtualization.framework's installer does: the boot ROM
-starts in DFU mode (cfg `run_installer`) and shows up as a USB device, and a
-standard restore runs over that link. Apple's signing server personalizes the
-boot chain for the machine's ECID, as for any Mac; nothing is decrypted or
-patched on the host (encrypted images go to the guest as they are, and the
-restore OS asks for its keys itself; the host only fetches the URL it names).
+Then open the Install tab, pick macOS Sequoia 15.6.1, and keep Henge open with the iPhone plugged in. Tahoe 26.6.2 and macOS 27.2 are offered too, but they aren't tested yet.
 
-- The USB port: Apple's virtio USB device controller, PCI 0x106b:0x1a01 for the
-  kernel (`AppleVirtIOUSBDeviceController`), and channel 0x100000 of the boot
-  ROM's bdif MMIO transport for AVPBooter and iBoot (devices/virtio_usb.c,
-  devices/bdif.c). Requests (host to guest) carry {u32 len, u8 endpoint, u8 type}
-  and the data; responses {u8 type, u8 endpoint} and the data.
-- The host side: libirecovery, usbmuxd and idevicerestore (third_party, upstream
-  sources; the boot-ROM exploit is left out) linked against host/libusb_shim.c,
-  a libusb whose one device is that port. usbmuxd sends 16 KB transfers (each
-  request is one read on the device side), and ASR sends wait for a slow disk.
-- iOS: tools/build_ios_restore.sh builds the same stack (with libplist,
-  libimobiledevice, libtatsu, libzip, mbedtls for compiling only) and
-  host/curl_shim.m puts libcurl's easy API on NSURLSession.
+## Known limits
 
-## Milestones
+- Signing in to an Apple Account inside macOS fails with a verification error.
+- Some GPU commands aren't implemented yet, so some apps may draw wrongly.
+- Only one Mac can start per launch. Quit Henge and open it again to start another.
+- It's emulation, so it runs slower than a real Mac.
 
-1. The translator runs small arm64 test programs at EL1 with the MMU off, and the
-   results match running the same code natively.
-2. MMU on: page-table walks, the TLB, and exceptions and interrupts; the timer and
-   GIC deliver interrupts.
-3. The device model, then booting the guest disk made by Henge's Mac app.
-4. Display, input, and networking.
-5. The iOS host: JIT through StikDebug, the memory limits, and the UI.
+## Screenshots
+
+<table>
+  <tr>
+    <td align="center" colspan="3"><img src="Screenshots/discord.jpg" alt="Discord"><br><sub>Discord</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%"><img src="Screenshots/macs.png" alt="Macs"><br><sub>Macs</sub></td>
+    <td align="center" width="33%"><img src="Screenshots/trackpad.png" alt="Trackpad"><br><sub>Trackpad</sub></td>
+    <td align="center" width="33%"><img src="Screenshots/install.png" alt="Install macOS"><br><sub>Install macOS</sub></td>
+  </tr>
+</table>
+
+<sub>Captured on a Mac: Discord is a frame from Henge's renderer, and the others are the app's own screens with sample data.</sub>
+
+## Building
+
+On a Mac with Xcode and `xcodegen`. Henge takes StikJIT, on-device pairing, libslirp and glib from a built [Husk](https://github.com/Leviidev/Husk) checkout at `~/Documents/Coding/Husk` (set `HUSK` to use another path):
+
+```bash
+ios/scripts/fetch_deps.sh
+tools/build_ios_restore.sh
+make ios-lib
+ios/scripts/package_ipa.sh
+```
+
+That produces `~/Desktop/Henge.ipa`, and `package_ipa.sh --trollstore` writes `Henge.tipa`. The build copies Apple's boot ROM (`AVPBooter.vmapple2.bin`) from the Mac's Virtualization framework into the app.
+
+`make` builds the engine for the Mac, `build/hengevm`, and `make test` runs its tests.
+
+## Licence
+
+GPL-2.0-or-later. Henge compiles in usbmuxd (GPLv2 or GPLv3) and code from Husk (GPL-2.0-or-later), so the shipped binary is a combined GPL work. It cannot go on the App Store. See [docs/licensing.md](docs/licensing.md).
+
+macOS and the boot ROM are Apple's and aren't covered by this licence.
