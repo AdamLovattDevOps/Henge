@@ -25,6 +25,21 @@ libslirp and glib for iOS).
   [docs/architecture.md](../docs/architecture.md)).
 - **Display**: iOS has no ParavirtualizedGraphics framework, so Henge replays the
   guest's GPU commands with Metal (`devices/pvg_lite.c`, `devices/pvg_metal.m`).
+- **External display (iOS 27+)**: `SessionView` registers a SwiftUI
+  `ExternalNonInteractiveAccessory` during a Mac session. `DisplayRouter` selects
+  one live `CAMetalLayer`, preferring the external surface and returning to the
+  device on disconnect. The phone's session owns the VM and all input; the
+  accessory only presents pixels. The existing guest resolution is unchanged
+  (1920×1080 by default on iPhone), fitted to the monitor without stretching.
+  USB-C video and a hub's keyboard/mouse can be used together when iOS recognizes
+  the peripherals. iOS 17–26 keep system mirroring; AirPlay may also provide an
+  external scene, with transport-dependent latency. Run `make test-display-routing`
+  for routing lifecycle checks; `ios/scripts/check_display.sh` also compiles all
+  app Swift sources and the iOS/macOS renderer without linking external libraries.
+  Real-device acceptance: connect before and during
+  boot, unplug/replug with an idle desktop, rotate the phone, test keyboard/mouse
+  through the dock, and end the session while connected. Monitor hardware testing
+  is still required; these checks are not a claim of verified USB-C performance.
 - **Sharing** (`Henge/Sharing.swift`, `host/share.c`,
   [docs/architecture.md](../docs/architecture.md)): the Shared folder in Files and
   the clipboard. The Mac's clipboard follows along; going the other way uses the

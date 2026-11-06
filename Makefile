@@ -158,3 +158,11 @@ $(B)/install.o: host/install.c host/*.h devices/*.h | $(B)
 	$(CC) $(CFLAGS) $(RESTORE_CFLAGS) -c $< -o $@
 restore-objs: $(RESTORE_OBJ)
 .PHONY: restore-objs
+
+# Session-owned display routing, independent of JIT, Metal and a connected monitor.
+$(B)/test_display_targets: ios/Henge/DisplayTargetSelection.swift tests/test_display_targets.swift | $(B)
+	xcrun --sdk macosx swiftc $^ -o $@
+
+test-display-routing: $(B)/test_display_targets
+	$(B)/test_display_targets
+.PHONY: test-display-routing
