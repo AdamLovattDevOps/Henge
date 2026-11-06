@@ -28,7 +28,7 @@ Download macOS, install it on the device, and use it.
 - **Graphics** — macOS draws through a virtual GPU, and Henge replays its commands with Metal. Safari and Electron apps like Discord draw on it.
 - **Touch** — The screen is a trackpad: hold to drag, two fingers to scroll. Esc, Tab, Control, Option and Command sit above the keyboard.
 - **Keyboard and mouse** — On iPad, a Magic Keyboard or a Bluetooth keyboard and mouse drive the Mac directly.
-- **External display (iOS 27+)** — Connect a USB-C display or a USB-C/HDMI dock during a Mac session. The monitor shows the Mac, while the iPhone or iPad keeps its trackpad and keyboard controls. Disconnect to return the image to the device. The existing guest resolution is preserved; older iOS versions keep system mirroring.
+- **External display (iOS 27+)** — During a Mac session, connect a display with a video-capable USB-C cable or a USB-C/HDMI dock. The mode activates automatically: the monitor shows the Mac, while the iPhone or iPad keeps its trackpad and keyboard controls. Disconnect to return the image to the device. The existing guest resolution is preserved; older iOS versions keep system mirroring. USB-C video is user-confirmed on an iPhone 17 Pro running iOS 27 (development build 0.1/2).
 - **Sharing** — Copy and paste between macOS and the device, and a shared folder that shows up in Files and on the Mac.
 - **Fits the screen** — On iPad, a new Mac gets a screen the shape of the iPad's, so there are no black bars.
 

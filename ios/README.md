@@ -36,10 +36,12 @@ libslirp and glib for iOS).
   external scene, with transport-dependent latency. Run `make test-display-routing`
   for routing lifecycle checks; `ios/scripts/check_display.sh` also compiles all
   app Swift sources and the iOS/macOS renderer without linking external libraries.
-  Real-device acceptance: connect before and during
-  boot, unplug/replug with an idle desktop, rotate the phone, test keyboard/mouse
-  through the dock, and end the session while connected. Monitor hardware testing
-  is still required; these checks are not a claim of verified USB-C performance.
+  USB-C video is user-confirmed on an iPhone 17 Pro running iOS 27 with
+  development build 0.1/2; activation is automatic during a Mac session.
+  Remaining acceptance checks: connect before/during boot, unplug/replug with an
+  idle desktop, rotate the phone, use keyboard/mouse through the dock, and end
+  the session while connected. These individual lifecycle cases, other devices
+  and AirPlay have not been separately verified.
 - **Sharing** (`Henge/Sharing.swift`, `host/share.c`,
   [docs/architecture.md](../docs/architecture.md)): the Shared folder in Files and
   the clipboard. The Mac's clipboard follows along; going the other way uses the
