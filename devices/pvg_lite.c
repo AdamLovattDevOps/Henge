@@ -31,6 +31,9 @@
    Ring entries are {op (1 map, 2 unmap, 3 test), mapping id, result, 0}. */
 
 #include <unistd.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <os/lock.h>
+#include <stdatomic.h>
 #include "pvg_lite.h"
 
 #include <stdio.h>
@@ -57,7 +60,9 @@ struct HvPvgLite {
     uint32_t draining;
     uint32_t barrier_waits[MAX_CHANNELS];
     uint64_t barriers, barrier_drains, barrier_retries, barrier_timeouts;
-    void *layer; /* where frames go, once there is a replay */
+    CFTypeRef layer; /* retained until replaced; layer_lock serializes lazy replay handoff */
+    os_unfair_lock layer_lock;
+    int layer_set; /* an explicit NULL also overrides the renderer's Mac test layer */
     uint32_t task_root[512]; /* page of each task's root, by the id in commands */
     uint64_t task_objects[512], task_placement[512]; /* task offsets of its object lists */
     uint8_t obj_seen[512][8192];
@@ -65,7 +70,7 @@ struct HvPvgLite {
     uint64_t counts[6][256];
     uint64_t execs, bad;
     double last_tally;
-    HvPvgMetal *metal;
+    _Atomic(HvPvgMetal *) metal; /* release-published after the cached layer is applied */
     int metal_tried;
     uint32_t stamps_pending; /* channels Metal finished, for the next poll */
 };
@@ -295,8 +300,15 @@ void hv_pvg_lite_complete(HvPvgLite *p, uint32_t ch, uint32_t stamp) {
 
 void hv_pvg_lite_set_layer(HvPvgLite *p, void *layer) {
     if (!p) return;
-    p->layer = layer;
-    if (p->metal) hv_pvg_metal_set_layer(p->metal, layer);
+    CFTypeRef retained = layer ? CFRetain(layer) : NULL;
+    os_unfair_lock_lock(&p->layer_lock);
+    CFTypeRef previous = p->layer;
+    p->layer = retained;
+    p->layer_set = 1;
+    HvPvgMetal *metal = atomic_load_explicit(&p->metal, memory_order_acquire);
+    if (metal) hv_pvg_metal_set_layer(metal, layer);
+    os_unfair_lock_unlock(&p->layer_lock);
+    if (previous) CFRelease(previous);
 }
 
 void hv_pvg_lite_barrier_stats(HvPvgLite *p, uint64_t out[4]) {
@@ -502,11 +514,14 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
                 fprintf(stderr, "trace: dev ch %u op %x len %u stamp %x sub %x args %x %x %x %x %x %x %x %x\n", ch, hdr[0], hdr[1], hdr[2], p->submitted[ch], w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
             }
         }
+        os_unfair_lock_lock(&p->layer_lock);
         if (!p->metal_tried) {
             p->metal_tried = 1;
-            if (!getenv("HV_PVG_NO_METAL")) p->metal = hv_pvg_metal_create(p);
-            if (p->metal && p->layer) hv_pvg_metal_set_layer(p->metal, p->layer);
+            HvPvgMetal *metal = getenv("HV_PVG_NO_METAL") ? NULL : hv_pvg_metal_create(p);
+            if (metal && p->layer_set) hv_pvg_metal_set_layer(metal, (void *)p->layer);
+            atomic_store_explicit(&p->metal, metal, memory_order_release);
         }
+        os_unfair_lock_unlock(&p->layer_lock);
         int blocked = 0;
         for (uint32_t k = 0; p->metal && k < hdr[0] >> 16 && !blocked; k++) {
             /* {channel, stamp}, as many as bits 31..16 say: this waits for that channel's
@@ -650,6 +665,8 @@ static void iosfc_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
 
 HvPvgLite *hv_pvg_lite_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint64_t iosfc_pa, int gfx_irq, int iosfc_irq) {
     HvPvgLite *p = calloc(1, sizeof *p);
+    p->layer_lock = OS_UNFAIR_LOCK_INIT;
+    atomic_init(&p->metal, NULL);
     p->m = m;
     p->gic = gic;
     p->gfx_irq = gfx_irq;

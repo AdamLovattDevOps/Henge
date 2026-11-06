@@ -2,6 +2,9 @@
 #include "pvg_lite.h"
 
 #include <TargetConditionals.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <os/lock.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <pthread/qos.h>
 #include <signal.h>
@@ -22,6 +25,11 @@ static HvMachine m;
 static HvCpu cpus[HV_MAX_CPUS]; /* the board takes them as an array */
 static int ncpus = 1;
 static HvVmapple board;
+/* UI display changes may arrive before or during the background machine creation. */
+static os_unfair_lock display_lock = OS_UNFAIR_LOCK_INIT;
+static CFTypeRef display_layer;
+static int display_layer_set;
+static _Atomic(HvPvgLite *) display_pvg; /* published only when the board is ready */
 static HvDisk disk, aux;
 static int net_on;
 static void (*extra_poll)(void);
@@ -37,9 +45,11 @@ int hv_vm_ncpus(void) { return ncpus; }
    Found by scanning page starts for one whose physBase is the RAM base. */
 int hv_vm_boot_display(HvBootDisplay *d) {
     /* What the guest's GPU has drawn, once it has drawn anything. */
+    HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
+    if (!pvg) return -1;
     const uint8_t *frame;
     uint32_t fw, fh;
-    if (board.pvg && hv_pvg_lite_frame(board.pvg, &frame, &fw, &fh) == 0) {
+    if (hv_pvg_lite_frame(pvg, &frame, &fw, &fh) == 0) {
         d->pixels = (uint8_t *)frame;
         d->width = fw, d->height = fh, d->stride = fw * 4;
         return 0;
@@ -193,16 +203,23 @@ static void on_ill(int sig, siginfo_t *info, void *ctx) {
     sigaction(sig, prior, NULL);
 }
 
-static void *display_layer;
 void (*hv_prof_register)(void);
 
 void hv_vm_set_display_layer(void *layer) {
-    display_layer = layer;
-    if (board.pvg) hv_pvg_lite_set_layer(board.pvg, layer);
+    CFTypeRef retained = layer ? CFRetain(layer) : NULL;
+    os_unfair_lock_lock(&display_lock);
+    CFTypeRef previous = display_layer;
+    display_layer = retained;
+    display_layer_set = 1;
+    HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
+    if (pvg) hv_pvg_lite_set_layer(pvg, layer);
+    os_unfair_lock_unlock(&display_lock);
+    if (previous) CFRelease(previous);
 }
 
 uint64_t hv_vm_gpu_frames(void) {
-    return board.pvg ? hv_pvg_lite_gpu_frames(board.pvg) : 0;
+    HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
+    return pvg ? hv_pvg_lite_gpu_frames(pvg) : 0;
 }
 
 int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
@@ -243,7 +260,12 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     if (board.snd && !c->no_sound) hv_audio_attach(board.snd);
     board.poll = board_poll;
     if (board.vusb && getenv("HV_VUSB_PROBE")) hv_usb_probe_start(board.vusb);
-    if (display_layer && board.pvg) hv_pvg_lite_set_layer(board.pvg, display_layer);
+    // The setter and publication share this lock: an older preboot target can
+    // never overwrite a monitor change made while the board was being built.
+    os_unfair_lock_lock(&display_lock);
+    if (display_layer_set && board.pvg) hv_pvg_lite_set_layer(board.pvg, (void *)display_layer);
+    atomic_store_explicit(&display_pvg, board.pvg, memory_order_release);
+    os_unfair_lock_unlock(&display_lock);
     return 0;
 }
 
@@ -370,7 +392,8 @@ void hv_vm_mouse_wheel(int dy) { wheel(HV_REL_WHEEL, dy); }
 void hv_vm_mouse_hwheel(int dx) { wheel(HV_REL_HWHEEL, dx); }
 
 int hv_vm_pointer(int *x, int *y) {
-    const uint8_t *page = board.pvg ? hv_pvg_lite_display_page(board.pvg) : NULL;
+    HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
+    const uint8_t *page = pvg ? hv_pvg_lite_display_page(pvg) : NULL;
     if (!page) return -1;
     uint32_t at = *(const volatile uint32_t *)(page + 0xe00);
     if (at == 0xffffffff) return -1;
@@ -379,6 +402,7 @@ int hv_vm_pointer(int *x, int *y) {
 }
 
 int hv_vm_snapshot(uint8_t *bgra, int width, int height) {
-    if (!board.pvg || width <= 0 || height <= 0) return -1;
-    return hv_pvg_lite_snapshot(board.pvg, bgra, (uint32_t)width, (uint32_t)height);
+    HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
+    if (!pvg || width <= 0 || height <= 0) return -1;
+    return hv_pvg_lite_snapshot(pvg, bgra, (uint32_t)width, (uint32_t)height);
 }
