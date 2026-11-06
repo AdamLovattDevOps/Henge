@@ -462,31 +462,23 @@ static HengeDualMapping henge_self_dual_mapping(size_t bytes)
    above 0x7000000000, but generated code placed there never runs (the self-test's call
    hangs), while below it the room is what is left between the app, its heap and its
    thread stacks in the 0x100000000-0x180000000 window, which varies from launch to launch
-   and is often less than the 1 GB region. So a hole is reserved as the app starts, while
-   that window is still mostly empty, and handed back just before the debugger allocates:
-   its first-fit allocation then takes the hole. */
+   and is often split into pieces under the 1 GB region. So the app's own image holds the
+   room: a zero-fill block in __DATA, mapped with the executable before anything else can
+   land in between, which costs nothing until it is touched. It is handed back just before
+   the debugger allocates, and the debugger's first-fit allocation takes the hole. */
 #define HENGE_JIT_LOW_LIMIT 0x7000000000ull
 #define HENGE_JIT_HOLD_BYTES ((size_t)1 << 30) /* JITBootstrap.jitBytes */
-static vm_address_t g_low_hold;
+__attribute__((used, aligned(16384))) static uint8_t g_jit_reserve[HENGE_JIT_HOLD_BYTES + (16u << 10)];
+static bool g_jit_reserve_released;
 
-__attribute__((constructor)) static void henge_ios_jit_hold_low(void)
-{
-    vm_address_t a = 0;
-    if (vm_allocate(mach_task_self(), &a, HENGE_JIT_HOLD_BYTES, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) return;
-    if ((uint64_t)a + HENGE_JIT_HOLD_BYTES > HENGE_JIT_LOW_LIMIT) {
-        vm_deallocate(mach_task_self(), a, HENGE_JIT_HOLD_BYTES); /* no low room even now: nothing to keep */
-        return;
-    }
-    g_low_hold = a;
-}
-
-/* Give the hole back for the debugger's allocation, if it is the size asked for. */
+/* Give the reserved block back for the debugger's allocation, if it is the size asked for. */
 static void henge_ios_jit_release_low_hold(size_t bytes)
 {
-    if (!g_low_hold || bytes > HENGE_JIT_HOLD_BYTES) return;
-    HENGE_LOG("releasing the low hole at %#lx for the JIT region", (unsigned long)g_low_hold);
-    vm_deallocate(mach_task_self(), g_low_hold, HENGE_JIT_HOLD_BYTES);
-    g_low_hold = 0;
+    if (g_jit_reserve_released || bytes > HENGE_JIT_HOLD_BYTES) return;
+    vm_address_t start = ((vm_address_t)g_jit_reserve + 16383) & ~(vm_address_t)16383;
+    kern_return_t kr = vm_deallocate(mach_task_self(), start, HENGE_JIT_HOLD_BYTES);
+    HENGE_LOG("released the reserved block at %#lx for the JIT region: %s", (unsigned long)start, mach_error_string(kr));
+    g_jit_reserve_released = true;
 }
 
 /* The address space, for working out where a JIT region can go: every mapping, and the gaps of 256 MiB or more. */
