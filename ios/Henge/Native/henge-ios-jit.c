@@ -371,6 +371,8 @@ static const char *volatile g_self_route;
 
 const char *henge_ios_jit_self_route(void) { return g_self_route; }
 
+static void henge_ios_jit_release_low_hold(size_t bytes);
+
 static HengeDualMapping henge_self_dual_mapping(size_t bytes)
 {
     HengeDualMapping none = { NULL, NULL, 0 };
@@ -379,6 +381,8 @@ static HengeDualMapping henge_self_dual_mapping(size_t bytes)
         return none;
     }
     size_t size = (bytes + 0x3fff) & ~(size_t)0x3fff;
+    /* No debugger will take the reserved block on this route, and it would keep this mapping out of the low window. */
+    henge_ios_jit_release_low_hold(size);
 
     /* 1. MAP_JIT: requires dynamic-codesigning. Refused with EPERM elsewhere, harmlessly. */
     uint8_t *rx = mmap(NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
