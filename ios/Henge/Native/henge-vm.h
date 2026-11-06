@@ -38,6 +38,12 @@ int henge_vm_guest_el0(void);              /* any CPU running user code right no
 void henge_vm_key(uint16_t code, int down);
 void henge_vm_mouse_move(int dx, int dy);
 void henge_vm_mouse_button(int button, int down);
+/* Wheel units: dy > 0 up, dx > 0 right. */
+void henge_vm_mouse_scroll(int dx, int dy);
+/* Where the guest has its pointer, in display pixels. 0, or -1 before it has one. */
+int henge_vm_pointer(int *x, int *y);
+/* A small picture of the display, BGRA, width * height * 4 bytes. 0, or -1 before anything shows. */
+int henge_vm_snapshot(uint8_t *bgra, int width, int height);
 
 /* The boot framebuffer (Apple logo and progress bar), 32-bit BGRA, or -1 if
    the kernel has not got that far. The pixels are the guest's live memory. */

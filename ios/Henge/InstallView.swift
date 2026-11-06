@@ -3,111 +3,253 @@ import SwiftUI
 /// Download macOS (or use a copy already on this iPhone) and install it on a new Mac.
 struct InstallView: View {
     @ObservedObject private var installer = Installer.shared
-    @Environment(\.dismiss) private var dismiss
     @State private var release = MacOSRelease.all.first(where: Installer.haveImage) ?? MacOSRelease.all[0]
     @State private var name = "Mac"
     @State private var ramGB = 8
     @State private var deleteAfter = false
     @State private var refresh = 0 // redraws the list when a download is deleted
+    @State private var details = false
+    @State private var stageStarted = Date()
+    @State private var stageSeen = -1
+    @State private var confirmDeleteDownload: MacOSRelease?
     @AppStorage("henge.cpus") private var cpus = 4
 
     var body: some View {
         NavigationStack {
-            Form {
-                switch installer.phase {
-                case .idle: chooser
-                case .downloading: downloading
-                case .preparing: Section { HStack { ProgressView(); Text("Making the new Mac…") } }
-                case .installing: installing
-                case .done(let text): Section("Done") { Text(text) }
-                case .failed(let text): failed(text)
+            ScrollView {
+                VStack(spacing: 0) {
+                    switch installer.phase {
+                    case .idle: chooser
+                    case .downloading, .preparing, .installing: progress
+                    case .done(let text): finished(text)
+                    case .failed(let text): failed(text)
+                    }
                 }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 24)
             }
-            .navigationTitle("Install macOS")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button(installer.busy ? "Hide" : "Close") { dismiss() }
-                }
-            }
+            .background(Desk.page)
+            .navigationTitle(installer.busy ? "Installing" : "Install macOS")
         }
-        .interactiveDismissDisabled(installer.busy)
     }
 
+    // MARK: Choosing
+
     @ViewBuilder private var chooser: some View {
-        Section("Version") {
+        DeskHeading("Version")
+        VStack(spacing: 0) {
             ForEach(MacOSRelease.all) { r in
                 Button { release = r } label: { versionRow(r) }
                     .buttonStyle(.plain)
-                    .swipeActions {
+                    .contextMenu {
                         if Installer.haveImage(r) {
-                            Button("Delete Download", role: .destructive) {
-                                Installer.deleteImage(r)
-                                refresh += 1
-                            }
+                            Button("Delete Download", role: .destructive) { confirmDeleteDownload = r }
                         }
                     }
+                if r.id != MacOSRelease.all.last?.id { Rectangle().fill(Desk.hairline).frame(height: 0.5) }
             }
         }
+        .deskCard()
         .id(refresh)
-        Section("New Mac") {
-            TextField("Name", text: $name)
-            Stepper("Memory: \(ramGB) GB", value: $ramGB, in: 2...8)
-            Toggle("Delete the download after installing", isOn: $deleteAfter)
-        }
-        Section {
-            Button(Installer.haveImage(release) ? "Install" : "Download and Install") {
-                installer.start(release, name: name.isEmpty ? "Mac" : name, ramMB: ramGB * 1024, cpus: cpus, keepImage: !deleteAfter)
+        .confirmationDialog("Delete this download?", isPresented: Binding(get: { confirmDeleteDownload != nil }, set: { if !$0 { confirmDeleteDownload = nil } }),
+                            titleVisibility: .visible) {
+            Button("Delete Download", role: .destructive) {
+                if let r = confirmDeleteDownload { Installer.deleteImage(r) }
+                refresh += 1
             }
-            .disabled(!JITBootstrap.ready)
-        } footer: {
-            Text(JITBootstrap.ready ? "Keep Henge open and the iPhone plugged in. Needs about \(ByteText.string(UInt64(Installer.spaceNeeded(release)))) free."
-                                    : "Turn on JIT first.")
         }
+
+        DeskHeading("New Mac")
+        VStack(spacing: 0) {
+            TextField("Name", text: $name)
+                .font(.system(size: 16))
+                .padding(.horizontal, 17)
+                .padding(.vertical, 14)
+            Rectangle().fill(Desk.hairline).frame(height: 0.5)
+            HStack {
+                Text("Memory").font(.system(size: 16))
+                Spacer()
+                Picker("Memory", selection: $ramGB) {
+                    ForEach([4, 6, 8], id: \.self) { Text("\($0) GB").tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 190)
+            }
+            .padding(.horizontal, 17)
+            .padding(.vertical, 10)
+            Rectangle().fill(Desk.hairline).frame(height: 0.5)
+            Toggle("Delete the download after", isOn: $deleteAfter)
+                .font(.system(size: 16))
+                .padding(.horizontal, 17)
+                .padding(.vertical, 10)
+        }
+        .deskCard()
+
+        Button(Installer.haveImage(release) ? "Install" : "Download and Install") {
+            installer.start(release, name: name.isEmpty ? "Mac" : name, ramMB: ramGB * 1024, cpus: cpus, keepImage: !deleteAfter)
+        }
+        .buttonStyle(DeskButtonStyle(enabled: JITBootstrap.ready))
+        .disabled(!JITBootstrap.ready)
+        .padding(.top, 20)
+        Text(JITBootstrap.ready ? "Keep Henge open and the iPhone plugged in. Needs about \(ByteText.string(UInt64(Installer.spaceNeeded(release)))) free."
+                                : "Turn on JIT first.")
+            .font(.system(size: 13))
+            .foregroundStyle(Desk.dim)
+            .multilineTextAlignment(.center)
+            .padding(.top, 10)
     }
 
     private func versionRow(_ r: MacOSRelease) -> some View {
         HStack {
-            VStack(alignment: .leading) {
-                Text(r.name)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(r.name).font(.system(size: 16, weight: .medium)).foregroundStyle(Desk.text)
                 if let size = Installer.imageSize(r) {
-                    Text("Downloaded, \(ByteText.string(UInt64(size)))").font(.caption).foregroundStyle(.green)
+                    Text("Downloaded, \(ByteText.string(UInt64(size)))").font(.system(size: 13)).foregroundStyle(Desk.good)
                 } else {
-                    Text("\(ByteText.string(UInt64(r.bytes))) download").font(.caption).foregroundStyle(.secondary)
+                    Text("\(ByteText.string(UInt64(r.bytes))) download").font(.system(size: 13)).foregroundStyle(Desk.dim)
                 }
-                Text(r.note).font(.caption).foregroundStyle(.secondary)
+                Text(r.note).font(.system(size: 13)).foregroundStyle(Desk.dim)
             }
             Spacer()
-            if release == r { Image(systemName: "checkmark").foregroundStyle(.tint) }
+            if release == r { Image(systemName: "checkmark").font(.system(size: 15, weight: .bold)).foregroundStyle(Desk.accentLight) }
         }
+        .padding(.horizontal, 17)
+        .padding(.vertical, 12)
         .contentShape(Rectangle())
     }
 
-    private var downloading: some View {
-        Section("Downloading \(release.name)") {
-            ProgressView(value: installer.expected > 0 ? Double(installer.received) / Double(installer.expected) : 0)
-            Text("\(ByteText.string(UInt64(installer.received))) of \(ByteText.string(UInt64(installer.expected)))")
-                .font(.footnote.monospacedDigit())
+    // MARK: Going
+
+    private static let stages = ["Download", "Start installer", "Write macOS", "Check macOS", "Finish"]
+
+    private var stage: Int {
+        switch installer.phase {
+        case .downloading: return 0
+        case .preparing: return 1
+        default:
+            switch installer.step {
+            case 0, 1: return 1
+            case 2: return 2
+            case 3: return 3
+            default: return 4
+            }
         }
     }
 
-    @ViewBuilder private var installing: some View {
-        Section("Installing on \(installer.machineName)") {
-            BootDisplay().aspectRatio(16.0 / 10.0, contentMode: .fit)
-            Text(Installer.stepName(installer.step))
-            ProgressView(value: installer.stepProgress)
+    private var fraction: Double {
+        if case .downloading = installer.phase {
+            return installer.expected > 0 ? Double(installer.received) / Double(installer.expected) : 0
         }
-        Section("Log") { LogTail() }
+        return installer.stepProgress
+    }
+
+    /// From how this step has gone so far; nothing until there is enough to go on.
+    private var timeLeft: String? {
+        let elapsed = Date().timeIntervalSince(stageStarted)
+        guard stageSeen == stage, fraction > 0.03, fraction < 1, elapsed > 10 else { return nil }
+        let minutes = Int((elapsed / fraction * (1 - fraction) / 60).rounded(.up))
+        return minutes <= 1 ? "About a minute left in this step" : "About \(minutes) minutes left in this step"
+    }
+
+    @ViewBuilder private var progress: some View {
+        Text("\(release.name) on this iPhone. Keep Henge open.")
+            .font(.system(size: 16))
+            .foregroundStyle(Desk.dim)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 4)
+            .padding(.bottom, 16)
+
+        TimelineView(.periodic(from: .now, by: 1)) { _ in
+            VStack(alignment: .leading, spacing: 0) {
+                Text("\(Int(fraction * 100))%")
+                    .font(.system(size: 66, weight: .bold))
+                    .monospacedDigit()
+                Text(timeLeft ?? "Step \(stage + 1) of \(Self.stages.count)")
+                    .font(.system(size: 15))
+                    .foregroundStyle(Desk.dim)
+                    .padding(.top, 2)
+                    .padding(.bottom, 16)
+                DeskBar(fraction: fraction, height: 11)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 24)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .deskCard(radius: 30)
+        }
+        .onChange(of: stage) { value in
+            stageSeen = value
+            stageStarted = Date()
+        }
+        .onAppear {
+            stageSeen = stage
+            stageStarted = Date()
+        }
+
+        DeskHeading("Steps")
+        VStack(spacing: 0) {
+            ForEach(Array(Self.stages.enumerated()), id: \.offset) { i, title in
+                HStack {
+                    Text(title)
+                        .font(.system(size: 16, weight: i == stage ? .semibold : .regular))
+                        .foregroundStyle(i > stage ? Desk.faint : Desk.text)
+                    Spacer()
+                    if i < stage {
+                        Image(systemName: "checkmark").font(.system(size: 15, weight: .bold)).foregroundStyle(Desk.good)
+                    } else if i == stage {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+                .padding(.horizontal, 17)
+                .padding(.vertical, 13)
+                if i < Self.stages.count - 1 { Rectangle().fill(Desk.hairline).frame(height: 0.5) }
+            }
+        }
+        .deskCard()
+
+        Button(details ? "Hide details" : "Show details") { withAnimation { details.toggle() } }
+            .font(.system(size: 15, weight: .semibold))
+            .foregroundStyle(Desk.accentLight)
+            .padding(.top, 14)
+        if details {
+            VStack(spacing: 12) {
+                if case .installing = installer.phase {
+                    BootDisplay()
+                        .aspectRatio(16.0 / 10.0, contentMode: .fit)
+                        .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+                }
+                LogTail()
+            }
+            .padding(14)
+            .deskCard()
+            .padding(.top, 10)
+        }
+    }
+
+    private func finished(_ text: String) -> some View {
+        VStack(spacing: 14) {
+            Image(systemName: "checkmark.circle.fill").font(.system(size: 54)).foregroundStyle(Desk.good).padding(.top, 8)
+            Text("Installed").font(.system(size: 24, weight: .bold))
+            Text(text).font(.system(size: 15)).foregroundStyle(Desk.dim).multilineTextAlignment(.center)
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity)
+        .deskCard(radius: 30)
+        .padding(.top, 8)
     }
 
     @ViewBuilder private func failed(_ text: String) -> some View {
-        Section("It did not work") {
-            Text(text)
+        VStack(alignment: .leading, spacing: 10) {
+            Text("It did not work").font(.system(size: 22, weight: .bold))
+            Text(text).font(.system(size: 15))
             Text("Quit Henge (swipe it away) and open it again before trying again: only one Mac can start per launch.")
-                .font(.footnote).foregroundStyle(.secondary)
-            Button("Back") { installer.reset() }
+                .font(.system(size: 13)).foregroundStyle(Desk.dim)
+            Button("Back") { installer.reset() }.buttonStyle(DeskButtonStyle()).padding(.top, 6)
         }
-        Section("Log") { LogTail() }
+        .padding(18)
+        .deskCard(radius: 30)
+        .padding(.top, 8)
+        DeskHeading("Log")
+        LogTail().padding(14).frame(maxWidth: .infinity, alignment: .leading).deskCard()
     }
 }
 
@@ -121,6 +263,7 @@ private struct LogTail: View {
                 Text(line).font(.system(size: 9, design: .monospaced)).foregroundStyle(.secondary).lineLimit(2)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .task {
             while !Task.isCancelled {
                 lines = Array(HengeLog.recentLines(14))

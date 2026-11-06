@@ -1,6 +1,7 @@
 import SwiftUI
 
-/// A running Mac: its screen, how it is doing, and the log. No keyboard or mouse yet.
+/// A running Mac. Upright, its screen sits above a trackpad; on its side the screen fills the phone
+/// and is its own trackpad. Zoomed in, the screen fills the phone either way and follows the pointer.
 struct SessionView: View {
     let mac: VirtualMac
     let close: () -> Void
@@ -17,97 +18,276 @@ struct SessionView: View {
     @AppStorage("henge.cpus") private var cpus = 4
 
     @State private var typing = false
-    @State private var rightClick = false
-    @State private var lastDrag: CGPoint?
-    @State private var dragDistance: CGFloat = 0
-    @State private var dragStart = Date()
-    @State private var holding = false
-    @State private var holdTimer: Task<Void, Never>?
+    @State private var zoomed = false
     @State private var showDetails = false
-    @Environment(\.verticalSizeClass) private var verticalSize
+    @State private var confirmStop = false
+    @State private var zoomCentre = CGPoint(x: 0.5, y: 0.5) // where the zoomed view is, 0...1 of the Mac's screen
+    @State private var map: UIImage?
+    @State private var zoomFollowing: Task<Void, Never>?
+
+    private static let aspect: CGFloat = 16.0 / 9.0
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 0) {
-                screen
-                if verticalSize != .compact {
-                    Text(phase).font(.footnote).foregroundStyle(.secondary).padding(.top, 6)
-                    if let error { Text(error).foregroundStyle(.red).padding(.horizontal) }
-                    Text("Drag to move the pointer, tap to click. Touch and hold, then drag, to drag something.").font(.footnote).foregroundStyle(.secondary).padding(.top, 2)
-                    Spacer()
+        GeometryReader { geo in
+            let insets = geo.safeAreaInsets
+            let full = CGSize(width: geo.size.width + insets.leading + insets.trailing,
+                              height: geo.size.height + insets.top + insets.bottom)
+            let landscape = full.width > full.height
+            let layout = Layout(full: full, insets: insets, landscape: landscape, zoomed: zoomed, typing: typing, centre: zoomCentre)
+            ZStack(alignment: .topLeading) {
+                (landscape || zoomed ? Color.black : Desk.page)
+                // One view in every layout: it holds the layer the engine draws into.
+                BootDisplay()
+                    .frame(width: layout.screen.width, height: layout.screen.height)
+                    .clipShape(RoundedRectangle(cornerRadius: layout.fillsPhone ? 0 : 15, style: .continuous))
+                    .overlay {
+                        if !layout.fillsPhone {
+                            RoundedRectangle(cornerRadius: 15, style: .continuous).stroke(Color.white.opacity(0.16), lineWidth: 0.5)
+                        }
+                    }
+                    .position(x: layout.screen.midX, y: layout.screen.midY)
+                Trackpad()
+                    .frame(width: layout.touch.width, height: layout.touch.height)
+                    .position(x: layout.touch.midX, y: layout.touch.midY)
+                if !layout.fillsPhone {
+                    uprightControls(layout)
+                } else {
+                    floatingControls(layout)
                 }
+                if let error { errorCard(error, layout) }
                 KeyboardCatcher(active: $typing).frame(width: 0, height: 0)
             }
-            .navigationTitle(mac.name)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItemGroup(placement: .primaryAction) {
-                    Button { typing.toggle() } label: { Image(systemName: typing ? "keyboard.chevron.compact.down" : "keyboard") }
-                        .accessibilityLabel("Keyboard")
-                    Button { rightClick.toggle() } label: { Image(systemName: rightClick ? "cursorarrow.click.2" : "cursorarrow.click") }
-                        .accessibilityLabel(rightClick ? "Next tap is a right click" : "Next tap is a click")
-                    Button { showDetails = true } label: { Image(systemName: "info.circle") }
-                        .accessibilityLabel("Details")
-                    Button(state == 1 ? "Shut Down" : "Close") { finish() }
-                }
-            }
-            .sheet(isPresented: $showDetails) {
-                NavigationStack {
-                    List {
-                        Section(phase) { status }
-                        Section("Log") { logView }
-                    }
-                    .navigationTitle("Details")
-                    .navigationBarTitleDisplayMode(.inline)
-                }
-            }
+            .frame(width: full.width, height: full.height)
+            .ignoresSafeArea()
+            .animation(.easeInOut(duration: 0.25), value: zoomed)
+            .animation(.easeInOut(duration: 0.25), value: typing)
+        }
+        .statusBarHidden(zoomed)
+        .persistentSystemOverlays(.hidden)
+        .preferredColorScheme(.dark)
+        .sheet(isPresented: $showDetails) { details }
+        .confirmationDialog("Shut down \(mac.name)?", isPresented: $confirmStop, titleVisibility: .visible) {
+            Button("Shut Down", role: .destructive) { finish() }
+        } message: {
+            Text("This turns the Mac off at once. Anything not saved on it is lost.")
+        }
+        .onChange(of: zoomed) { on in
+            zoomFollowing?.cancel()
+            zoomFollowing = on ? Task { await followPointer() } : nil
+        }
+        .onAppear { UIApplication.shared.isIdleTimerDisabled = true }
+        .onDisappear {
+            UIApplication.shared.isIdleTimerDisabled = false
+            zoomFollowing?.cancel()
+            StickyKeys.shared.releaseAll()
         }
         .task { await run() }
     }
 
-    /// The Mac's screen, used like a trackpad: pointer speed suits a 1920-wide screen on a small one.
-    /// A finger held still for a moment presses the button, until it lifts: that is how to drag.
-    private var screen: some View {
-        BootDisplay()
-            .aspectRatio(16.0 / 9.0, contentMode: .fit)
-            .contentShape(Rectangle())
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { value in
-                        if let last = lastDrag {
-                            let dx = value.location.x - last.x, dy = value.location.y - last.y
-                            dragDistance += abs(dx) + abs(dy)
-                            henge_vm_mouse_move(Int32((dx * 3).rounded()), Int32((dy * 3).rounded()))
-                        } else {
-                            dragDistance = 0
-                            dragStart = Date()
-                            holdTimer = Task {
-                                try? await Task.sleep(nanoseconds: 400_000_000)
-                                guard !Task.isCancelled, lastDrag != nil, dragDistance < 8 else { return }
-                                holding = true
-                                henge_vm_mouse_button(rightClick ? 1 : 0, 1)
-                                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                            }
-                        }
-                        lastDrag = value.location
+    // MARK: Layout
+
+    /// Where everything goes, in points from the phone's top left corner.
+    private struct Layout {
+        let screen: CGRect
+        let touch: CGRect     // what is a trackpad besides the pad itself
+        let fillsPhone: Bool
+        let toolsY: CGFloat
+        let pad: CGRect
+        let insets: EdgeInsets
+
+        init(full: CGSize, insets: EdgeInsets, landscape: Bool, zoomed: Bool, typing: Bool, centre: CGPoint) {
+            self.insets = insets
+            let aspect = SessionView.aspect
+            if zoomed {
+                // Upright, as tall as the phone. On its side, twice as big as it fits.
+                let height = landscape ? full.height * 2 : max(full.height - insets.bottom, full.width / aspect)
+                let width = height * aspect
+                let x = min(0, max(full.width - width, full.width / 2 - centre.x * width))
+                let y = min(0, max(full.height - height, full.height / 2 - centre.y * height))
+                screen = CGRect(x: x, y: y, width: width, height: height)
+                touch = CGRect(origin: .zero, size: full)
+                fillsPhone = true
+                toolsY = 0
+                pad = .zero
+            } else if landscape {
+                let height = min(full.height, (full.width - 2 * max(insets.leading, insets.trailing)) / aspect)
+                let width = height * aspect
+                screen = CGRect(x: (full.width - width) / 2, y: (full.height - height) / 2, width: width, height: height)
+                touch = CGRect(origin: .zero, size: full)
+                fillsPhone = true
+                toolsY = 0
+                pad = .zero
+            } else {
+                let width = full.width - 16
+                let height = width / aspect
+                screen = CGRect(x: 8, y: insets.top + 6, width: width, height: height)
+                touch = screen
+                fillsPhone = false
+                toolsY = screen.maxY + 10
+                let top = typing ? screen.maxY + 8 : toolsY + 54 + 10
+                let bottom = full.height - insets.bottom - (typing ? 8 : 0)
+                pad = CGRect(x: 8, y: top, width: width, height: max(bottom - top, 60))
+            }
+        }
+    }
+
+    // MARK: Upright
+
+    @ViewBuilder private func uprightControls(_ layout: Layout) -> some View {
+        if !typing {
+            HStack {
+                tool("keyboard", "Keyboard") { typing = true }
+                Spacer()
+                tool("plus.magnifyingglass", "Zoom in") { zoomed = true }
+                Spacer()
+                tool("info.circle", "Details") { showDetails = true }
+                Spacer()
+                tool("power", "Shut down", tint: Desk.bad) { stopTapped() }
+            }
+            .padding(.horizontal, 22)
+            .frame(width: layout.pad.width, height: 54)
+            .background(Desk.card, in: Capsule())
+            .overlay(Capsule().stroke(Desk.hairline, lineWidth: 0.5))
+            .position(x: layout.pad.midX, y: layout.toolsY + 27)
+            .transition(.opacity)
+        }
+        trackpadPanel(layout)
+    }
+
+    private func trackpadPanel(_ layout: Layout) -> some View {
+        let compact = layout.pad.height < 260
+        return VStack(spacing: 0) {
+            ZStack {
+                Trackpad()
+                if compact {
+                    Text("Trackpad").font(.system(size: 14)).foregroundStyle(Desk.faint).allowsHitTesting(false)
+                } else {
+                    VStack(spacing: 6) {
+                        hint("Drag", "to move")
+                        hint("Tap", "to click")
+                        hint("Hold, then drag", "to grab")
+                        hint("Two fingers", "to scroll")
                     }
-                    .onEnded { _ in
-                        lastDrag = nil
-                        holdTimer?.cancel()
-                        holdTimer = nil
-                        if holding {
-                            holding = false
-                            henge_vm_mouse_button(rightClick ? 1 : 0, 0)
-                            rightClick = false
-                            return
-                        }
-                        guard dragDistance < 8, Date().timeIntervalSince(dragStart) < 0.4 else { return }
-                        let button: Int32 = rightClick ? 1 : 0
-                        henge_vm_mouse_button(button, 1)
-                        henge_vm_mouse_button(button, 0)
-                        rightClick = false
-                    }
-            )
+                    .allowsHitTesting(false)
+                }
+            }
+            Rectangle().fill(Desk.hairline).frame(height: 0.5)
+            HStack(spacing: 0) {
+                MouseButton(title: "Click", button: 0)
+                Rectangle().fill(Desk.hairline).frame(width: 0.5)
+                MouseButton(title: "Right-click", button: 1)
+            }
+            .frame(height: compact ? 50 : 70)
+        }
+        .background(Desk.card)
+        .clipShape(RoundedRectangle(cornerRadius: 30, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 30, style: .continuous).stroke(Desk.hairline, lineWidth: 0.5))
+        .frame(width: layout.pad.width, height: layout.pad.height)
+        .position(x: layout.pad.midX, y: layout.pad.midY)
+    }
+
+    private func hint(_ strong: String, _ rest: String) -> some View {
+        (Text(strong).foregroundColor(Desk.dim).fontWeight(.semibold) + Text(" \(rest)").foregroundColor(Desk.faint))
+            .font(.system(size: 15))
+    }
+
+    private func tool(_ symbol: String, _ label: String, tint: Color = Desk.text, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 19, weight: .medium))
+                .foregroundStyle(tint)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .accessibilityLabel(label)
+    }
+
+    // MARK: Filling the phone
+
+    @ViewBuilder private func floatingControls(_ layout: Layout) -> some View {
+        let landscape = layout.touch.width > layout.touch.height
+        let top = layout.insets.top + (landscape ? 8 : 6)
+        let pill = HStack(spacing: 4) {
+            tool("keyboard", "Keyboard", tint: .white) { typing.toggle() }
+            tool(zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass", zoomed ? "Zoom out" : "Zoom in", tint: zoomed ? Desk.accentLight : .white) { zoomed.toggle() }
+            tool("info.circle", "Details", tint: .white) { showDetails = true }
+            Rectangle().fill(Color.white.opacity(0.3)).frame(width: 1, height: 22).padding(.horizontal, 4)
+            tool("power", "Shut down", tint: Desk.bad) { stopTapped() }
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 50)
+        .deskGlass(in: Capsule())
+        if landscape || typing {
+            pill.position(x: layout.touch.midX, y: top + 25)
+        } else {
+            pill.position(x: layout.touch.midX, y: layout.touch.height - layout.insets.bottom - 34)
+        }
+        if zoomed { zoomMap(layout) }
+    }
+
+    /// The whole screen, small, with where the zoomed view is on it.
+    private func zoomMap(_ layout: Layout) -> some View {
+        let width: CGFloat = 112, height = width / Self.aspect
+        let viewW = min(layout.touch.width / layout.screen.width, 1) * width
+        let viewH = min(layout.touch.height / layout.screen.height, 1) * height
+        let left = (-layout.screen.minX / layout.screen.width) * width
+        let top = (-layout.screen.minY / layout.screen.height) * height
+        return ZStack(alignment: .topLeading) {
+            Color.black
+            if let map { Image(uiImage: map).resizable() }
+            RoundedRectangle(cornerRadius: 3).stroke(Color.white, lineWidth: 1.5)
+                .frame(width: viewW, height: viewH)
+                .offset(x: left, y: top)
+        }
+        .frame(width: width, height: height)
+        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .padding(3)
+        .deskGlass(in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .position(x: layout.touch.width - width / 2 - 15, y: layout.insets.top + height / 2 + 20)
+        .allowsHitTesting(false)
+    }
+
+    /// Keeps the pointer in view: the view moves when the pointer nears its edge.
+    private func followPointer() async {
+        var tick = 0
+        while !Task.isCancelled {
+            var x: Int32 = 0, y: Int32 = 0
+            if henge_vm_pointer(&x, &y) == 0 {
+                moveZoom(toward: CGPoint(x: CGFloat(x) / 1920, y: CGFloat(y) / 1080))
+            }
+            if tick % 60 == 0, let image = MacPreview.capture(width: 224, height: 126) { map = UIImage(cgImage: image) }
+            tick += 1
+            try? await Task.sleep(nanoseconds: 33_000_000)
+        }
+    }
+
+    private func moveZoom(toward p: CGPoint) {
+        // How much of the screen the view shows, as Layout makes it, and a margin inside that.
+        let phone = UIScreen.main.bounds.size
+        let landscape = phone.width > phone.height
+        let shownX = landscape ? 0.5 : phone.width / (phone.height * Self.aspect), shownY: CGFloat = landscape ? 0.5 : 1
+        let reachX = shownX * 0.3, reachY = shownY * 0.3
+        var c = zoomCentre
+        if p.x < c.x - reachX { c.x = p.x + reachX } else if p.x > c.x + reachX { c.x = p.x - reachX }
+        if p.y < c.y - reachY { c.y = p.y + reachY } else if p.y > c.y + reachY { c.y = p.y - reachY }
+        c.x = min(max(c.x, shownX / 2), 1 - shownX / 2)
+        c.y = min(max(c.y, shownY / 2), 1 - shownY / 2)
+        guard c != zoomCentre else { return }
+        withAnimation(.linear(duration: 0.08)) { zoomCentre = c }
+    }
+
+    // MARK: Status
+
+    private func errorCard(_ text: String, _ layout: Layout) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("This Mac could not start").font(.system(size: 17, weight: .semibold))
+            Text(text).font(.system(size: 14)).foregroundStyle(Desk.dim)
+            Button("Close") { close() }.font(.system(size: 15, weight: .semibold)).foregroundStyle(Desk.accentLight)
+        }
+        .padding(18)
+        .frame(width: min(layout.touch.width, 390) - 32, alignment: .leading)
+        .background(Desk.raised, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .position(x: (layout.fillsPhone ? layout.touch.midX : layout.pad.midX), y: layout.fillsPhone ? layout.touch.midY : layout.pad.midY)
     }
 
     private var phase: String {
@@ -118,20 +298,30 @@ struct SessionView: View {
         }
     }
 
-    @ViewBuilder private var status: some View {
-        LabeledContent("CPUs on", value: "\(cpusOn) of \(cpus)")
-        LabeledContent("Translated blocks", value: String(format: "%.1f M/s", blocksPerSecond / 1e6))
-        LabeledContent("Network frames", value: "\(framesOut) out, \(framesIn) in")
-        LabeledContent("Up", value: "\(Int(Date().timeIntervalSince(started))) s")
+    private var details: some View {
+        NavigationStack {
+            List {
+                Section(phase) {
+                    LabeledContent("CPUs on", value: "\(cpusOn) of \(cpus)")
+                    LabeledContent("Translated blocks", value: String(format: "%.1f M/s", blocksPerSecond / 1e6))
+                    LabeledContent("Network frames", value: "\(framesOut) out, \(framesIn) in")
+                    LabeledContent("Up", value: "\(Int(Date().timeIntervalSince(started))) s")
+                }
+                Section("Log") {
+                    VStack(alignment: .leading, spacing: 1) {
+                        ForEach(Array(log.suffix(30).enumerated()), id: \.offset) { _, line in
+                            Text(line).font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Details")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+        .preferredColorScheme(.dark)
     }
 
-    private var logView: some View {
-        VStack(alignment: .leading, spacing: 1) {
-            ForEach(Array(log.suffix(30).enumerated()), id: \.offset) { _, line in
-                Text(line).font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
-            }
-        }
-    }
+    // MARK: Running
 
     private func run() async {
         let ram = GuestMemory.prepare(mac)
@@ -147,6 +337,9 @@ struct SessionView: View {
             return
         }
         started = Date()
+        var used = mac
+        used.lastUsed = started
+        Machines.shared.update(used)
         var lastBlocks = henge_vm_blocks()
         var lastTime = Date()
         var tick = 0
@@ -164,12 +357,20 @@ struct SessionView: View {
             if state == 2 { break }
             tick += 1
             if tick % 30 == 0 { HengeLog.logFootprint("session") } // how close to the limit, for a memory kill leaves no crash report
+            if tick % 60 == 0 { MacPreview.save(for: mac) }
             try? await Task.sleep(nanoseconds: 1_000_000_000)
         }
     }
 
+    private func stopTapped() {
+        if state == 1 { confirmStop = true } else { close() }
+    }
+
     private func finish() {
-        if state == 1 { henge_vm_stop() }
+        if state == 1 {
+            MacPreview.saveNow(for: mac)
+            henge_vm_stop()
+        }
         close()
     }
 }

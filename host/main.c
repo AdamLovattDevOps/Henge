@@ -516,6 +516,36 @@ static void *input_thread(void *unused) {
         int x, y;
         if (sscanf(line, "click %d %d", &x, &y) == 2) pointer_to(x, y), click_here();
         else if (sscanf(line, "move %d %d", &x, &y) == 2) pointer_to(x, y);
+        else if (sscanf(line, "scroll %d %d", &x, &y) == 2) {
+            if (y) hv_vm_mouse_wheel(y);
+            if (x) hv_vm_mouse_hwheel(x);
+        }
+        else if (!strncmp(line, "pointer", 7)) {
+            int px = -1, py = -1;
+            int rc = hv_vm_pointer(&px, &py);
+            fprintf(stderr, "hengevm: pointer %d: %d, %d\n", rc, px, py);
+        }
+        else if (!strncmp(line, "snapshot ", 9)) { /* FILE, a 32-bit BMP of what hv_vm_snapshot gives the app */
+            enum { W = 640, H = 360 };
+            static uint8_t px[W * H * 4];
+            int rc = hv_vm_snapshot(px, W, H);
+            fprintf(stderr, "hengevm: snapshot %d\n", rc);
+            FILE *bf = rc == 0 ? fopen(line + 9, "wb") : NULL;
+            if (bf) {
+                uint32_t size = W * H * 4;
+                uint8_t h[54] = {'B', 'M'};
+                uint32_t v;
+                v = 54 + size; memcpy(h + 2, &v, 4);
+                v = 54; memcpy(h + 10, &v, 4);
+                v = 40; memcpy(h + 14, &v, 4);
+                int32_t iw = W, ih = -H; memcpy(h + 18, &iw, 4); memcpy(h + 22, &ih, 4);
+                h[26] = 1; h[28] = 32;
+                memcpy(h + 34, &size, 4);
+                fwrite(h, 1, 54, bf);
+                fwrite(px, 1, size, bf);
+                fclose(bf);
+            }
+        }
         else if (!strncmp(line, "press", 5) || !strncmp(line, "release", 7)) {
             hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, line[0] == 'p');
             hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);

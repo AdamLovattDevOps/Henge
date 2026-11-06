@@ -124,6 +124,13 @@ int henge_vm_guest_el0(void) {
 void henge_vm_key(uint16_t code, int down) { if (state == 1) hv_vm_key(code, down); }
 void henge_vm_mouse_move(int dx, int dy) { if (state == 1) hv_vm_mouse_move(dx, dy); }
 void henge_vm_mouse_button(int button, int down) { if (state == 1) hv_vm_mouse_button(button, down); }
+void henge_vm_mouse_scroll(int dx, int dy) {
+    if (state != 1) return;
+    if (dy) hv_vm_mouse_wheel(dy);
+    if (dx) hv_vm_mouse_hwheel(dx);
+}
+int henge_vm_pointer(int *x, int *y) { return state == 1 ? hv_vm_pointer(x, y) : -1; }
+int henge_vm_snapshot(uint8_t *bgra, int width, int height) { return state == 1 ? hv_vm_snapshot(bgra, width, height) : -1; }
 
 void henge_vm_set_display_layer(void *layer) {
     hv_vm_set_display_layer(layer);

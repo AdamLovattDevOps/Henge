@@ -32,24 +32,34 @@ struct HengeApp: App {
 }
 
 struct RootView: View {
+    enum Tab: Hashable { case macs, install, settings }
+
     @ObservedObject private var machines = Machines.shared
     @ObservedObject private var jit = JITCoordinator.shared
     @Environment(\.scenePhase) private var scenePhase
     @State private var running: VirtualMac?
+    @State private var tab = Tab.macs
 
     var body: some View {
         ZStack {
-            TabView {
-                HomeView(running: $running)
-                    .tabItem { Label("Machines", systemImage: "macwindow") }
+            TabView(selection: $tab) {
+                HomeView(running: $running, tab: $tab)
+                    .tabItem { Label("Macs", systemImage: "macwindow") }
+                    .tag(Tab.macs)
+                InstallView()
+                    .tabItem { Label("Install", systemImage: "arrow.down.circle") }
+                    .tag(Tab.install)
                 SettingsView()
                     .tabItem { Label("Settings", systemImage: "gearshape") }
+                    .tag(Tab.settings)
             }
+            .tint(Desk.accentLight)
             if let running {
                 SessionView(mac: running) { self.running = nil }
                     .transition(.opacity)
             }
         }
+        .preferredColorScheme(.dark)
         .sheet(isPresented: $jit.showSetup) { JITSetupFlow() }
         .onChange(of: scenePhase) { phase in
             guard phase == .active else { return }

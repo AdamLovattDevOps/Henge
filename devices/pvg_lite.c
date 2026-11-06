@@ -298,6 +298,10 @@ uint64_t hv_pvg_lite_gpu_frames(HvPvgLite *p) {
     return p && p->metal ? hv_pvg_metal_gpu_frames(p->metal) : 0;
 }
 
+int hv_pvg_lite_snapshot(HvPvgLite *p, uint8_t *bgra, uint32_t width, uint32_t height) {
+    return p && p->metal ? hv_pvg_metal_snapshot(p->metal, bgra, width, height) : -1;
+}
+
 int hv_pvg_lite_frame(HvPvgLite *p, const uint8_t **pixels, uint32_t *width, uint32_t *height) {
     return p && p->metal ? hv_pvg_metal_frame(p->metal, pixels, width, height) : -1;
 }

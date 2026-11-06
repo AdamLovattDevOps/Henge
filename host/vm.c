@@ -356,3 +356,22 @@ void hv_vm_mouse_wheel(int dy) {
     hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_WHEEL, dy);
     hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
 }
+
+void hv_vm_mouse_hwheel(int dx) {
+    hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_HWHEEL, dx);
+    hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+}
+
+int hv_vm_pointer(int *x, int *y) {
+    const uint8_t *page = board.pvg ? hv_pvg_lite_display_page(board.pvg) : NULL;
+    if (!page) return -1;
+    uint32_t at = *(const volatile uint32_t *)(page + 0xe00);
+    if (at == 0xffffffff) return -1;
+    *x = (int)(at & 0xffff), *y = (int)(at >> 16);
+    return 0;
+}
+
+int hv_vm_snapshot(uint8_t *bgra, int width, int height) {
+    if (!board.pvg || width <= 0 || height <= 0) return -1;
+    return hv_pvg_lite_snapshot(board.pvg, bgra, (uint32_t)width, (uint32_t)height);
+}

@@ -70,5 +70,10 @@ void hv_vm_key(uint16_t code, int down);
 void hv_vm_mouse_move(int dx, int dy);
 void hv_vm_mouse_button(int button, int down); /* 0 left, 1 right, 2 middle */
 void hv_vm_mouse_wheel(int dy);
+void hv_vm_mouse_hwheel(int dx);
+/* Where the guest has its pointer, in display pixels. 0, or -1 before it has one. */
+int hv_vm_pointer(int *x, int *y);
+/* A small picture of the display, BGRA, width * height * 4 bytes. 0, or -1 before anything shows. */
+int hv_vm_snapshot(uint8_t *bgra, int width, int height);
 
 #endif

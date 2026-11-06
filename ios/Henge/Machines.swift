@@ -3,7 +3,7 @@ import UIKit
 
 /// A Mac made on the Mac (HengeVM or Henge) and brought over: its boot ROM,
 /// disk and auxiliary storage, and the identity it was installed with.
-struct VirtualMac: Identifiable, Codable, Equatable {
+struct VirtualMac: Identifiable, Codable, Hashable {
     var id = UUID()
     var name: String
     var ecid: UInt64
@@ -11,6 +11,8 @@ struct VirtualMac: Identifiable, Codable, Equatable {
     var ramMB: Int
     var diskBytes: Int64
     var added = Date()
+    var osName: String?
+    var lastUsed: Date?
 
     var directory: URL { Machines.directory(for: id) }
     var rom: URL { directory.appendingPathComponent("AVPBooter.vmapple2.bin") }

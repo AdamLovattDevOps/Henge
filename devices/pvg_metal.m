@@ -2115,6 +2115,48 @@ void hv_pvg_metal_unmap(HvPvgMetal *m, uint32_t mapping) {
     });
 }
 
+/* A small picture of what the display shows, BGRA with no padding, for the app's home screen.
+   Read straight from the surface's memory, nearest pixel: it may catch a frame being drawn, which
+   does not matter at this size. -1 before anything has been shown. */
+int hv_pvg_metal_snapshot(HvPvgMetal *m, uint8_t *bgra, uint32_t w, uint32_t h) {
+    if (!m || !w || !h) return -1;
+    HvReplay *r = (__bridge HvReplay *)m;
+    os_unfair_lock_lock(&r->screen_lock);
+    id<MTLTexture> tex = r->screen_tex;
+    BOOL half = r->screen_half;
+    uint32_t W = r->screen_w, H = r->screen_h;
+    os_unfair_lock_unlock(&r->screen_lock);
+    id<MTLBuffer> buffer = tex.buffer;
+    if (!buffer || !W || !H || buffer.storageMode == MTLStorageModePrivate) return -1;
+    const uint8_t *base = (const uint8_t *)buffer.contents + tex.bufferOffset;
+    size_t row = tex.bufferBytesPerRow;
+    /* Four samples to a pixel: one makes text look broken at this size. */
+    for (uint32_t y = 0; y < h; y++) {
+        uint8_t *out = bgra + (size_t)y * w * 4;
+        for (uint32_t x = 0; x < w; x++, out += 4) {
+            uint32_t sum[3] = {0, 0, 0};
+            for (uint32_t k = 0; k < 4; k++) {
+                size_t sx = (2 * x + (k & 1)) * (uint64_t)W / (2 * w), sy = (2 * y + (k >> 1)) * (uint64_t)H / (2 * h);
+                const uint8_t *src = base + sy * row;
+                if (!half) {
+                    for (int c = 0; c < 3; c++) sum[c] += src[sx * 4 + c];
+                    continue;
+                }
+                const __fp16 *p = (const __fp16 *)(src + sx * 8);
+                for (int c = 0; c < 3; c++) {
+                    float v = (float)p[c];
+                    v = v < 0 ? 0 : v > 1 ? 1 : v;
+                    v = v <= 0.0031308f ? v * 12.92f : 1.055f * powf(v, 1 / 2.4f) - 0.055f; /* the surface is linear light */
+                    sum[2 - c] += (uint32_t)(v * 255 + 0.5f);
+                }
+            }
+            for (int c = 0; c < 3; c++) out[c] = (uint8_t)((sum[c] + 2) / 4);
+            out[3] = 255;
+        }
+    }
+    return 0;
+}
+
 int hv_pvg_metal_frame(HvPvgMetal *m, const uint8_t **pixels, uint32_t *w, uint32_t *h) {
     if (!m) return -1;
     HvReplay *r = (__bridge HvReplay *)m;

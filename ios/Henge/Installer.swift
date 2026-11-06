@@ -90,7 +90,8 @@ final class Installer: NSObject, ObservableObject {
                 try checkSpace(release)
                 let ipsw = try await download(release)
                 phase = .preparing
-                let mac = try prepare(name: name, ramMB: ramMB)
+                var mac = try prepare(name: name, ramMB: ramMB)
+                mac.osName = release.name
                 made = mac
                 phase = .installing
                 try await install(mac, ipsw: ipsw, cpus: cpus)
