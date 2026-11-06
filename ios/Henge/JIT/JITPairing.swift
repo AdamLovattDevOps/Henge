@@ -138,10 +138,12 @@ import UserNotifications
         guard active else { return }
         phase = .pin(pin)
         log("code shown")
+        #if compiler(>=6.2)
         if #available(iOS 26.0, *), let task = continued as? BGContinuedProcessingTask {
             task.updateTitle("Pairing code \(pin)", subtitle: "Enter it on this \(Self.deviceKind) to pair with Henge")
             task.progress.completedUnitCount = 1
         }
+        #endif
         if UIApplication.shared.applicationState != .active {
             notify("Henge pairing code: \(pin)", body: "Enter this code on your \(Self.deviceKind) to finish pairing.")
         }
@@ -251,9 +253,14 @@ import UserNotifications
                 pairing.endGrace()
             }
         }
+        #if compiler(>=6.2)
         if #available(iOS 26.0, *) { submitContinued() } else { backgroundLimited = true }
+        #else
+        backgroundLimited = true
+        #endif
     }
 
+    #if compiler(>=6.2)
     @available(iOS 26.0, *)
     private func submitContinued() {
         guard let identifier = taskIdentifier else { backgroundLimited = true; return }
@@ -294,12 +301,15 @@ import UserNotifications
         }
         log("continued-processing running")
     }
+    #endif
 
     private func endBackground(success: Bool) {
+        #if compiler(>=6.2)
         if #available(iOS 26.0, *), let task = continued as? BGContinuedProcessingTask {
             task.progress.completedUnitCount = task.progress.totalUnitCount
             task.setTaskCompleted(success: success)
         }
+        #endif
         continued = nil
         endGrace()
     }

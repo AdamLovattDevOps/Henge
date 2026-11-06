@@ -21,11 +21,15 @@ enum Desk {
 extension View {
     /// Liquid Glass where iOS has it, for controls floating over a Mac's screen.
     @ViewBuilder func deskGlass<S: Shape>(in shape: S) -> some View {
+        #if compiler(>=6.2)
         if #available(iOS 26.0, *) {
             glassEffect(.regular, in: shape)
         } else {
             background(.ultraThinMaterial, in: shape)
         }
+        #else
+        background(.ultraThinMaterial, in: shape)
+        #endif
     }
 
     /// Keeps a page's content a readable width on a big screen.

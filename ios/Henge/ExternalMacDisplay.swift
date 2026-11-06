@@ -28,6 +28,7 @@ struct ExternalMacDisplayModifier: ViewModifier {
 
     @ViewBuilder
     func body(content: Content) -> some View {
+        #if compiler(>=6.3)
         if #available(iOS 27.0, *) {
             content.sceneAccessory {
                 ExternalNonInteractiveAccessory {
@@ -37,5 +38,8 @@ struct ExternalMacDisplayModifier: ViewModifier {
         } else {
             content
         }
+        #else
+        content
+        #endif
     }
 }
