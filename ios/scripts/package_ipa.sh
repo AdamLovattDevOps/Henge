@@ -24,8 +24,7 @@ xcodebuild -project Henge.xcodeproj -scheme Henge -configuration Release -sdk ip
 grep -E "BUILD" "$DD.buildlog" || true
 APP="$DD/Build/Products/Release-iphoneos/Henge.app"
 rc=0
-for f in "$APP/Henge" "$APP/henge-jit.js" "$APP/PlugIns/HengeJITHelper.appex/HengeJITHelper" \
-         "$APP/Frameworks/StikJIT.framework/StikJIT" "$APP/Frameworks/StikJIT.framework/Info.plist"; do
+for f in "$APP/Henge" "$APP/henge-jit.js"; do
     if [ -f "$f" ]; then printf "  ok       %s\n" "${f#$APP/}"; else echo "  MISSING  ${f#$APP/}" >&2; rc=1; fi
 done
 [ $rc -eq 0 ] || { echo "==> bundle is not installable; refusing to package" >&2; exit 1; }

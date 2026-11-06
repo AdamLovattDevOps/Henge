@@ -83,9 +83,6 @@ targets:
           - "AVFAudio"
           - "-framework"
           - "CoreFoundation"
-    dependencies:
-      # Built-in StikJIT's debugger process. Embedded into PlugIns/.
-      - target: HengeJITHelper
     preBuildScripts:
       - name: Build the engine
         script: |
@@ -101,58 +98,3 @@ targets:
           set -e
           cp "$SRCROOT/../build/henge-agent.gz" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/henge-agent.gz"
         basedOnDependencyAnalysis: false
-      - name: Embed StikJIT
-        # As in Husk: the helper links StikJIT; it lives in the app's Frameworks
-        # with a minimal Info.plist (installd refuses one without), signed here.
-        script: |
-          set -e
-          SRC="$SRCROOT/deps/StikJIT.xcframework/ios-arm64/StikJIT.framework"
-          DST="$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH/StikJIT.framework"
-          rm -rf "$DST"
-          mkdir -p "$(dirname "$DST")"
-          ditto "$SRC" "$DST"
-          rm -rf "$DST/Headers" "$DST/Modules"
-          PLIST="$DST/Info.plist"
-          if [ ! -f "$PLIST" ]; then
-            plutil -create xml1 "$PLIST"
-            plutil -insert CFBundleIdentifier -string "$PRODUCT_BUNDLE_IDENTIFIER.StikJIT" "$PLIST"
-            plutil -insert CFBundleExecutable -string StikJIT "$PLIST"
-            plutil -insert CFBundleName -string StikJIT "$PLIST"
-            plutil -insert CFBundlePackageType -string FMWK "$PLIST"
-            plutil -insert CFBundleInfoDictionaryVersion -string 6.0 "$PLIST"
-            plutil -insert CFBundleShortVersionString -string 1.9.0 "$PLIST"
-            plutil -insert CFBundleVersion -string 1.9.0 "$PLIST"
-            plutil -insert MinimumOSVersion -string 17.4 "$PLIST"
-            plutil -insert CFBundleSupportedPlatforms -array "$PLIST"
-            plutil -insert CFBundleSupportedPlatforms.0 -string iPhoneOS "$PLIST"
-          fi
-          if [ -n "$EXPANDED_CODE_SIGN_IDENTITY" ] && [ "$CODE_SIGNING_ALLOWED" != "NO" ]; then
-            codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" --timestamp=none "$DST"
-          fi
-        basedOnDependencyAnalysis: false
-
-  # Built-in StikJIT's debugger (Husk docs/06-built-in-jit.md): a process cannot
-  # debug itself, so StikJIT runs here and attaches to the app. iOS 26 and later.
-  HengeJITHelper:
-    type: app-extension
-    platform: iOS
-    deploymentTarget: "26.0"
-    sources:
-      - path: HengeJITHelper
-        excludes:
-          - "Info.plist"
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: $(HENGE_BUNDLE_IDENTIFIER).JITHelper
-        INFOPLIST_FILE: HengeJITHelper/Info.plist
-        GENERATE_INFOPLIST_FILE: NO
-        APPLICATION_EXTENSION_API_ONLY: YES
-        CODE_SIGN_STYLE: Automatic
-        TARGETED_DEVICE_FAMILY: "1,2"
-        LD_RUNPATH_SEARCH_PATHS:
-          - "$(inherited)"
-          - "@executable_path/../../Frameworks"
-    dependencies:
-      # StikJIT 1.9.0 (MPL-2.0, with idevice under MIT), unmodified; embedded by the app's Embed StikJIT.
-      - framework: deps/StikJIT.xcframework
-        embed: false
