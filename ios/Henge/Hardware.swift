@@ -1,0 +1,187 @@
+import SwiftUI
+import UIKit
+import GameController
+
+/// What this device is, for what the app says and suggests.
+enum Device {
+    static let isPad = UIDevice.current.userInterfaceIdiom == .pad
+    static let name = isPad ? "iPad" : "iPhone"
+
+    /// How much memory to suggest for a new Mac: what leaves this device room for iOS.
+    static var suggestedRAMGB: Int {
+        let mb = ProcessInfo.processInfo.physicalMemory >> 20
+        return mb >= 10_000 ? 8 : mb >= 7_000 ? 6 : 4
+    }
+
+    /// The virtual CPU offers Armv8.5 instructions (core/sysreg.c), and macOS uses them. They run as
+    /// they are, so the chip needs them too: A14, M1 and later, which is iPhone13,x and iPad13,x up.
+    static let chipTooOld: Bool = {
+        let model = HengeLog.deviceModel
+        guard model.hasPrefix("iPhone") || model.hasPrefix("iPad"),
+              let major = Int(model.drop { !$0.isNumber }.prefix { $0.isNumber }) else { return false }
+        return major < 13
+    }()
+
+    static let chipTooOldText = "macOS won't run on this \(name). Henge needs an A14 or M1 chip or newer."
+}
+
+/// A keyboard attached to the device. iOS reports each key going down and coming up by its HID usage,
+/// which is what the Mac's USB keyboard sends, so every key and modifier goes straight across.
+enum HardwareKeys {
+    private static var held: Set<UInt8> = []
+
+    /// Sends the presses that are keys, and returns the rest.
+    static func send(_ presses: Set<UIPress>, down: Bool) -> Set<UIPress> {
+        var rest = Set<UIPress>()
+        for press in presses {
+            guard let raw = press.key?.keyCode.rawValue, raw >= 0x04, raw <= 0xe7 else {
+                rest.insert(press)
+                continue
+            }
+            let usage = UInt8(raw)
+            henge_vm_key_hid(usage, down ? 1 : 0)
+            if down {
+                held.insert(usage)
+            } else {
+                held.remove(usage)
+                if usage < 0xe0 { StickyKeys.shared.releaseAll() } // one key after a tap on ⌃, ⌥ or ⌘
+            }
+        }
+        return rest
+    }
+
+    /// iPadOS can keep a key's release when it takes over, as it does for ⌘-Tab: the Mac must not
+    /// go on thinking the key is down.
+    static func releaseAll() {
+        for usage in held { henge_vm_key_hid(usage, 0) }
+        held.removeAll()
+    }
+}
+
+/// Asks iPadOS to hand the pointer over, so a trackpad or mouse drives only the Mac's pointer. It does
+/// that only for an app filling the screen. SwiftUI has no way to ask, so the answer is added to the
+/// class of the window's root view controller, which is who iPadOS asks.
+enum PointerLock {
+    private static var wanted = false
+    private static var patched: Set<ObjectIdentifier> = []
+
+    static func set(_ on: Bool) {
+        wanted = on
+        let windows = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap(\.windows)
+        for window in windows {
+            guard let root = window.rootViewController else { continue }
+            let kind: AnyClass = type(of: root)
+            if patched.insert(ObjectIdentifier(kind)).inserted {
+                let answer: @convention(block) (UIViewController) -> Bool = { _ in wanted }
+                class_replaceMethod(kind, #selector(getter: UIViewController.prefersPointerLocked), imp_implementationWithBlock(answer), "B@:")
+            }
+            root.setNeedsUpdateOfPrefersPointerLocked()
+        }
+    }
+}
+
+/// A Magic Keyboard's trackpad or a mouse, while a Mac is running. GameController gives the raw motion,
+/// which macOS then accelerates as it would for its own mouse.
+final class HardwareMouse {
+    static let shared = HardwareMouse()
+    static let speedKey = "henge.mouse.speed"
+    static let reverseKey = "henge.mouse.reverse"
+
+    private var observers: [NSObjectProtocol] = []
+    private var mice: [GCMouse] = []
+    private var buttonsDown: Set<Int32> = []
+    private var restX: Float = 0, restY: Float = 0
+    private var speed: Float = 1
+    private var reverse = false
+    private var scrollsLogged = 0 // the first few, to see what a device's raw values look like
+
+    func start() {
+        let defaults = UserDefaults.standard
+        speed = defaults.object(forKey: Self.speedKey) == nil ? 1 : Float(defaults.double(forKey: Self.speedKey))
+        reverse = defaults.bool(forKey: Self.reverseKey)
+        GCMouse.mice().forEach(attach)
+        observers.append(NotificationCenter.default.addObserver(forName: .GCMouseDidConnect, object: nil, queue: .main) { [weak self] note in
+            if let mouse = note.object as? GCMouse { self?.attach(mouse) }
+        })
+        observers.append(NotificationCenter.default.addObserver(forName: .GCMouseDidDisconnect, object: nil, queue: .main) { [weak self] note in
+            guard let self, let mouse = note.object as? GCMouse else { return }
+            self.releaseButtons()
+            self.mice.removeAll { $0 === mouse }
+        })
+        observers.append(NotificationCenter.default.addObserver(forName: UIPointerLockState.didChangeNotification, object: nil, queue: .main) { note in
+            let locked = (note.object as? UIScene)?.pointerLockState?.isLocked ?? false
+            HengeLog.log("input", "pointer lock: \(locked ? "on" : "off")")
+        })
+        PointerLock.set(true)
+    }
+
+    func stop() {
+        PointerLock.set(false)
+        releaseButtons()
+        observers.forEach(NotificationCenter.default.removeObserver)
+        observers.removeAll()
+        for mouse in mice {
+            guard let input = mouse.mouseInput else { continue }
+            input.mouseMovedHandler = nil
+            input.leftButton.pressedChangedHandler = nil
+            input.rightButton?.pressedChangedHandler = nil
+            input.middleButton?.pressedChangedHandler = nil
+            input.scroll.valueChangedHandler = nil
+        }
+        mice.removeAll()
+    }
+
+    func releaseButtons() {
+        for button in buttonsDown { henge_vm_mouse_button(button, 0) }
+        buttonsDown.removeAll()
+    }
+
+    private func attach(_ mouse: GCMouse) {
+        guard let input = mouse.mouseInput, !mice.contains(where: { $0 === mouse }) else { return }
+        mice.append(mouse)
+        HengeLog.log("input", "mouse: \(mouse.vendorName ?? "?"), right button \(input.rightButton != nil), middle \(input.middleButton != nil)")
+        input.mouseMovedHandler = { [weak self] _, dx, dy in self?.moved(dx, dy) }
+        input.leftButton.pressedChangedHandler = { [weak self] _, _, pressed in self?.button(0, pressed) }
+        input.rightButton?.pressedChangedHandler = { [weak self] _, _, pressed in self?.button(1, pressed) }
+        input.middleButton?.pressedChangedHandler = { [weak self] _, _, pressed in self?.button(2, pressed) }
+        input.scroll.valueChangedHandler = { [weak self] _, first, second in self?.scrolled(first, second) }
+    }
+
+    /// GameController's Y runs upward. What doesn't make a whole step yet waits for the next move.
+    private func moved(_ dx: Float, _ dy: Float) {
+        restX += dx * speed
+        restY -= dy * speed
+        let x = restX.rounded(), y = restY.rounded()
+        guard x != 0 || y != 0 else { return }
+        restX -= x
+        restY -= y
+        henge_vm_mouse_move(Int32(x), Int32(y))
+    }
+
+    private func button(_ button: Int32, _ pressed: Bool) {
+        henge_vm_mouse_button(button, pressed ? 1 : 0)
+        if pressed {
+            buttonsDown.insert(button)
+        } else {
+            buttonsDown.remove(button)
+            StickyKeys.shared.releaseAll()
+        }
+    }
+
+    /// GameController puts the wheel's vertical motion on the pad's first axis, negative going up, and
+    /// its horizontal motion on the second. macOS accelerates the wheel by about the square of what it
+    /// is sent (see Trackpad's scroll), so this sends the root: one notch, a value of 1, is about 40 pixels.
+    private func scrolled(_ first: Float, _ second: Float) {
+        if scrollsLogged < 24 {
+            scrollsLogged += 1
+            HengeLog.log("input", "scroll raw: \(first), \(second)")
+        }
+        let way: Int32 = reverse ? -1 : 1
+        henge_vm_mouse_scroll(way * Self.wheelUnits(second), way * Self.wheelUnits(-first))
+    }
+
+    private static func wheelUnits(_ value: Float) -> Int32 {
+        let units = Int32((22 * abs(value).squareRoot()).rounded())
+        return value < 0 ? -units : units
+    }
+}

@@ -37,6 +37,7 @@ struct HomeView: View {
                 }
                 .padding(.horizontal, 16)
                 .padding(.bottom, 24)
+                .deskColumn()
             }
             .background(Desk.page)
             .navigationTitle("Henge")
@@ -65,6 +66,9 @@ struct HomeView: View {
     }
 
     @ViewBuilder private var notices: some View {
+        if Device.chipTooOld {
+            NoticeRow(symbol: "exclamationmark.triangle.fill", text: Device.chipTooOldText, tint: Desk.bad)
+        }
         if installer.busy {
             Button { tab = .install } label: {
                 NoticeRow(symbol: "arrow.down.circle.fill", text: "Installing \(installer.machineName)…", trailing: "See")
@@ -88,7 +92,7 @@ struct HomeView: View {
                 .frame(height: 190)
                 .background(Desk.raised.opacity(0.5), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
             Text("No Mac yet").font(.system(size: 24, weight: .bold))
-            Text("Install macOS on this iPhone, or bring in a Mac made on a computer.")
+            Text("Install macOS on this \(Device.name), or bring in a Mac made on a computer.")
                 .font(.system(size: 15)).foregroundStyle(Desk.dim).multilineTextAlignment(.center)
             Button("Install macOS") { tab = .install }.buttonStyle(DeskButtonStyle())
             Button("Bring in a Mac") { picking = true }

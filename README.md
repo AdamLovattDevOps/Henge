@@ -4,7 +4,7 @@
 
 <h1 align="center">Henge</h1>
 
-<p align="center">macOS on your iPhone.</p>
+<p align="center">macOS on your iPhone and iPad.</p>
 
 <p align="center">
   <a href="#install">Install</a>
@@ -21,37 +21,39 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/Leviidev/Henge?style=flat-square&color=2E6BFF&labelColor=111111" alt="GPL-2.0-or-later"></a>
 </p>
 
-Download macOS, install it on the iPhone, and use it.
+Download macOS, install it on the device, and use it.
 
 - **Own emulator** — iOS gives apps no hypervisor, so Henge runs the Mac's arm64 code through its own JIT, with its own MMU and devices. It doesn't use QEMU or Virtualization.framework.
-- **Installs on the iPhone** — Henge downloads Apple's restore image and restores it the way a Mac does. No Mac needed, and nothing is decrypted or patched.
+- **Installs on the device** — Henge downloads Apple's restore image and restores it the way a Mac does. No Mac needed, and nothing is decrypted or patched.
 - **Graphics** — macOS draws through a virtual GPU, and Henge replays its commands with Metal. Safari and Electron apps like Discord draw on it.
 - **Touch** — The screen is a trackpad: hold to drag, two fingers to scroll. Esc, Tab, Control, Option and Command sit above the keyboard.
+- **Keyboard and mouse** — On iPad, a Magic Keyboard or a Bluetooth keyboard and mouse drive the Mac directly.
 
 On an iPhone 17 Pro, macOS reaches the lock screen in about 15 seconds. Discord installs, opens in about 15 seconds, logs in and sends messages.
 
 ## Install
 
-Sideload `Henge.ipa` from [Releases](https://github.com/Leviidev/Henge/releases) with SideStore or AltStore, or install `Henge.tipa` with TrollStore. iOS 17 or later, and so far tested only on an iPhone 17 Pro.
+Sideload `Henge.ipa` from [Releases](https://github.com/Leviidev/Henge/releases) with SideStore or AltStore, or install `Henge.tipa` with TrollStore. iOS or iPadOS 17 or later, on an A14 or M1 chip or newer. So far it's tested only on an iPhone 17 Pro: iPad support is new and hasn't run on a real iPad yet.
 
 - **JIT** is required: StikDebug, TrollStore, a jailbreak, or the StikJIT helper built into Henge (iOS 26 or later).
 - **Storage:** about 43 GB free for macOS Sequoia. That's 17 GB for the download, which you can delete afterwards, and 26 GB for the Mac.
 - **Memory:** a Mac gets 4, 6 or 8 GB. Sign Henge with the increased memory limit entitlement if your certificate has it.
 
-Then open the Install tab, pick macOS Sequoia 15.6.1, and keep Henge open with the iPhone plugged in. Tahoe 26.6.2 and macOS 27.2 are offered too, but they aren't tested yet.
+Then open the Install tab, pick macOS Sequoia 15.6.1, and keep Henge open with the device plugged in. Tahoe 26.6.2 and macOS 27.2 are offered too, but they aren't tested yet.
 
 ## Known limits
 
 - Signing in to an Apple Account inside macOS fails with a verification error.
 - Some GPU commands aren't implemented yet, so some apps may draw wrongly.
 - Only one Mac can start per launch. Quit Henge and open it again to start another.
+- iPadOS keeps some keyboard shortcuts for itself, such as Command-Tab.
 - It's emulation, so it runs slower than a real Mac.
 
 ## Screenshots
 
 <table>
   <tr>
-    <td align="center" colspan="3"><img src="Screenshots/discord.jpg" alt="Discord"><br><sub>Discord</sub></td>
+    <td align="center" colspan="3"><img src="Screenshots/ipad.jpg" alt="Discord on an iPad"><br><sub>iPad</sub></td>
   </tr>
   <tr>
     <td align="center" width="33%"><img src="Screenshots/macs.png" alt="Macs"><br><sub>Macs</sub></td>
@@ -60,7 +62,7 @@ Then open the Install tab, pick macOS Sequoia 15.6.1, and keep Henge open with t
   </tr>
 </table>
 
-<sub>Captured on a Mac: Discord is a frame from Henge's renderer, and the others are the app's own screens with sample data.</sub>
+<sub>Captured on a Mac: the app's own screens with sample data, at iPad and iPhone sizes, showing a frame from Henge's renderer.</sub>
 
 ## Building
 

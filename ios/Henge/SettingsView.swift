@@ -3,6 +3,8 @@ import SwiftUI
 struct SettingsView: View {
     @ObservedObject private var jit = JITCoordinator.shared
     @AppStorage(JITCoordinator.autoEnableKey) private var jitAtLaunch = false
+    @AppStorage(HardwareMouse.speedKey) private var mouseSpeed = 1.0
+    @AppStorage(HardwareMouse.reverseKey) private var reverseScrolling = false
 
     var body: some View {
         NavigationStack {
@@ -29,6 +31,18 @@ struct SettingsView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 .listRowBackground(Desk.card)
+                if Device.isPad {
+                    Section("Mouse and Trackpad") {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Pointer speed")
+                            Slider(value: $mouseSpeed, in: 0.5...3)
+                        }
+                        Toggle("Reverse scrolling", isOn: $reverseScrolling)
+                        Text("A Magic Keyboard or a Bluetooth mouse moves the Mac's pointer. Changes apply the next time a Mac starts.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                    .listRowBackground(Desk.card)
+                }
                 Section("Log") {
                     ShareLink(item: HengeLog.logFileURL) { Label("Share henge.log", systemImage: "square.and.arrow.up") }
                 }

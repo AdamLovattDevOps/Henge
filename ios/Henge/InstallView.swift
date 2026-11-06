@@ -1,11 +1,11 @@
 import SwiftUI
 
-/// Download macOS (or use a copy already on this iPhone) and install it on a new Mac.
+/// Download macOS (or use a copy already on this device) and install it on a new Mac.
 struct InstallView: View {
     @ObservedObject private var installer = Installer.shared
     @State private var release = MacOSRelease.all.first(where: Installer.haveImage) ?? MacOSRelease.all[0]
     @State private var name = "Mac"
-    @State private var ramGB = 8
+    @State private var ramGB = Device.suggestedRAMGB
     @State private var deleteAfter = false
     @State private var refresh = 0 // redraws the list when a download is deleted
     @State private var details = false
@@ -27,6 +27,7 @@ struct InstallView: View {
                 }
                 .padding(.horizontal, 16)
                 .padding(.bottom, 24)
+                .deskColumn()
             }
             .background(Desk.page)
             .navigationTitle(installer.busy ? "Installing" : "Install macOS")
@@ -88,10 +89,10 @@ struct InstallView: View {
         Button(Installer.haveImage(release) ? "Install" : "Download and Install") {
             installer.start(release, name: name.isEmpty ? "Mac" : name, ramMB: ramGB * 1024, cpus: cpus, keepImage: !deleteAfter)
         }
-        .buttonStyle(DeskButtonStyle(enabled: JITBootstrap.ready))
-        .disabled(!JITBootstrap.ready)
+        .buttonStyle(DeskButtonStyle(enabled: JITBootstrap.ready && !Device.chipTooOld))
+        .disabled(!JITBootstrap.ready || Device.chipTooOld)
         .padding(.top, 20)
-        Text(JITBootstrap.ready ? "Keep Henge open and the iPhone plugged in. Needs about \(ByteText.string(UInt64(Installer.spaceNeeded(release)))) free."
+        Text(Device.chipTooOld ? Device.chipTooOldText : JITBootstrap.ready ? "Keep Henge open and the \(Device.name) plugged in. Needs about \(ByteText.string(UInt64(Installer.spaceNeeded(release)))) free."
                                 : "Turn on JIT first.")
             .font(.system(size: 13))
             .foregroundStyle(Desk.dim)
@@ -152,7 +153,7 @@ struct InstallView: View {
     }
 
     @ViewBuilder private var progress: some View {
-        Text("\(release.name) on this iPhone. Keep Henge open.")
+        Text("\(release.name) on this \(Device.name). Keep Henge open.")
             .font(.system(size: 16))
             .foregroundStyle(Desk.dim)
             .frame(maxWidth: .infinity, alignment: .leading)

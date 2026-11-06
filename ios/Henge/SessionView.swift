@@ -1,7 +1,8 @@
 import SwiftUI
 
-/// A running Mac. Upright, its screen sits above a trackpad; on its side the screen fills the phone
-/// and is its own trackpad. Zoomed in, the screen fills the phone either way and follows the pointer.
+/// A running Mac. Upright, its screen sits above a trackpad; on its side the screen fills the device
+/// and is its own trackpad. Zoomed in, the screen fills the device either way and follows the pointer.
+/// A keyboard, trackpad or mouse attached to an iPad works throughout.
 struct SessionView: View {
     let mac: VirtualMac
     let close: () -> Void
@@ -24,6 +25,8 @@ struct SessionView: View {
     @State private var zoomCentre = CGPoint(x: 0.5, y: 0.5) // where the zoomed view is, 0...1 of the Mac's screen
     @State private var map: UIImage?
     @State private var zoomFollowing: Task<Void, Never>?
+    @State private var shown = CGSize(width: 0.5, height: 0.5) // how much of the Mac's screen the zoomed view shows
+    @Environment(\.scenePhase) private var scenePhase
 
     private static let aspect: CGFloat = 16.0 / 9.0
 
@@ -61,8 +64,10 @@ struct SessionView: View {
             .ignoresSafeArea()
             .animation(.easeInOut(duration: 0.25), value: zoomed)
             .animation(.easeInOut(duration: 0.25), value: typing)
+            .onAppear { shown = layout.shown }
+            .onChange(of: layout.shown) { shown = $0 }
         }
-        .statusBarHidden(zoomed)
+        .statusBarHidden(zoomed || Device.isPad)
         .persistentSystemOverlays(.hidden)
         .preferredColorScheme(.dark)
         .sheet(isPresented: $showDetails) { details }
@@ -75,18 +80,32 @@ struct SessionView: View {
             zoomFollowing?.cancel()
             zoomFollowing = on ? Task { await followPointer() } : nil
         }
-        .onAppear { UIApplication.shared.isIdleTimerDisabled = true }
+        .onChange(of: pointerNeeded) { PointerLock.set(!$0) }
+        .onChange(of: scenePhase) { phase in
+            guard phase != .active else { return }
+            HardwareKeys.releaseAll()
+            HardwareMouse.shared.releaseButtons()
+        }
+        .onAppear {
+            UIApplication.shared.isIdleTimerDisabled = true
+            HardwareMouse.shared.start()
+        }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
             zoomFollowing?.cancel()
             StickyKeys.shared.releaseAll()
+            HardwareKeys.releaseAll()
+            HardwareMouse.shared.stop()
         }
         .task { await run() }
     }
 
+    /// When there is something of the app's to point at, iPadOS gets its own pointer back.
+    private var pointerNeeded: Bool { showDetails || confirmStop || error != nil }
+
     // MARK: Layout
 
-    /// Where everything goes, in points from the phone's top left corner.
+    /// Where everything goes, in points from the device's top left corner.
     private struct Layout {
         let screen: CGRect
         let touch: CGRect     // what is a trackpad besides the pad itself
@@ -94,13 +113,19 @@ struct SessionView: View {
         let toolsY: CGFloat
         let pad: CGRect
         let insets: EdgeInsets
+        var barY: CGFloat?    // where the controls go in the space beside the screen, if it has room for them
+
+        var shown: CGSize {
+            CGSize(width: min(touch.width / max(screen.width, 1), 1), height: min(touch.height / max(screen.height, 1), 1))
+        }
 
         init(full: CGSize, insets: EdgeInsets, landscape: Bool, zoomed: Bool, typing: Bool, centre: CGPoint) {
             self.insets = insets
             let aspect = SessionView.aspect
+            let big = full.height >= 600 // an iPad on its side, or a window on one
             if zoomed {
-                // Upright, as tall as the phone. On its side, twice as big as it fits.
-                let height = landscape ? full.height * 2 : max(full.height - insets.bottom, full.width / aspect)
+                // Upright, as tall as the device. On its side, bigger than it fits: a big screen needs less.
+                let height = landscape ? full.height * (big ? 1.5 : 2) : max(full.height - insets.bottom, full.width / aspect)
                 let width = height * aspect
                 let x = min(0, max(full.width - width, full.width / 2 - centre.x * width))
                 let y = min(0, max(full.height - height, full.height / 2 - centre.y * height))
@@ -109,6 +134,19 @@ struct SessionView: View {
                 fillsPhone = true
                 toolsY = 0
                 pad = .zero
+            } else if landscape, big {
+                // Room to keep the controls off the Mac's menu bar, and the Mac above the on-screen keyboard.
+                let bar: CGFloat = 62
+                let room = typing ? full.height - insets.bottom - insets.top - bar - 8 : full.height
+                let height = max(min(room, (full.width - 2 * max(insets.leading, insets.trailing)) / aspect), 200)
+                let width = height * aspect
+                let y = typing ? insets.top + bar : (full.height - height) / 2
+                screen = CGRect(x: (full.width - width) / 2, y: y, width: width, height: height)
+                touch = CGRect(origin: .zero, size: full)
+                fillsPhone = true
+                toolsY = 0
+                pad = .zero
+                if y - insets.top >= 54 { barY = insets.top + (y - insets.top) / 2 }
             } else if landscape {
                 let height = min(full.height, (full.width - 2 * max(insets.leading, insets.trailing)) / aspect)
                 let width = height * aspect
@@ -217,7 +255,9 @@ struct SessionView: View {
         .padding(.horizontal, 8)
         .frame(height: 50)
         .deskGlass(in: Capsule())
-        if landscape || typing {
+        if let barY = layout.barY {
+            pill.position(x: layout.touch.midX, y: barY)
+        } else if landscape || typing {
             pill.position(x: layout.touch.midX, y: top + 25)
         } else {
             pill.position(x: layout.touch.midX, y: layout.touch.height - layout.insets.bottom - 34)
@@ -262,10 +302,8 @@ struct SessionView: View {
     }
 
     private func moveZoom(toward p: CGPoint) {
-        // How much of the screen the view shows, as Layout makes it, and a margin inside that.
-        let phone = UIScreen.main.bounds.size
-        let landscape = phone.width > phone.height
-        let shownX = landscape ? 0.5 : phone.width / (phone.height * Self.aspect), shownY: CGFloat = landscape ? 0.5 : 1
+        // How much of the screen the view shows, and a margin inside that.
+        let shownX = shown.width, shownY = shown.height
         let reachX = shownX * 0.3, reachY = shownY * 0.3
         var c = zoomCentre
         if p.x < c.x - reachX { c.x = p.x + reachX } else if p.x > c.x + reachX { c.x = p.x - reachX }

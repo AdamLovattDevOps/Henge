@@ -28,6 +28,11 @@ extension View {
         }
     }
 
+    /// Keeps a page's content a readable width on a big screen.
+    func deskColumn() -> some View {
+        frame(maxWidth: 680).frame(maxWidth: .infinity)
+    }
+
     /// A card on the page.
     func deskCard(radius: CGFloat = 22) -> some View {
         background(Desk.card, in: RoundedRectangle(cornerRadius: radius, style: .continuous))

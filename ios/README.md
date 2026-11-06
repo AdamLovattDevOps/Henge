@@ -22,6 +22,13 @@ libslirp and glib for iOS).
   see `host/hvsparse.h`), and dropped on Henge in Finder or picked in Files.
 - **Display**: iOS has no ParavirtualizedGraphics framework, so Henge replays the
   guest's GPU commands with Metal (`devices/pvg_lite.c`, `devices/pvg_metal.m`).
+- **Hardware input** (`Henge/Hardware.swift`): a keyboard's keys go to the Mac's
+  USB keyboard by HID usage, which is how iOS reports them. A trackpad or mouse
+  goes through GameController with the pointer locked, which iPadOS allows only
+  for an app filling the screen. The first scroll values are logged to
+  `henge.log`, to tune scrolling from a real device.
+- **Chips**: the virtual CPU offers Armv8.5 instructions (`core/sysreg.c`), which
+  macOS uses and which run as they are, so Henge needs an A14 or M1 or newer.
 
 Code from Husk (GPL-2.0-or-later): `Henge/JIT/*`, `Henge/HengeLog.swift`,
 `Henge/Native/henge-ios-jit.*`, `henge-brk.S`, `HengeJITHelper/`. StikJIT is

@@ -497,7 +497,7 @@ static void both_hook(HvCpu *c) {
 }
 
 /* Debugging: HV_INPUT_FILE=path follows a file of lines, for driving a running guest:
-   "click x y", "move x y", "key code" (Linux), "shiftkey code", "type words", "wait seconds". */
+   "click x y", "move x y", "key code" (Linux), "hidkey usage", "hiddown usage", "hidup usage", "shiftkey code", "type words", "wait seconds". */
 static void *input_thread(void *unused) {
     (void)unused;
     FILE *f = fopen(getenv("HV_INPUT_FILE"), "a+");
@@ -549,6 +549,13 @@ static void *input_thread(void *unused) {
         else if (!strncmp(line, "press", 5) || !strncmp(line, "release", 7)) {
             hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, line[0] == 'p');
             hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+        }
+        else if (sscanf(line, "hiddown %i", &x) == 1) hv_vm_key_hid((uint8_t)x, 1);
+        else if (sscanf(line, "hidup %i", &x) == 1) hv_vm_key_hid((uint8_t)x, 0);
+        else if (sscanf(line, "hidkey %i", &x) == 1) {
+            hv_vm_key_hid((uint8_t)x, 1);
+            usleep(60000);
+            hv_vm_key_hid((uint8_t)x, 0);
         }
         else if (sscanf(line, "key %d", &x) == 1) key_press(x, 0);
         else if (sscanf(line, "shiftkey %d", &x) == 1) key_press(x, 1);

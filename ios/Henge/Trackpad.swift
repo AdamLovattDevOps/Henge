@@ -3,13 +3,13 @@ import UIKit
 
 /// A surface that works like a Mac's trackpad. One finger moves the pointer; a tap clicks; a finger
 /// held still for a moment presses the button until it lifts, which is how to drag. Two fingers
-/// scroll, and tapped together they right-click. Pointer speed suits a 1920-wide screen on a small one.
+/// scroll, and tapped together they right-click. Pointer speed suits a 1920-wide screen on a small
+/// one. Only fingers count here: a real trackpad or mouse goes through HardwareMouse.
 struct Trackpad: UIViewRepresentable {
     func makeUIView(context: Context) -> Surface { Surface() }
     func updateUIView(_ view: Surface, context: Context) {}
 
-    final class Surface: UIView {
-        private static let speed: CGFloat = 3
+    final class Surface: UIView, UIPointerInteractionDelegate {
         private static let holdTime: TimeInterval = 0.4
         private static let tapTime: TimeInterval = 0.3
         private static let tapDistance: CGFloat = 8
@@ -27,11 +27,20 @@ struct Trackpad: UIViewRepresentable {
             super.init(frame: frame)
             isMultipleTouchEnabled = true
             backgroundColor = .clear
+            addInteraction(UIPointerInteraction(delegate: self))
         }
+
+        /// Over the Mac there is only the Mac's pointer, if iPadOS hasn't locked its own away.
+        func pointerInteraction(_ interaction: UIPointerInteraction, styleFor region: UIPointerRegion) -> UIPointerStyle? { .hidden() }
+
+        /// A full-size iPad has more room to move a finger across than a phone does.
+        private var speed: CGFloat { traitCollection.horizontalSizeClass == .regular ? 2 : 3 }
 
         required init?(coder: NSCoder) { fatalError("made in code") }
 
         override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+            let touches = touches.filter { $0.type != .indirectPointer }
+            guard !touches.isEmpty else { return }
             if fingers.isEmpty {
                 started = Date()
                 travelled = 0
@@ -50,7 +59,7 @@ struct Trackpad: UIViewRepresentable {
         }
 
         override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-            guard let finger = fingers.first, touches.contains(finger) || fingers.count >= 2 else { return }
+            guard let finger = fingers.first, touches.contains(finger) || (fingers.count >= 2 && touches.contains(where: fingers.contains)) else { return }
             let now = finger.location(in: self), before = finger.previousLocation(in: self)
             let dx = now.x - before.x, dy = now.y - before.y
             travelled += abs(dx) + abs(dy)
@@ -58,7 +67,7 @@ struct Trackpad: UIViewRepresentable {
                 scroll(dx, dy)
             } else {
                 if travelled >= Self.tapDistance, !holding { cancelHold() }
-                henge_vm_mouse_move(Int32((dx * Self.speed).rounded()), Int32((dy * Self.speed).rounded()))
+                henge_vm_mouse_move(Int32((dx * speed).rounded()), Int32((dy * speed).rounded()))
             }
         }
 
@@ -66,6 +75,8 @@ struct Trackpad: UIViewRepresentable {
         override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) { lift(touches) }
 
         private func lift(_ touches: Set<UITouch>) {
+            let touches = touches.filter { $0.type != .indirectPointer }
+            guard !touches.isEmpty else { return }
             fingers.removeAll { touches.contains($0) }
             guard fingers.isEmpty else { return }
             cancelHold()

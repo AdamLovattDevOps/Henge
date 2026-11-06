@@ -36,6 +36,7 @@ int henge_vm_guest_el0(void);              /* any CPU running user code right no
 
 /* Input: Linux key codes, relative pointer, buttons 0 left 1 right 2 middle. */
 void henge_vm_key(uint16_t code, int down);
+void henge_vm_key_hid(uint8_t usage, int down); /* a hardware keyboard: iOS gives each key's HID usage */
 void henge_vm_mouse_move(int dx, int dy);
 void henge_vm_mouse_button(int button, int down);
 /* Wheel units: dy > 0 up, dx > 0 right. */

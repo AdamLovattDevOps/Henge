@@ -113,7 +113,7 @@ final class Installer: NSObject, ObservableObject {
             .volumeAvailableCapacityForImportantUsage ?? 0
         let needed = Self.spaceNeeded(r)
         if free > 0 && free < needed {
-            throw message("This install needs about \(ByteText.string(UInt64(needed))) free; this iPhone has \(ByteText.string(UInt64(free))).")
+            throw message("This install needs about \(ByteText.string(UInt64(needed))) free; this \(Device.name) has \(ByteText.string(UInt64(free))).")
         }
     }
 

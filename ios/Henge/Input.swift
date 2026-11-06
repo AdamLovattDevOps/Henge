@@ -1,26 +1,67 @@
 import SwiftUI
 import UIKit
 
-/// Types into the Mac: an invisible view that holds the iPhone's keyboard, with a row of the
-/// Mac's own keys above it.
+/// Types into the Mac. Two invisible views take turns holding the keyboard: one that asks for the
+/// on-screen keyboard, with a row of the Mac's own keys above it, and one that doesn't, so that a
+/// hardware keyboard works whether or not that is open.
 struct KeyboardCatcher: UIViewRepresentable {
     @Binding var active: Bool
 
-    func makeUIView(context: Context) -> CatcherView {
-        let view = CatcherView()
-        view.onHide = { active = false }
-        return view
+    func makeUIView(context: Context) -> Holder { Holder() }
+
+    func updateUIView(_ view: Holder, context: Context) {
+        view.typer.onHide = { active = false }
+        view.typing = active
+        DispatchQueue.main.async { view.takeKeyboard() }
     }
 
-    func updateUIView(_ view: CatcherView, context: Context) {
-        view.onHide = { active = false }
-        DispatchQueue.main.async {
-            if active, !view.isFirstResponder { view.becomeFirstResponder() }
-            if !active, view.isFirstResponder { view.resignFirstResponder() }
+    final class Holder: UIView {
+        let listener = KeyListener()
+        let typer = CatcherView()
+        var typing = false
+
+        override init(frame: CGRect) {
+            super.init(frame: frame)
+            addSubview(listener)
+            addSubview(typer)
+        }
+
+        required init?(coder: NSCoder) { fatalError("made in code") }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            takeKeyboard()
+        }
+
+        /// Called often, which also takes the keyboard back after a sheet has had it.
+        func takeKeyboard() {
+            guard let window, window.rootViewController?.presentedViewController == nil else { return }
+            let holder: UIView = typing ? typer : listener
+            if !holder.isFirstResponder { holder.becomeFirstResponder() }
         }
     }
 
-    final class CatcherView: UIView, UIKeyInput {
+    /// Whichever view holds the keyboard hears a hardware keyboard's keys here.
+    class KeyListener: UIView {
+        override var canBecomeFirstResponder: Bool { true }
+
+        override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+            let rest = HardwareKeys.send(presses, down: true)
+            if !rest.isEmpty { super.pressesBegan(rest, with: event) }
+        }
+
+        override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+            let rest = HardwareKeys.send(presses, down: false)
+            if !rest.isEmpty { super.pressesEnded(rest, with: event) }
+        }
+
+        override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+            let rest = HardwareKeys.send(presses, down: false)
+            if !rest.isEmpty { super.pressesCancelled(rest, with: event) }
+        }
+    }
+
+    final class CatcherView: KeyListener, UIKeyInput {
         var onHide: () -> Void = {}
         private lazy var row: UIHostingController<ModifierRow> = {
             let host = UIHostingController(rootView: ModifierRow(hide: { [weak self] in self?.onHide() }))
@@ -31,7 +72,6 @@ struct KeyboardCatcher: UIViewRepresentable {
             return host
         }()
 
-        override var canBecomeFirstResponder: Bool { true }
         override var inputAccessoryView: UIView? { row.view }
         var hasText: Bool { true }
         var autocorrectionType: UITextAutocorrectionType = .no
@@ -118,7 +158,7 @@ final class StickyKeys: ObservableObject {
     }
 }
 
-/// The keys an iPhone's keyboard doesn't have, in the slot above it.
+/// The keys an on-screen keyboard doesn't have, in the slot above it.
 struct ModifierRow: View {
     let hide: () -> Void
     @ObservedObject private var sticky = StickyKeys.shared

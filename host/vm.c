@@ -339,6 +339,10 @@ void hv_vm_key(uint16_t code, int down) {
     hv_xhci_key_linux(board.usb, code, down);
 }
 
+void hv_vm_key_hid(uint8_t usage, int down) {
+    hv_xhci_key(board.usb, usage, down);
+}
+
 void hv_vm_mouse_move(int dx, int dy) {
     if (dx) hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_X, dx);
     if (dy) hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_Y, dy);

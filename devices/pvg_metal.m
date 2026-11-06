@@ -14,6 +14,23 @@
 #import <objc/message.h>
 #import <TargetConditionals.h>
 #import <IOSurface/IOSurfaceRef.h>
+#include <string.h>
+#include <sys/utsname.h>
+
+/* 1080p shrunk onto a phone would make a normal pointer a few dots across; an iPad's screen needs less. */
+static int cursor_scale(void) {
+#if TARGET_OS_IPHONE
+    static int scale;
+    if (!scale) {
+        struct utsname u;
+        uname(&u);
+        scale = strncmp(u.machine, "iPad", 4) ? 3 : 2;
+    }
+    return scale;
+#else
+    return 1;
+#endif
+}
 
 #include <mach/mach.h>
 #include <stdatomic.h>
@@ -1704,12 +1721,8 @@ static const uint8_t *half_to_byte(void) {
         last = where;
     }
     if (where == 0xffffffff) return;
-    /* 1080p shrunk onto a phone would make a normal pointer a few dots across. The hot spot stays where it points. */
-#if TARGET_OS_IPHONE
-    const int scale = 3;
-#else
-    const int scale = 1;
-#endif
+    /* Bigger than the guest draws it. The hot spot stays where it points. */
+    const int scale = cursor_scale();
     int x = (int)(where & 0xffff) - cursor_hot_x * scale, y = (int)(where >> 16) - cursor_hot_y * scale;
     int cw = (int)cursor_w * scale, ch = (int)cursor_h * scale;
     int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
@@ -1876,11 +1889,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
         const uint8_t *page = hv_pvg_lite_display_page(lite);
         uint32_t where = page ? __atomic_load_n((const uint32_t *)(page + 0xe00), __ATOMIC_ACQUIRE) : 0xffffffff;
         if (ctex && where != 0xffffffff && (shown || page[0xe04])) {
-#if TARGET_OS_IPHONE
-            const float scale = 3;
-#else
-            const float scale = 1;
-#endif
+            const float scale = cursor_scale();
             float x = (float)(where & 0xffff) - hx * scale, y = (float)(where >> 16) - hy * scale;
             float cw = cw0 * scale, ch = ch0 * scale;
             float r[4] = {x / W * 2 - 1, 1 - (y + ch) / H * 2, cw / W * 2, ch / H * 2};

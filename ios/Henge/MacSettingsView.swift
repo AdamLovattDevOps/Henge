@@ -68,6 +68,7 @@ struct MacSettingsView: View {
             }
             .padding(.horizontal, 16)
             .padding(.bottom, 24)
+            .deskColumn()
         }
         .background(Desk.page)
         .navigationTitle(mac.name)
@@ -85,7 +86,7 @@ struct MacSettingsView: View {
                 dismiss()
             }
         } message: {
-            Text("Its disk is removed from this iPhone.")
+            Text("Its disk is removed from this \(Device.name).")
         }
     }
 
