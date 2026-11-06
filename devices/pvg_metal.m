@@ -1265,6 +1265,17 @@ typedef struct {
         draws++;
         break;
     }
+    case 154: { /* {count, then a viewport and a render target offset for each view} */
+        uint32_t count = U32(0);
+        MTLVertexAmplificationViewMapping views[8];
+        if (count == 0 || count > 8 || r.size < 4 + count * 8ull || ![e.device supportsVertexAmplificationCount:count]) break;
+        for (uint32_t i = 0; i < count; i++) {
+            views[i].viewportArrayIndexOffset = U32(4 + i * 8);
+            views[i].renderTargetArrayIndexOffset = U32(8 + i * 8);
+        }
+        [e setVertexAmplificationCount:count viewMappings:views];
+        break;
+    }
     case 155: {
         MTLSize s;
         memcpy(&s, r.p, sizeof s);
