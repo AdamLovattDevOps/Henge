@@ -52,8 +52,9 @@ Then a Henge folder in the Mac's home folder is the same folder as Files › Hen
 ## Known limits
 
 - Signing in to an Apple Account inside macOS fails with a verification error.
-- Some GPU commands aren't implemented yet, so some apps may draw wrongly.
-- Only one Mac can start per launch. Quit Henge and open it again to start another.
+- Graphics are tested on macOS's own apps, Chrome, Firefox, VS Code and Discord. Other apps may draw wrongly.
+- For the first few minutes after you log in, macOS is busy starting up in the background, so apps open more slowly.
+- Only one Mac can start per launch. Quit Henge and open it again to start another, and to start one again after restarting or shutting down macOS.
 - iPadOS keeps some keyboard shortcuts for itself, such as Command-Tab.
 - It's emulation, so it runs slower than a real Mac.
 
