@@ -458,6 +458,52 @@ static HengeDualMapping henge_self_dual_mapping(size_t bytes)
  * work. So the region is claimed at app launch, while the attachment is fresh,
  * and held until QEMU asks for it.
  */
+/* Where the JIT region can work. iOS gives an app with extended-virtual-addressing room
+   above 0x7000000000, but generated code placed there never runs (the self-test's call
+   hangs), while below it the room is what is left between the app, its heap and its
+   thread stacks in the 0x100000000-0x180000000 window, which varies from launch to launch
+   and is often split into pieces under the 1 GB region. So the app's own image holds the
+   room: a zero-fill block in __DATA, mapped with the executable before anything else can
+   land in between, which costs nothing until it is touched. It is handed back just before
+   the debugger allocates, and the debugger's first-fit allocation takes the hole. */
+#define HENGE_JIT_LOW_LIMIT 0x7000000000ull
+#define HENGE_JIT_HOLD_BYTES ((size_t)1 << 30) /* JITBootstrap.jitBytes */
+__attribute__((used, aligned(16384))) static uint8_t g_jit_reserve[HENGE_JIT_HOLD_BYTES + (16u << 10)];
+static bool g_jit_reserve_released;
+
+/* Give the reserved block back for the debugger's allocation, if it is the size asked for. */
+static void henge_ios_jit_release_low_hold(size_t bytes)
+{
+    if (g_jit_reserve_released || bytes > HENGE_JIT_HOLD_BYTES) return;
+    vm_address_t start = ((vm_address_t)g_jit_reserve + 16383) & ~(vm_address_t)16383;
+    kern_return_t kr = vm_deallocate(mach_task_self(), start, HENGE_JIT_HOLD_BYTES);
+    HENGE_LOG("released the reserved block at %#lx for the JIT region: %s", (unsigned long)start, mach_error_string(kr));
+    g_jit_reserve_released = true;
+}
+
+/* The address space, for working out where a JIT region can go: every mapping, and the gaps of 256 MiB or more. */
+static void henge_ios_jit_log_map(const char *tag)
+{
+    mach_vm_address_t addr = 0, prev_end = 0x100000000ull;
+    for (int i = 0; i < 4096; i++) {
+        vm_size_t size = 0;
+        vm_address_t a = (vm_address_t)addr;
+        natural_t depth = 0;
+        struct vm_region_submap_info_64 info;
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        if (vm_region_recurse_64(mach_task_self(), &a, &size, &depth, (vm_region_recurse_info_t)&info, &count) != KERN_SUCCESS) break;
+        if (a > prev_end && a - prev_end >= (256ull << 20))
+            HENGE_LOG("map[%s]: gap %#llx-%#llx (%llu MiB)", tag, (unsigned long long)prev_end, (unsigned long long)a,
+                      (unsigned long long)((a - prev_end) >> 20));
+        if (size >= (256ull << 20))
+            HENGE_LOG("map[%s]: big %#llx-%#llx prot %d/%d tag %u", tag, (unsigned long long)a, (unsigned long long)(a + size),
+                      info.protection, info.max_protection, info.user_tag);
+        if (a + size > prev_end) prev_end = a + size;
+        addr = a + size;
+    }
+    HENGE_LOG("map[%s]: highest mapped end %#llx", tag, (unsigned long long)prev_end);
+}
+
 static HengeDualMapping henge_ios_jit_allocate_real(size_t bytes);
 
 static HengeDualMapping henge_prewarmed;
@@ -601,6 +647,8 @@ static HengeDualMapping henge_ios_jit_allocate_real(size_t bytes)
      * iOS) rather than permanently gone, and the two are indistinguishable from
      * here, so retry a few times before giving up.
      */
+    henge_ios_jit_log_map("before");
+    henge_ios_jit_release_low_hold(bytes);
     enum { kMaxAttempts = 3 };
     void *rx = NULL;
     for (int attempt = 1; attempt <= kMaxAttempts; attempt++) {
@@ -622,6 +670,14 @@ static HengeDualMapping henge_ios_jit_allocate_real(size_t bytes)
         }
     }
 
+    henge_ios_jit_log_map("after");
+    if (rx != NULL && (uint64_t)(uintptr_t)rx + bytes > HENGE_JIT_LOW_LIMIT) {
+        /* Calling into it would hang the app with the debugger still attached. */
+        HENGE_LOG("#%llu: the JIT region came back at %p, above %#llx where generated code does not run; "
+                  "giving it back. Quit Henge and open it again.", (unsigned long long)n, rx, HENGE_JIT_LOW_LIMIT);
+        vm_deallocate(mach_task_self(), (vm_address_t)rx, bytes);
+        return region;
+    }
     if (rx == NULL) {
         HENGE_LOG("#%llu: FAILED after %d attempts. StikDebug must be attached with "
                  "the Universal JIT script BEFORE the guest is started.",
