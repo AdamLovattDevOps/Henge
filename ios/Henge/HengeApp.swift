@@ -9,6 +9,7 @@ struct HengeApp: App {
         // Order matters: HengeLog takes over stderr, so the engine's and the JIT
         // allocator's first lines land in Documents/henge.log too.
         HengeLog.start()
+        EngineTuning.apply()
         HengeLog.logFootprint("app-launch")
         JITBootstrap.noteLaunchState()
         HengeLog.log("app", "increased memory limit: \(Entitlements.increasedMemory ? "yes" : "no"); extended addressing: \(Entitlements.extendedAddressing ? "yes" : "no"); limit \(Entitlements.memoryLimitAtLaunch >> 20) MB")

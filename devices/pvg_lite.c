@@ -172,7 +172,11 @@ static void display_set_page(HvPvgLite *p, uint64_t pa) {
     PUTF(0x28, (float)height_mm);
     PUT32(0x208, 1); /* one mode: */
     PUT32(0x210, display_h << 16 | display_w);
-    PUT32(0x214, 60u << 16);
+    {   /* m4 fork: 120 Hz on ProMotion (HV_HZ), so WindowServer animates at the panel's rate */
+        const char *hz = getenv("HV_HZ");
+        uint32_t r = hz && atoi(hz) > 0 ? (uint32_t)atoi(hz) : 60;
+        PUT32(0x214, r << 16);
+    }
     PUTF(0xa10, 1.0f); /* identity colour matrix */
     PUTF(0xa24, 1.0f);
     PUTF(0xa38, 1.0f);
@@ -193,6 +197,7 @@ static void display_ack(HvPvgLite *p, uint32_t seq) {
     *(uint32_t *)(d + 0xfc0) = 2;
 }
 
+static int task_read(HvPvgLite *p, uint32_t task, uint64_t off, void *to, uint32_t n);
 static void display_swap(HvPvgLite *p, uint64_t mapping, const uint32_t *args) {
     uint8_t *d = p->display_pa ? hv_phys_ptr(p->m, p->display_pa, 0x4000) : NULL;
     if (!d) return;
@@ -218,6 +223,25 @@ static void display_swap(HvPvgLite *p, uint64_t mapping, const uint32_t *args) {
                 fprintf(stderr, "hvgamma: page@off");
                 for (int i = 0; i < 64; i++) fprintf(stderr, "%s%02x", i % 4 ? "" : " ", d[off + i]);
                 fprintf(stderr, "\n");
+            }
+            for (uint32_t t = 0, shown = 0; off && t < 512 && shown < 8; t++) {
+                uint8_t g[96];
+                if (task_read(p, t, off, g, sizeof g) != 0) continue;
+                shown++;
+                fprintf(stderr, "hvgamma: task %u@off", t);
+                for (int i = 0; i < 96; i++) fprintf(stderr, "%s%02x", i % 4 ? "" : " ", g[i]);
+                fprintf(stderr, "\n");
+                uint8_t mid[48]; /* the middle and end of the table too, whatever its layout */
+                if (task_read(p, t, off + 0x600, mid, sizeof mid) == 0) {
+                    fprintf(stderr, "hvgamma: task %u@off+600", t);
+                    for (int i = 0; i < 48; i++) fprintf(stderr, "%s%02x", i % 4 ? "" : " ", mid[i]);
+                    fprintf(stderr, "\n");
+                }
+                if (task_read(p, t, off + 0xbf0, mid, sizeof mid) == 0) {
+                    fprintf(stderr, "hvgamma: task %u@off+bf0", t);
+                    for (int i = 0; i < 48; i++) fprintf(stderr, "%s%02x", i % 4 ? "" : " ", mid[i]);
+                    fprintf(stderr, "\n");
+                }
             }
             fprintf(stderr, "hvgamma: state a00..a80");
             for (int i = 0xa00; i < 0xa80; i += 4) fprintf(stderr, " %08x", *(uint32_t *)(d + i));

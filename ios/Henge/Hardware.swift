@@ -31,7 +31,8 @@ enum Device {
     /// How much memory to suggest for a new Mac: what leaves this device room for iOS.
     static var suggestedRAMGB: Int {
         let mb = ProcessInfo.processInfo.physicalMemory >> 20
-        return mb >= 10_000 ? 8 : mb >= 7_000 ? 6 : 4
+        // m4 fork: an 8 GB iPad (7.4 GB usable) thrashes and kills the Mac at 6 GB: 16 GB devices only.
+        return mb >= 14_000 ? 8 : mb >= 10_000 ? 6 : 4
     }
 
     /// The virtual CPU offers Armv8.5 instructions (core/sysreg.c), and macOS uses them. They run as
