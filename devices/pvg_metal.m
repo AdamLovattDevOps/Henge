@@ -336,6 +336,15 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         [self complain:[NSString stringWithFormat:@"library: %@", err.localizedDescription]];
         return nil;
     }
+    {   /* m4 fork: while tracing, keep each library macOS sends, to read its shaders on a Mac */
+        const char *tf = getenv("HV_PVG_TRACE_FILE");
+        if (tf && getenv("HV_SHADER_DUMP") && atoi(getenv("HV_SHADER_DUMP"))) {
+            NSString *dir = [[[NSString stringWithUTF8String:tf] stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"shaders"];
+            [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+            NSString *name = [NSString stringWithFormat:@"%@-%llx.metallib", library.functionNames.firstObject ?: @"lib", (unsigned long long)at];
+            [lib writeToFile:[dir stringByAppendingPathComponent:name] atomically:NO];
+        }
+    }
     return [library newFunctionWithName:library.functionNames.firstObject];
 }
 
