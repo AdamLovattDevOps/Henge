@@ -1000,7 +1000,7 @@ typedef struct {
                     (unsigned long)offsets[i], (unsigned long)bb.length);
             if (bb && bb.storageMode != MTLStorageModePrivate && offsets[i] < bb.length) {
                 const float *f = (const float *)((const uint8_t *)bb.contents + offsets[i]);
-                NSUInteger nf = MIN((bb.length - offsets[i]) / 4, (NSUInteger)24);
+                NSUInteger nf = MIN((bb.length - offsets[i]) / 4, (NSUInteger)96);
                 for (NSUInteger k = 0; k < nf; k++) fprintf(stderr, " %g", f[k]);
             }
             fprintf(stderr, "\n");
