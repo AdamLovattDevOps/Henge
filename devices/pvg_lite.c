@@ -141,6 +141,14 @@ static void ring_read(HvPvgLite *p, const uint32_t *table, uint32_t size, uint32
 
 /* The one mode the display offers. macOS takes the size it is given at boot. */
 static uint32_t display_w = 1920, display_h = 1080;
+/* The panel's real size, when known: macOS works out the pixel density from it and
+   picks HiDPI (2x) for a Retina-dense panel, as on a real Mac. 0 = the old 400 mm. */
+static uint32_t display_mm_w, display_mm_h;
+
+void hv_pvg_lite_set_size_mm(uint32_t width_mm, uint32_t height_mm) {
+    display_mm_w = width_mm;
+    display_mm_h = height_mm;
+}
 
 void hv_pvg_lite_set_mode(uint32_t width, uint32_t height) {
     display_w = width;
@@ -155,6 +163,7 @@ static void display_set_page(HvPvgLite *p, uint64_t pa) {
 #define PUTF(off, v) (*(float *)(d + (off)) = (v))
     PUT32(0x00, 1);
     uint32_t width_mm = 400, height_mm = 400 * display_h / display_w; /* the same pixel density at any shape */
+    if (display_mm_w && display_mm_h) width_mm = display_mm_w, height_mm = display_mm_h;
     PUT32(0x14, height_mm << 16 | width_mm);
     PUT32(0x18, 0x01000100);
     PUT32(0x1c, 0x400);
@@ -189,6 +198,32 @@ static void display_swap(HvPvgLite *p, uint64_t mapping, const uint32_t *args) {
     if (!d) return;
     memcpy(d + 0xf80, args + 4, 16); /* gamma table offset, length */
     memcpy(d + 0xf90, args + 8, 8);  /* gamma entries, sum */
+    {   /* m4 fork: say what the gamma table is whenever it changes (colour is washed out without it) */
+        static uint32_t last[6];
+        if (memcmp(last, args + 4, sizeof last)) {
+            memcpy(last, args + 4, sizeof last);
+            uint64_t off = (uint64_t)args[5] << 32 | args[4], len = (uint64_t)args[7] << 32 | args[6];
+            fprintf(stderr, "hvgamma: swap %llu port %u w1 %#x off %#llx len %#llx count %u sum %#x\n",
+                    (unsigned long long)p->swaps, args[0], args[1], (unsigned long long)off, (unsigned long long)len, args[8], args[9]);
+            fprintf(stderr, "hvgamma: args");
+            for (int i = 0; i < 10; i++) fprintf(stderr, " %08x", args[i]);
+            fprintf(stderr, "\n");
+            const uint8_t *g = off ? hv_phys_ptr(p->m, off, 64) : NULL;
+            if (g) {
+                fprintf(stderr, "hvgamma: phys@off");
+                for (int i = 0; i < 64; i++) fprintf(stderr, "%s%02x", i % 4 ? "" : " ", g[i]);
+                fprintf(stderr, "\n");
+            }
+            if (off && off + 64 <= 0x4000) {
+                fprintf(stderr, "hvgamma: page@off");
+                for (int i = 0; i < 64; i++) fprintf(stderr, "%s%02x", i % 4 ? "" : " ", d[off + i]);
+                fprintf(stderr, "\n");
+            }
+            fprintf(stderr, "hvgamma: state a00..a80");
+            for (int i = 0xa00; i < 0xa80; i += 4) fprintf(stderr, " %08x", *(uint32_t *)(d + i));
+            fprintf(stderr, "\n");
+        }
+    }
     p->swaps++;
     *(uint32_t *)(d + 0xf98) = (uint32_t)p->swaps;
     *(uint32_t *)(d + 0xfb0) = (uint32_t)mapping;

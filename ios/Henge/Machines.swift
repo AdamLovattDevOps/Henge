@@ -16,7 +16,10 @@ struct VirtualMac: Identifiable, Codable, Hashable {
     /// The size macOS is told its screen is. Macs made before this was a choice have none: 16:9.
     var screenWidth: Int?
     var screenHeight: Int?
-    var screen: (width: Int, height: Int) { (screenWidth ?? 1920, screenHeight ?? 1080) }
+    /// m4 fork: the iPad's own panel at Retina density. On by default on iPad, for Macs that never chose.
+    var retina: Bool?
+    var isRetina: Bool { Device.isPad && (retina ?? (screenWidth == nil)) }
+    var screen: (width: Int, height: Int) { isRetina ? Device.retinaScreen : (screenWidth ?? 1920, screenHeight ?? 1080) }
     var aspect: CGFloat { CGFloat(screen.width) / CGFloat(screen.height) }
 
     var directory: URL { Machines.directory(for: id) }

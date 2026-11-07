@@ -1854,6 +1854,11 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
         [CATransaction setDisableActions:YES];
         target.device = device;
         target.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        {   /* m4 fork: say what the pixels are, so iOS colour-matches them on the P3 panel */
+            CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+            target.colorspace = cs;
+            CGColorSpaceRelease(cs);
+        }
         target.framebufferOnly = !getenv("HV_PVG_GPU_TEST");
         target.allowsNextDrawableTimeout = YES;
         target.maximumDrawableCount = 3;

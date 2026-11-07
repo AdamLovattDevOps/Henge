@@ -47,5 +47,6 @@ void hv_pvg_lite_complete(HvPvgLite *p, uint32_t channel, uint32_t stamp);
 
 /* The size macOS is told its screen is. Set before the machine starts; default 1920 x 1080. */
 void hv_pvg_lite_set_mode(uint32_t width, uint32_t height);
+void hv_pvg_lite_set_size_mm(uint32_t width_mm, uint32_t height_mm);
 
 #endif

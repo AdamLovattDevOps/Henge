@@ -420,6 +420,12 @@ struct SessionView: View {
         var buffer = [CChar](repeating: 0, count: 256)
         Sharing.prepare()
         henge_vm_set_display(UInt32(mac.screen.width), UInt32(mac.screen.height))
+        if mac.isRetina {
+            henge_vm_set_display_mm(UInt32(Device.retinaMM.width), UInt32(Device.retinaMM.height))
+        } else {
+            henge_vm_set_display_mm(0, 0)
+        }
+        HengeLog.log("session", "screen \(mac.screen.width)x\(mac.screen.height) retina \(mac.isRetina)")
         let rc = henge_vm_boot(mac.rom.path, mac.disk.path, mac.aux.path, mac.ecid, mac.seed, ram, Int32(cpus), &buffer, buffer.count)
         if rc != 0 {
             error = String(cString: buffer)

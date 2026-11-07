@@ -54,12 +54,14 @@ struct MacSettingsView: View {
                 if Device.isPad {
                     DeskHeading("Screen")
                     VStack(alignment: .leading, spacing: 12) {
-                        Picker("Screen", selection: Binding(get: { mac.screen.height == 1080 }, set: { wide in
-                            (mac.screenWidth, mac.screenHeight) = wide ? (1920, 1080) : Device.fittingScreen
+                        Picker("Screen", selection: Binding(get: { mac.isRetina ? 0 : mac.screen.height == 1080 ? 2 : 1 }, set: { pick in
+                            mac.retina = pick == 0
+                            if pick != 0 { (mac.screenWidth, mac.screenHeight) = pick == 2 ? (1920, 1080) : Device.fittingScreen }
                             save()
                         })) {
-                            Text("Fit this iPad").tag(false)
-                            Text("16:9").tag(true)
+                            if Device.isPad { Text("Retina").tag(0) }
+                            Text("Fit this iPad").tag(1)
+                            Text("16:9").tag(2)
                         }
                         .pickerStyle(.segmented)
                         Text("\(mac.screen.width) × \(mac.screen.height). Changes apply the next time this Mac starts.")

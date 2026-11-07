@@ -30,6 +30,7 @@ static void on_exit(int reason) {
 
 int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
                   int cpus, char *err, size_t errlen) {
+    { extern void hv_prof_ios_start(void); hv_prof_ios_start(); }
     if (state) {
         snprintf(err, errlen, "A machine has already run in this session. Quit Henge and open it again to start another.");
         return -1;
@@ -132,6 +133,7 @@ char *henge_share_take_clipboard(void) { return hv_share_take_clipboard(); }
 long henge_share_agent_seen(void) { return hv_share_agent_seen(); }
 
 void henge_vm_set_display(uint32_t width, uint32_t height) { hv_pvg_lite_set_mode(width, height); }
+void henge_vm_set_display_mm(uint32_t width_mm, uint32_t height_mm) { hv_pvg_lite_set_size_mm(width_mm, height_mm); }
 
 void henge_vm_key(uint16_t code, int down) { if (state == 1) hv_vm_key(code, down); }
 void henge_vm_key_hid(uint8_t usage, int down) { if (state == 1) hv_vm_key_hid(usage, down); }

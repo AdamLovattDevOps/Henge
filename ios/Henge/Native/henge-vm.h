@@ -44,6 +44,8 @@ long henge_share_agent_seen(void);
 
 /* The size macOS is told its screen is. Before henge_vm_boot. */
 void henge_vm_set_display(uint32_t width, uint32_t height);
+/* The panel's physical size; 0, 0 for the default (a ~122 ppi, 1x screen). Before boot. */
+void henge_vm_set_display_mm(uint32_t width_mm, uint32_t height_mm);
 void henge_vm_key(uint16_t code, int down);
 void henge_vm_key_hid(uint8_t usage, int down); /* a hardware keyboard: iOS gives each key's HID usage */
 void henge_vm_mouse_move(int dx, int dy);

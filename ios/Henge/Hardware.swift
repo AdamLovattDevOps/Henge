@@ -16,6 +16,18 @@ enum Device {
         return (1920, min(max(Int((1920 / shape / 8).rounded()) * 8, 1080), 1440))
     }
 
+    /// The panel itself, on its side: every physical pixel, and its real size in mm so that macOS
+    /// sees a Retina density and draws at 2x (looks like half the pixels, sharp as the iPad's own UI).
+    /// Every iPad with an M chip is 264 ppi.
+    static var retinaScreen: (width: Int, height: Int) {
+        let n = UIScreen.main.nativeBounds.size
+        return (Int(max(n.width, n.height)) / 8 * 8, Int(min(n.width, n.height)) / 8 * 8)
+    }
+    static var retinaMM: (width: Int, height: Int) {
+        let s = retinaScreen
+        return (Int((Double(s.width) / 264 * 25.4).rounded()), Int((Double(s.height) / 264 * 25.4).rounded()))
+    }
+
     /// How much memory to suggest for a new Mac: what leaves this device room for iOS.
     static var suggestedRAMGB: Int {
         let mb = ProcessInfo.processInfo.physicalMemory >> 20
