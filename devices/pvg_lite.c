@@ -181,6 +181,22 @@ static void display_set_page(HvPvgLite *p, uint64_t pa) {
     PUTF(0xa24, 1.0f);
     PUTF(0xa38, 1.0f);
     d[0xa73] = 1;
+    {   /* m4 fork: HV_DISP_POKE="off=val,off=val" (hex) overrides 32-bit words of the display page, to learn
+           which tell macOS about luminance: it was treating the screen as ~7x HDR, so SDR white came out grey. */
+        const char *pk = getenv("HV_DISP_POKE");
+        while (pk && *pk) {
+            unsigned off = 0, val = 0;
+            if (sscanf(pk, "%x=%x", &off, &val) == 2 && off < 0x1000 && !(off & 3)) {
+                PUT32(off, val);
+                fprintf(stderr, "hvdisp: poke %#x = %#x\n", off, val);
+            }
+            pk = strchr(pk, ',');
+            if (pk) pk++;
+        }
+        fprintf(stderr, "hvdisp: page 0..40:");
+        for (int i = 0; i < 0x40; i += 4) fprintf(stderr, " %08x", *(uint32_t *)(d + i));
+        fprintf(stderr, "\n");
+    }
     PUT32(0x200, 1); /* the mode list's sequence number, which the guest acks */
     d[0xfa9] = 1;    /* ack pending */
     PUT32(0xfc0, 1); /* state: told the guest, waiting for the ack */
