@@ -302,6 +302,28 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     return t;
 }
 
+/* m4 fork, tracing only: what a texture holds at a few points (the last frame's pixels). */
+static void hv_probe(const char *what, id<MTLTexture> x) {
+    if (!x || x.storageMode == MTLStorageModePrivate || x.textureType != MTLTextureType2D) return;
+    MTLPixelFormat f = x.pixelFormat;
+    if (f != MTLPixelFormatBGRA8Unorm && f != MTLPixelFormatRGBA16Float && f != MTLPixelFormatBGRA8Unorm_sRGB && f != MTLPixelFormatRGBA8Unorm) return;
+    const double pts[3][2] = {{0.5, 0.5}, {0.25, 0.45}, {0.9, 0.5}};
+    fprintf(stderr, "trace:  probe %s %lux%lu fmt %lu:", what, (unsigned long)x.width, (unsigned long)x.height, (unsigned long)f);
+    for (int k = 0; k < 3; k++) {
+        NSUInteger px = (NSUInteger)(pts[k][0] * (x.width - 1)), py = (NSUInteger)(pts[k][1] * (x.height - 1));
+        if (f == MTLPixelFormatRGBA16Float) {
+            __fp16 h[4] = {0};
+            [x getBytes:h bytesPerRow:8 fromRegion:MTLRegionMake2D(px, py, 1, 1) mipmapLevel:0];
+            fprintf(stderr, " (%.3f %.3f %.3f %.3f)", (double)h[0], (double)h[1], (double)h[2], (double)h[3]);
+        } else {
+            uint8_t b[4] = {0};
+            [x getBytes:b bytesPerRow:4 fromRegion:MTLRegionMake2D(px, py, 1, 1) mipmapLevel:0];
+            fprintf(stderr, " [%u %u %u %u]", b[0], b[1], b[2], b[3]);
+        }
+    }
+    fprintf(stderr, "\n");
+}
+
 @implementation HvContext
 - (void)resetFailureState { failure = nil; }
 - (BOOL)hadLookupFailure { return failure != nil; }
@@ -934,6 +956,7 @@ typedef struct {
         MTLClearColor cc = d.colorAttachments[0].clearColor;
         HvObject *co = [self object:U32(0x4c) task:task];
         fprintf(stderr, "trace: pass c0 ref %u %lux%lu fmt %lu load %lu store %lu clear %.2f %.2f %.2f %.2f surface %s heap %d\n", U32(0x4c), (unsigned long)c0.width, (unsigned long)c0.height, (unsigned long)c0.pixelFormat, (unsigned long)d.colorAttachments[0].loadAction, (unsigned long)d.colorAttachments[0].storeAction, cc.red, cc.green, cc.blue, cc.alpha, co && co->surface ? "yes" : "no", c0.heap != nil);
+        hv_probe("target", c0);
     }
     id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:d];
     if (!e) {
@@ -1037,6 +1060,7 @@ typedef struct {
             id<MTLTexture> x = strong[i];
             HvObject *xo = [self object:U32(8 + i * 4) task:task];
             fprintf(stderr, "trace:  tex %u ref %u %lux%lu fmt %lu type %u swz %d%d%d%d surface %s heap %d valid %d\n", index + i, U32(8 + i * 4), (unsigned long)x.width, (unsigned long)x.height, (unsigned long)x.pixelFormat, xo ? xo->entry[0] & 0xff : 0, x.swizzle.red, x.swizzle.green, x.swizzle.blue, x.swizzle.alpha, xo && xo->surface ? "yes" : "no", x.heap != nil, xo ? xo->host_valid : 0);
+            hv_probe("src", x);
         }
         if (tag == 114) [e setFragmentTextures:items withRange:NSMakeRange(index, count)];
         else [e setTileTextures:items withRange:NSMakeRange(index, count)];
