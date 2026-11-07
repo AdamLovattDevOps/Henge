@@ -5,6 +5,7 @@
 # with the user's own certificate and keeps the entitlements it can.
 # --trollstore strips the entitlements TrollStore bans under PPL/TXM.
 set -e
+setopt null_glob 2>/dev/null || true
 IOS="$(cd "$(dirname "$0")/.." && pwd)"
 TROLLSTORE=false
 [ "$1" = "--trollstore" ] && TROLLSTORE=true
