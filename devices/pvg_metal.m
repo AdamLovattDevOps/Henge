@@ -368,6 +368,18 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         id state = tag == 0xe ? [device newRenderPipelineStateWithDescriptor:descriptor error:&err]
                               : [device newRenderPipelineStateWithTileDescriptor:descriptor options:MTLPipelineOptionNone reflection:nil error:&err];
         if (!state) [self complain:[NSString stringWithFormat:@"pipeline %u: %@", tag, err.localizedDescription]];
+        if (tag == 0xe && getenv("HV_SHADER_DUMP") && atoi(getenv("HV_SHADER_DUMP"))) { /* m4 fork: blend state as this iOS read it */
+            MTLRenderPipelineDescriptor *rp = descriptor;
+            for (int i = 0; i < 4; i++) {
+                MTLRenderPipelineColorAttachmentDescriptor *c = rp.colorAttachments[i];
+                if (c.pixelFormat == MTLPixelFormatInvalid) continue;
+                fprintf(stderr, "hvpipe: %s c%d fmt %lu blend %d rgb %lu*src %lu %lu*dst alpha %lu*src %lu %lu*dst mask %lx\n",
+                        rp.fragmentFunction.name.UTF8String ?: "?", i, (unsigned long)c.pixelFormat, (int)c.blendingEnabled,
+                        (unsigned long)c.sourceRGBBlendFactor, (unsigned long)c.rgbBlendOperation, (unsigned long)c.destinationRGBBlendFactor,
+                        (unsigned long)c.sourceAlphaBlendFactor, (unsigned long)c.alphaBlendOperation, (unsigned long)c.destinationAlphaBlendFactor,
+                        (unsigned long)c.writeMask);
+            }
+        }
         if (state && tag == 0xe && getenv("HV_PVG_TRACE_FILE")) {
             MTLRenderPipelineDescriptor *rp = descriptor;
             objc_setAssociatedObject(state, "hvname", [NSString stringWithFormat:@"%@ / %@ -> fmt %lu blend %d", rp.vertexFunction.name, rp.fragmentFunction.name, (unsigned long)rp.colorAttachments[0].pixelFormat, (int)rp.colorAttachments[0].blendingEnabled], OBJC_ASSOCIATION_RETAIN);
