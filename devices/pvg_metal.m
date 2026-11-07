@@ -1871,8 +1871,12 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
     "vertex V screen_v(uint i [[vertex_id]], constant float4 &rect [[buffer(0)]]) {\n"
     "  float2 c = float2(i & 1, (i >> 1) & 1);\n"
     "  V o; o.at = float4(rect.xy + c * rect.zw, 0, 1); o.uv = float2(c.x, 1 - c.y); return o; }\n"
-    "fragment float4 screen_plain(V v [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) {\n"
-    "  return float4(t.sample(s, v.uv).rgb, 1); }\n"
+    "float3 dec(float3 c) { return select(powr((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045); }\n"
+    "float3 enc(float3 c) { return select(1.055 * powr(c, 1.0 / 2.4) - 0.055, c * 12.92, c <= 0.0031308); }\n"
+    "fragment float4 screen_plain(V v [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant float &gain [[buffer(0)]]) {\n"
+    "  float3 c = t.sample(s, v.uv).rgb;\n"
+    "  if (gain != 1.0) c = enc(saturate(dec(c) * gain));\n"
+    "  return float4(c, 1); }\n"
     "fragment float4 screen_linear(V v [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) {\n"
     "  float3 c = saturate(t.sample(s, v.uv).rgb);\n"
     "  float3 e = select(1.055 * powr(c, 1.0 / 2.4) - 0.055, c * 12.92, c <= 0.0031308);\n"
@@ -2078,6 +2082,16 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
         [e setVertexBytes:rect length:sizeof rect atIndex:0];
         [e setFragmentTexture:tex atIndex:0];
         [e setFragmentSamplerState:screen_sampler atIndex:0];
+        {   /* m4 fork: macOS draws SDR white at a fraction of full scale here (it treats the
+               display as ~7x HDR); bring white back to white in linear light. HV_WHITE_GAIN. */
+            static float gain = -1;
+            if (gain < 0) {
+                const char *g = getenv("HV_WHITE_GAIN");
+                gain = g ? (float)atof(g) : 1.0f;
+                if (!(gain > 0)) gain = 1.0f;
+            }
+            [e setFragmentBytes:&gain length:sizeof gain atIndex:0];
+        }
         [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         const uint8_t *page = hv_pvg_lite_display_page(lite);
         uint32_t where = page ? __atomic_load_n((const uint32_t *)(page + 0xe00), __ATOMIC_ACQUIRE) : 0xffffffff;

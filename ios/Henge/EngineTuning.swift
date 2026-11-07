@@ -6,7 +6,8 @@ enum EngineTuning {
     static let defaults: [String: String] = [
         "HV_HZ": "120",        // the refresh rate macOS is told its display has
         "HV_WFI_SPIN": "0",    // microseconds an idle CPU watches for work before sleeping
-        "HV_STATS": "10",      // seconds between engine stats lines in the log; 0 = off
+        "HV_STATS": "10",
+        "HV_WHITE_GAIN": "7.19", // macOS puts SDR white at 0.139 linear on this display; 1/0.139      // seconds between engine stats lines in the log; 0 = off
     ]
 
     static func apply() {
