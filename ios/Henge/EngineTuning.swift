@@ -11,7 +11,10 @@ enum EngineTuning {
 
     static func apply() {
         var env = defaults
-        let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("henge-env.txt")
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        // GPU command trace: on while Documents/trace-on exists (it is checked every frame, so it can be toggled live).
+        env["HV_PVG_TRACE_FILE"] = docs.appendingPathComponent("trace-on").path
+        let url = docs.appendingPathComponent("henge-env.txt")
         if let text = try? String(contentsOf: url, encoding: .utf8) {
             for raw in text.split(whereSeparator: \.isNewline) {
                 let line = raw.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init)?

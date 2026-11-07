@@ -985,6 +985,17 @@ typedef struct {
             offsets[i] = (NSUInteger)U64(12 + i * 12);
         }
         NSRange range = NSMakeRange(index, count);
+        if (tracing) for (uint32_t i = 0; i < count; i++) { /* m4 fork: what the shaders are given */
+            id<MTLBuffer> bb = strong[i];
+            fprintf(stderr, "trace:  %s buf %u ref %u off %lu len %lu:", tag == 125 ? "vtx" : tag == 110 ? "frag" : "tile", index + i, U32(8 + i * 12),
+                    (unsigned long)offsets[i], (unsigned long)bb.length);
+            if (bb && bb.storageMode != MTLStorageModePrivate && offsets[i] < bb.length) {
+                const float *f = (const float *)((const uint8_t *)bb.contents + offsets[i]);
+                NSUInteger nf = MIN((bb.length - offsets[i]) / 4, (NSUInteger)24);
+                for (NSUInteger k = 0; k < nf; k++) fprintf(stderr, " %g", f[k]);
+            }
+            fprintf(stderr, "\n");
+        }
         if (tag == 125) [e setVertexBuffers:buffers offsets:offsets withRange:range];
         else if (tag == 110) [e setFragmentBuffers:buffers offsets:offsets withRange:range];
         else [e setTileBuffers:buffers offsets:offsets withRange:range];
